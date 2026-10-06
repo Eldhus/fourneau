@@ -1,0 +1,20 @@
+//! The test root: every file whose tests run (tidy checks none is left out).
+
+test {
+    _ = @import("http1_chunked.zig");
+    _ = @import("hybrid.zig");
+    _ = @import("http1_head.zig");
+    _ = @import("http1_response.zig");
+    _ = @import("http_date.zig");
+    _ = @import("floor.zig");
+    _ = @import("fourneau.zig");
+    _ = @import("load.zig");
+    _ = @import("prng.zig");
+    _ = @import("server.zig");
+    _ = @import("sim.zig");
+    _ = @import("sim_client.zig");
+    _ = @import("sim_io.zig");
+    _ = @import("static.zig");
+    _ = @import("stdx.zig");
+    _ = @import("tidy.zig");
+}
