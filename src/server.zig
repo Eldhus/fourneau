@@ -155,6 +155,8 @@ pub const Stats = struct {
     timeouts: u64 = 0,
     handshakes: u64 = 0,
     handshakes_failed: u64 = 0,
+    /// Idle keep-alive connections closed to admit new ones.
+    evicted: u64 = 0,
 };
 
 /// The address of this, per thread, names the thread a shard runs on.
@@ -180,6 +182,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// The tick at which each slot's current wait expires; 0 when it is
         /// not waiting. The timekeeper's array.
         deadlines: []u32,
+        /// The tick since which each slot has waited, idle, for its next
+        /// request (its last response sent); 0 when it is not idle. When
+        /// every slot is taken, the oldest is closed to admit a new client.
+        idle_since: []u32,
         /// Ticks since `run`, counted by the timekeeper: the server's clock.
         /// Starts at 1, so a deadline is never 0.
         tick: u32 = 1,
@@ -440,6 +446,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 .listener = listener,
                 .connections = try gpa.alloc(Connection, count),
                 .deadlines = try gpa.alloc(u32, count),
+                .idle_since = try gpa.alloc(u32, count),
                 .ticks_max = undefined,
                 .free = try gpa.alloc(u32, count),
                 .free_count = count,
@@ -464,6 +471,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 const table = stride(Header, headers, config.headers_max, index);
                 connection.parser = http1_head.Parser.init(config.head_limits(), table);
                 server.deadlines[index] = 0;
+                server.idle_since[index] = 0;
                 server.free[index] = count - 1 - index; // slot 0 is used first
             }
             server.recv_slab = recv;
@@ -476,6 +484,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         pub fn deinit(server: *Server, gpa: std.mem.Allocator) void {
             gpa.free(server.connections);
             gpa.free(server.deadlines);
+            gpa.free(server.idle_since);
             gpa.free(server.free);
             gpa.free(server.recv_slab);
             gpa.free(server.heads_slab);
@@ -501,17 +510,22 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.accept_loop();
         }
 
+        /// Accept first, then find a slot: when none is free, the connection
+        /// idle longest is closed for the new one (a server full of idle
+        /// keep-alives otherwise locks new clients out for the idle timeout).
+        /// With none idle, the new client waits for a slot, and the kernel's
+        /// backlog holds the rest.
         fn accept_loop(server: *Server) void {
             // A server's accept loop does not end: bounded only to say so.
             for (0..std.math.maxInt(u64)) |_| {
-                server.free_slots.waitUncancelable(server.io);
                 const stream = server.listener.accept(server.io) catch |err| {
-                    server.free_slots.post(server.io);
                     log.warn("accept: {t}", .{err});
                     // Out of descriptors: wait a tick rather than spin.
                     server.io.sleep(.fromMilliseconds(server.config.tick_ms), .awake) catch {};
                     continue;
                 };
+                if (server.free_count == 0) server.evict_idle();
+                server.free_slots.waitUncancelable(server.io);
                 const index = server.take_slot();
                 server.open_connection(index, stream);
                 server.stats.accepted += 1;
@@ -520,6 +534,24 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     server.close_connection(&server.connections[index]);
                 };
             } else unreachable;
+        }
+
+        /// Close the connection idle longest, if any is: the fiber waiting
+        /// on it reads 0 and closes, which frees its slot. One scan of one
+        /// array, as the timekeeper's. Only the read side is shut: a
+        /// response still being sent (the linked send-then-receive) is sent
+        /// whole before the read returns 0, so none is ever cut short.
+        fn evict_idle(server: *Server) void {
+            var oldest: ?u32 = null;
+            for (server.idle_since, 0..) |since, index| {
+                if (since == 0) continue;
+                if (oldest == null or since < server.idle_since[oldest.?]) oldest = @intCast(index);
+            }
+            const index = oldest orelse return;
+            assert(server.connections[index].open);
+            server.idle_since[index] = 0;
+            server.connections[index].stream.shutdown(server.io, .recv) catch {};
+            server.stats.evicted += 1;
         }
 
         fn take_slot(server: *Server) u32 {
@@ -559,6 +591,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             assert(connection.open);
             connection.open = false;
             server.deadlines[connection.index] = 0;
+            server.idle_since[connection.index] = 0;
             connection.stream.close(server.io);
             server.stats.closed += 1;
             server.give_slot(connection.index);
@@ -672,6 +705,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 const timeout = if (idle) config.idle_timeout_ms else config.head_timeout_ms;
                 const window = connection.recv[connection.recv_used..];
                 assert(window.len > 0); // the parser refuses before the buffer fills
+                if (idle) server.idle_since[connection.index] = server.tick;
+                defer server.idle_since[connection.index] = 0;
                 const got = connection.read_some(window, timeout) catch return false;
                 if (got == 0) return false; // closed, or timed out
                 connection.recv_used += got;
