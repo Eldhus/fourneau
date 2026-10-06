@@ -35,7 +35,17 @@ pub const Context = struct {
     alpn: []const []const u8 = &.{"http/1.1"},
 };
 
-pub const HandshakeError = error{ HandshakeFailed, KernelTlsFailed, EarlyDataTooLarge };
+pub const HandshakeError = error{
+    HandshakeFailed,
+    KernelTlsFailed,
+    EarlyDataTooLarge,
+    /// The first byte is not a TLS handshake record: plain HTTP, most
+    /// likely, which deserves an answer rather than a timeout.
+    NotTls,
+};
+
+/// A TLS record's content type for a handshake message (RFC 8446 §5.1).
+const record_type_handshake = 0x16;
 
 /// A connection's reads and writes as `std.Io`'s reader and writer, for
 /// tls.zig. `Connection` offers `read_some(buffer, timeout_ms) !u32` (0
@@ -146,6 +156,8 @@ pub fn handshake(
     context: *const Context,
     early: []u8,
 ) HandshakeError!u32 {
+    transport.reader.fill(1) catch return error.HandshakeFailed;
+    if (transport.reader.buffered()[0] != record_type_handshake) return error.NotTls;
     const random_source: std.Random.IoSource = .{ .io = io };
     var session = tls.server(&transport.reader, &transport.writer, .{
         .rng = random_source.interface(),

@@ -596,6 +596,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             const early = tls.handshake(server.io, &transport, socket, context, recv) catch |err| {
                 server.stats.handshakes_failed += 1;
                 log.debug("handshake: {t}", .{err});
+                switch (err) {
+                    error.NotTls => server.refuse_plain_http(connection),
+                    error.HandshakeFailed, error.KernelTlsFailed, error.EarlyDataTooLarge => {},
+                }
                 return false;
             };
             assert(early <= connection.recv.len);
@@ -603,6 +607,15 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.kernel_tls = true;
             server.stats.handshakes += 1;
             return true;
+        }
+
+        /// Plain HTTP sent to the HTTPS port: a plain 400 that says so (as
+        /// nginx does), then close.
+        fn refuse_plain_http(server: *Server, connection: *Connection) void {
+            assert(!connection.kernel_tls);
+            const body = "This port speaks HTTPS: use https://\n";
+            connection.keep_alive = false;
+            _ = server.write_response(connection, .{ .status = 400, .body = body });
         }
 
         /// One request, start to finish. False: close the connection.
