@@ -194,3 +194,12 @@ Read the diary, keep the tests, delete what did not pay, write it again.
   "experimental", how large are fiber stacks, are stackless coroutines in
   the language? If upstream can serve, shrink our port toward it.
   (2026-10-04)
+
+### 2027-04-30
+
+- [ ] Can listeners go back to io_uring's BIND? The port binds with the
+  system call because Ubuntu 24.04's kernel (6.8) lacks `IORING_OP_BIND`
+  (6.11; zig-io-evented's `netListenIp`). When the dragrace droplets and
+  the site host run a kernel of 6.11 or later (Ubuntu 26.04's image),
+  decide: drop the patch (one less difference from upstream), or keep it
+  (a startup call gains nothing from the ring). (2026-10-06)
