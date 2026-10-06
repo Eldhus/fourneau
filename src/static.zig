@@ -28,7 +28,7 @@ const server_module = @import("server.zig");
 const http1_response = @import("http1_response.zig");
 const http1_head = @import("http1_head.zig");
 const tls = @import("tls.zig");
-const acme = @import("acme.zig");
+const https = @import("https.zig");
 
 const files_max = 4096;
 const file_bytes_max = 16 * 1024 * 1024;
@@ -203,40 +203,8 @@ test "static: Range, as RFC 9110 §14 reads it" {
 
 const Server = server_module.ServerType(App, .{ .send_then_receive = Evented.sendThenReceive });
 
-/// Plain HTTP beside HTTPS (port 80): every request goes to the same path
-/// on `https://host` (301; 308 for methods other than GET and HEAD, which
-/// keeps the method and body), so a browser that types the address bare
-/// lands on HTTPS. The host is the configured one, never the request's
-/// Host header.
-const Redirect = struct {
-    host: []const u8,
-
-    pub const Response = App.Response;
-
-    pub fn handle(redirect: *Redirect, request: *RedirectServer.Request) Response {
-        const head = request.head;
-        var memory = std.heap.FixedBufferAllocator.init(request.scratch);
-        const allocator = memory.allocator();
-        const location = std.fmt.allocPrint(allocator, "https://{s}{s}", .{
-            redirect.host,
-            head.path_and_query,
-        }) catch return .{ .status = 414, .headers = &.{}, .body = "" };
-        const headers = allocator.alloc(http1_response.Header, 1) catch
-            return .{ .status = 414, .headers = &.{}, .body = "" };
-        headers[0] = .{ .name = "Location", .value = location };
-        const keeps_method = head.method == .get or head.method == .head;
-        return .{ .status = if (keeps_method) 301 else 308, .headers = headers, .body = "" };
-    }
-
-    pub fn release(redirect: *Redirect, response: *Response) void {
-        _ = redirect;
-        response.* = undefined;
-    }
-};
-
-const RedirectServer = server_module.ServerType(Redirect, .{
-    .send_then_receive = Evented.sendThenReceive,
-});
+/// Port 80 beside HTTPS: redirects (https.zig).
+const Redirect = https.RedirectType(.{ .send_then_receive = Evented.sendThenReceive });
 
 /// True when the request's If-None-Match names this ETag (or `*`).
 fn fresh(headers: []const http1_head.Header, etag: []const u8) bool {
@@ -270,16 +238,16 @@ fn content_type(name: []const u8) []const u8 {
 }
 
 /// A file as served: its body and its headers, the ETag a hash of the body.
-fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8, https: bool) !File {
+fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8, secure: bool) !File {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
     const compressed = if (compressible(name, body.len)) try gzip(gpa, body) else null;
     // A copy at least a tenth smaller is worth its CPU and memory.
     const worth = if (compressed) |bytes| bytes.len * 10 < body.len * 9 else false;
     const tag = try std.fmt.allocPrint(gpa, "{x}", .{digest[0..8]});
-    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth, https) };
+    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth, secure) };
     if (worth) {
-        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true, https);
+        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true, secure);
     } else if (compressed) |bytes| gpa.free(bytes);
     return file;
 }
@@ -293,7 +261,7 @@ fn make_variant(
     tag: []const u8,
     encoding: ?[]const u8,
     vary: bool,
-    https: bool,
+    secure: bool,
 ) !Variant {
     // Each copy its own ETag, as each has its own bytes.
     const etag = if (encoding) |coding|
@@ -313,7 +281,7 @@ fn make_variant(
     if (vary) try headers.append(gpa, .{ .name = "Vary", .value = "Accept-Encoding" });
     // HTTPS from now on, for a year (browsers ignore it for an IP address:
     // it takes effect when the site has a name).
-    if (https) {
+    if (secure) {
         const policy = "max-age=31536000";
         try headers.append(gpa, .{ .name = "Strict-Transport-Security", .value = policy });
     }
@@ -421,7 +389,7 @@ test "static: a compressible file gets a smaller gzip copy that inflates back" {
 }
 
 /// Read every file under `root` into `site`, with its routes.
-fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site, https: bool) !void {
+fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site, secure: bool) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
     var walker = try dir.walk(gpa);
@@ -439,7 +407,7 @@ fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site, https
         const body = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(file_bytes_max));
         site_bytes += body.len;
         if (site_bytes > site_bytes_max) return error.SiteTooLarge;
-        const file = try make_file(gpa, entry.basename, body, https);
+        const file = try make_file(gpa, entry.basename, body, secure);
         try add_routes(gpa, site, entry.path, file);
     } else return error.TooManyEntries;
 }
@@ -486,18 +454,8 @@ const Options = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     shards: u32 = 0,
-    cert: ?[]const u8 = null,
-    key: ?[]const u8 = null,
-    acme_directory: ?[]const u8 = null,
-    acme_identifier: ?[]const u8 = null,
-    acme_state: ?[]const u8 = null,
-    acme_profile: ?[]const u8 = null,
-    acme_http_port: u16 = 80,
-    acme_ca: ?[]const u8 = null,
-    /// A plain-HTTP port that redirects to HTTPS (80 in production).
-    redirect_port: ?u16 = null,
-    /// The host the redirect names: the ACME identifier unless given.
-    https_host: ?[]const u8 = null,
+    /// The certificate (files or ACME) and the redirect: https.zig.
+    https: https.Options = .{},
 };
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -516,37 +474,29 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
         } else if (std.mem.eql(u8, arg, "--shards")) {
             options.shards = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, arg, "--cert")) {
-            options.cert = value;
+            options.https.cert = value;
         } else if (std.mem.eql(u8, arg, "--key")) {
-            options.key = value;
+            options.https.key = value;
         } else if (std.mem.eql(u8, arg, "--acme-directory")) {
-            options.acme_directory = value;
+            options.https.acme_directory = value;
         } else if (std.mem.eql(u8, arg, "--acme-identifier")) {
-            options.acme_identifier = value;
+            options.https.acme_identifier = value;
         } else if (std.mem.eql(u8, arg, "--acme-state")) {
-            options.acme_state = value;
+            options.https.acme_state = value;
         } else if (std.mem.eql(u8, arg, "--acme-profile")) {
-            options.acme_profile = value;
+            options.https.acme_profile = value;
         } else if (std.mem.eql(u8, arg, "--acme-http-port")) {
-            options.acme_http_port = try std.fmt.parseInt(u16, value, 10);
+            options.https.acme_http_port = try std.fmt.parseInt(u16, value, 10);
         } else if (std.mem.eql(u8, arg, "--acme-ca")) {
-            options.acme_ca = value;
+            options.https.acme_ca = value;
         } else if (std.mem.eql(u8, arg, "--redirect-port")) {
-            options.redirect_port = try std.fmt.parseInt(u16, value, 10);
+            options.https.redirect_port = try std.fmt.parseInt(u16, value, 10);
         } else if (std.mem.eql(u8, arg, "--https-host")) {
-            options.https_host = value;
+            options.https.https_host = value;
         } else return error.Usage;
     }
     if (options.root == null) return error.Usage;
-    // Both or neither: half a certificate is a mistake, not plain HTTP.
-    if ((options.cert == null) != (options.key == null)) return error.Usage;
-    const acme_given = options.acme_directory != null;
-    if (acme_given != (options.acme_identifier != null)) return error.Usage;
-    if (acme_given != (options.acme_state != null)) return error.Usage;
-    if (acme_given and options.cert != null) return error.Usage; // one source of certificate
-    if (options.https_host == null) options.https_host = options.acme_identifier;
-    // A redirect needs an HTTPS site and a host to name.
-    if (options.redirect_port != null and options.https_host == null) return error.Usage;
+    try options.https.check();
     return options;
 }
 
@@ -557,20 +507,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // shard exists.
     const io = std.Io.Threaded.global_single_threaded.io();
     var site: Site = .{};
-    const https_site = options.cert != null or options.acme_directory != null;
-    try load(gpa, io, options.root.?, &site, https_site);
+    try load(gpa, io, options.root.?, &site, options.https.enabled());
     if (site.routes.count() == 0) return error.EmptySite;
     // The certificate, loaded once and shared read-only by every shard.
-    var auth: tls.CertKeyPair = undefined;
-    var context: tls.Context = undefined;
-    if (options.acme_directory != null) try use_acme(gpa, io, &options);
-    const https = options.cert != null;
-    if (https) {
-        const cwd = std.Io.Dir.cwd();
-        auth = try tls.CertKeyPair.fromFilePath(gpa, io, cwd, options.cert.?, options.key.?);
-        context = .{ .auth = &auth };
-    }
-    const shared: Shared = .{ .site = &site, .tls = if (https) &context else null };
+    const shared: Shared = .{ .site = &site, .tls = try https.context(gpa, io, options.https) };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
     var threads: [shards_max]std.Thread = undefined;
@@ -579,33 +519,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     std.debug.print("fourneau-static: {d} routes on {s}://{s}:{d} ({d} shards)\n", .{
         site.routes.count(),
-        if (https) "https" else "http",
+        if (shared.tls != null) "https" else "http",
         options.address,
         options.port,
         options.shards,
     });
     run_shard(&shared, options);
-}
-
-/// A fresh certificate in the ACME state directory (obtained now if need
-/// be), then served as if given with --cert and --key.
-fn use_acme(gpa: std.mem.Allocator, io: std.Io, options: *Options) !void {
-    const value = options.acme_identifier.?;
-    const identifier: acme.Identifier = if (std.Io.net.IpAddress.parse(value, 0)) |address|
-        .{ .ip = address }
-    else |_|
-        .{ .dns = value };
-    const state = options.acme_state.?;
-    try acme.ensure(gpa, io, .{
-        .directory_url = options.acme_directory.?,
-        .identifier = identifier,
-        .profile = options.acme_profile,
-        .state_dir = state,
-        .http_port = options.acme_http_port,
-        .ca_bundle_path = options.acme_ca,
-    });
-    options.cert = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ state, acme.cert_file });
-    options.key = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ state, acme.key_file });
 }
 
 /// What every shard reads and none writes.
@@ -625,7 +544,7 @@ fn cpu_count() u32 {
     return @min(count, shards_max);
 }
 
-fn run_redirect(redirect_server: *RedirectServer) void {
+fn run_redirect(redirect_server: *Redirect.Server) void {
     redirect_server.run() catch |err| std.debug.panic("redirect: {t}", .{err});
 }
 
@@ -651,20 +570,11 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     });
     var group: std.Io.Group = .init;
     var redirect: Redirect = undefined;
-    var redirect_server: RedirectServer = undefined;
-    if (options.redirect_port) |port| {
+    var redirect_server: Redirect.Server = undefined;
+    if (options.https.redirect_port) |port| {
         assert(shared.tls != null); // redirecting to an HTTPS site
-        redirect = .{ .host = options.https_host.? };
-        const plain = try std.Io.net.IpAddress.parse(options.address, port);
-        const listen_options: std.Io.net.IpAddress.ListenOptions = .{
-            .reuse_address = true,
-            .kernel_backlog = 1024,
-        };
-        const plain_listener = try plain.listen(io, listen_options);
-        redirect_server = try RedirectServer.init(gpa, io, &redirect, plain_listener, .{
-            .connections_max = 64,
-            .scratch_bytes_max = 16 * 1024,
-        });
+        redirect = .{ .host = options.https.https_host.? };
+        redirect_server = try redirect.listen(gpa, io, options.address, port);
         try group.concurrent(io, run_redirect, .{&redirect_server});
     }
     try server.run();

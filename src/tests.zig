@@ -21,4 +21,5 @@ test {
     _ = @import("der.zig");
     _ = @import("acme_crypto.zig");
     _ = @import("acme.zig");
+    _ = @import("https.zig");
 }
