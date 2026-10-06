@@ -1025,3 +1025,13 @@ Pebble's root. A restart finds it fresh and keeps it.
       --acme-ca pebble/test/certs/pebble.minica.pem --acme-profile shortlived
 
 The plan said tls-alpn-01; this is http-01 (DESIGN.md, Layers: acme).
+
+## 2026-10-06: port 80 redirects to HTTPS
+
+`fourneau-static --redirect-port 80` runs a second, small server in each
+shard (64 connections, 16 KiB of scratch each) beside the HTTPS one: 301
+to `https://<host><path?query>` for GET and HEAD, 308 for anything else
+(keeping the method and body). The host is the configured one
+(`--https-host`, default the ACME identifier), never the request's Host
+header. Two shards, Pebble's certificate: GET 301, POST 308, and curl
+following the redirect gets 200 with the chain verified.
