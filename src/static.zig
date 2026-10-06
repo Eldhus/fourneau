@@ -132,6 +132,9 @@ fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site) !void
     for (0..files_max * 8) |_| {
         const entry = (try walker.next(io)) orelse break;
         if (entry.kind != .file) continue;
+        // Hidden files are never pages: a deploy's marker, `.git`, an
+        // editor's swap file. Serving one is how secrets leak.
+        if (is_hidden(entry.path)) continue;
         files += 1;
         if (files > files_max) return error.TooManyFiles;
         const body = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(file_bytes_max));
@@ -140,6 +143,24 @@ fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site) !void
         const file = try make_file(gpa, entry.basename, body);
         try add_routes(gpa, site, entry.path, file);
     } else return error.TooManyEntries;
+}
+
+/// Whether any component of a relative path starts with a dot.
+fn is_hidden(path: []const u8) bool {
+    assert(path.len > 0);
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len > 0 and component[0] == '.') return true;
+    }
+    return false;
+}
+
+test "static: hidden files and directories are not served" {
+    try std.testing.expect(is_hidden(".deployed"));
+    try std.testing.expect(is_hidden(".git/config"));
+    try std.testing.expect(is_hidden("docs/.draft.html"));
+    try std.testing.expect(!is_hidden("index.html"));
+    try std.testing.expect(!is_hidden("data/runs/a.json"));
 }
 
 fn add_routes(gpa: std.mem.Allocator, site: *Site, path: []const u8, file: File) !void {
