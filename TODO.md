@@ -23,6 +23,15 @@
      2026-10-06 (DIARY). Next: idle eviction and the fiber pool (Todo),
      then M6 (static files and compression).
 
+2. **HTTPS and templates, end to end and deployed.** (owner, 2026-10-06)
+   "Work through a few more milestones, particularly templating and
+   https": M7 (TLS), M8 (ACME), M10 (deploy: the dragrace site on 443),
+   with roux's templates and the dragrace's templates workload; then M6
+   and M9. Iteratively, TigerStyle, data-oriented, until deployed.
+   - Where it stands (2026-10-06): started. Order: M7 (tls.zig vendored,
+     handshake on the connection's fiber, kTLS), M8, M10; templates in
+     roux and the dragrace (their TODOs); M6; M9.
+
 ## Plan
 
 The road to a server on the internet with nothing in front of it.
