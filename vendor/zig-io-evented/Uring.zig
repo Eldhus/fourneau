@@ -6227,7 +6227,18 @@ fn netListenIp(
     }
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
-    try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
+    // fourneau: bind with the system call, not IORING_OP_BIND, which Linux
+    // gained only in 6.11 (Ubuntu 24.04's 6.8 answers EINVAL). A listener
+    // binds once, at startup, so nothing is lost by blocking.
+    switch (linux.errno(linux.bind(socket_fd, &storage.any, addr_len))) {
+        .SUCCESS => {},
+        .ACCES => return error.AccessDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .NOMEM => return error.SystemResources,
+        else => |err| return unexpectedErrno(err),
+    }
     switch (linux.errno(linux.listen(socket_fd, options.kernel_backlog))) {
         .SUCCESS => {},
         .ADDRINUSE => return error.AddressInUse,
