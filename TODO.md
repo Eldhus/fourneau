@@ -199,6 +199,15 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 - [ ] `fourneau-static` names the file that broke a limit at load
   (`StreamTooLong` alone, 2026-10-06, for a 33 MB file in the root).
   (2026-10-06)
+- [ ] Graceful shutdown (M6; M10's graceful restart needs it): on
+  SIGTERM, each shard stops accepting, shuts its idle connections for
+  reading (as eviction does), lets requests in flight finish within a
+  deadline, then returns; the process exits when every shard has. The
+  signal reaches a shard without shared memory: one eventfd per shard,
+  written by the signal thread, read by a fiber in the shard, which
+  cancels its accept loop. First, the simulator must model cancellation
+  (today its `cancel` awaits), so the drain is tested like everything
+  else. (2026-10-06)
 
 ## Tickler
 
