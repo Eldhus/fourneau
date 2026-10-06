@@ -36,9 +36,13 @@
      fourneau-static (443 with Let's Encrypt for the host's IP address,
      the six-day profile; port 80 redirecting; renewal by a daily
      restart): the dragrace site, https://174.138.75.219/, verified by
-     curl with the system's trust. Next: templates in roux and the
-     dragrace (their TODOs); M7's last checks (Zig's TLS client,
-     testssl.sh); M6; M9; M10's graceful restart and the roux app.
+     curl with the system's trust. M7's checks done (2026-10-06): Zig's
+     std.http.Client fetches the site; testssl.sh 3.2 finds TLS 1.3 only,
+     the chain and name OK, no vulnerability (BREACH flagged for gzip:
+     a static site has no secrets to leak); HSTS now sent. Templates in
+     roux and the dragrace are done (their TODOs). Next: M6's rest
+     (Range, brotli, graceful shutdown), M9, M10's graceful restart and
+     the roux app.
 
 ## Plan
 

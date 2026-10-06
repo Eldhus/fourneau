@@ -174,16 +174,16 @@ fn content_type(name: []const u8) []const u8 {
 }
 
 /// A file as served: its body and its headers, the ETag a hash of the body.
-fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8) !File {
+fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8, https: bool) !File {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
     const compressed = if (compressible(name, body.len)) try gzip(gpa, body) else null;
     // A copy at least a tenth smaller is worth its CPU and memory.
     const worth = if (compressed) |bytes| bytes.len * 10 < body.len * 9 else false;
     const tag = try std.fmt.allocPrint(gpa, "{x}", .{digest[0..8]});
-    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth) };
+    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth, https) };
     if (worth) {
-        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true);
+        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true, https);
     } else if (compressed) |bytes| gpa.free(bytes);
     return file;
 }
@@ -197,6 +197,7 @@ fn make_variant(
     tag: []const u8,
     encoding: ?[]const u8,
     vary: bool,
+    https: bool,
 ) !Variant {
     // Each copy its own ETag, as each has its own bytes.
     const etag = if (encoding) |coding|
@@ -212,6 +213,12 @@ fn make_variant(
         try headers.append(gpa, .{ .name = "Content-Encoding", .value = coding });
     }
     if (vary) try headers.append(gpa, .{ .name = "Vary", .value = "Accept-Encoding" });
+    // HTTPS from now on, for a year (browsers ignore it for an IP address:
+    // it takes effect when the site has a name).
+    if (https) {
+        const policy = "max-age=31536000";
+        try headers.append(gpa, .{ .name = "Strict-Transport-Security", .value = policy });
+    }
     return .{ .body = body, .headers = try headers.toOwnedSlice(gpa), .etag = etag };
 }
 
@@ -304,7 +311,7 @@ test "static: a compressible file gets a smaller gzip copy that inflates back" {
         try page_buffer.appendSlice(arena, line);
     }
     const page = page_buffer.items;
-    const file = try make_file(arena, "page.html", page);
+    const file = try make_file(arena, "page.html", page, false);
     const compressed = file.gzip orelse return error.TestExpectedGzip;
     try std.testing.expect(compressed.body.len < page.len / 4);
     var input: std.Io.Reader = .fixed(compressed.body);
@@ -316,7 +323,7 @@ test "static: a compressible file gets a smaller gzip copy that inflates back" {
 }
 
 /// Read every file under `root` into `site`, with its routes.
-fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site) !void {
+fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site, https: bool) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
     var walker = try dir.walk(gpa);
@@ -334,7 +341,7 @@ fn load(gpa: std.mem.Allocator, io: std.Io, root: []const u8, site: *Site) !void
         const body = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(file_bytes_max));
         site_bytes += body.len;
         if (site_bytes > site_bytes_max) return error.SiteTooLarge;
-        const file = try make_file(gpa, entry.basename, body);
+        const file = try make_file(gpa, entry.basename, body, https);
         try add_routes(gpa, site, entry.path, file);
     } else return error.TooManyEntries;
 }
@@ -452,7 +459,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // shard exists.
     const io = std.Io.Threaded.global_single_threaded.io();
     var site: Site = .{};
-    try load(gpa, io, options.root.?, &site);
+    const https_site = options.cert != null or options.acme_directory != null;
+    try load(gpa, io, options.root.?, &site, https_site);
     if (site.routes.count() == 0) return error.EmptySite;
     // The certificate, loaded once and shared read-only by every shard.
     var auth: tls.CertKeyPair = undefined;
@@ -570,9 +578,9 @@ test "static: routes for pages, directories and the 404" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var site: Site = .{};
-    const page = try make_file(arena, "a.html", "page");
-    const index = try make_file(arena, "index.html", "index");
-    const missing = try make_file(arena, "404.html", "missing");
+    const page = try make_file(arena, "a.html", "page", false);
+    const index = try make_file(arena, "index.html", "index", false);
+    const missing = try make_file(arena, "404.html", "missing", false);
     try add_routes(arena, &site, "index.html", index);
     try add_routes(arena, &site, "about.html", page);
     try add_routes(arena, &site, "docs/index.html", index);

@@ -1087,3 +1087,20 @@ Measured (fourneau-static, one shard, 1,024 slots, Python clients): 1,024
 idle connections, then a new client: served in 1 ms, exactly one idle
 connection closed; the next two, after it closed, needed none. (A first
 count said 429: my loop spent 51 s reading, past the idle timeout.)
+
+## 2026-10-06: M7's checks: Zig's client, testssl.sh
+
+Zig's own `std.http.Client` fetches https://174.138.75.219/about.html
+(200, the chain verified against the system's roots). testssl.sh 3.2 (run
+on the site host against its public address: the laptop has no DNS tool
+and its Docker daemon is off): TLS 1.3 only, SSLv2 to TLS 1.2 not offered,
+trust OK via the SAN, chain of trust OK, a six-day certificate; Heartbleed,
+CCS, Ticketbleed, ROBOT, renegotiation, CRIME, POODLE, SWEET32, FREAK,
+DROWN, LOGJAM, BEAST, LUCKY13, RC4: not vulnerable. Two notes:
+
+- BREACH, "potentially NOT ok" for gzip: it needs a compressed response
+  holding a secret beside attacker-reflected input; a static site has
+  neither. Not applicable here; roux apps that compress must think again.
+- No Strict-Transport-Security: now sent on an HTTPS site, a year.
+  Browsers ignore it for an IP address; it counts once the site has a
+  name.
