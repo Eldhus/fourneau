@@ -32,6 +32,10 @@ pub const Limits = struct {
     /// may pause between pieces: chosen to cross the server's timeouts.
     idle_ticks_max: u32,
     pause_ticks_max: u32,
+    /// The longest silence after a cut-short stream's last byte before
+    /// the server closes: a few network turns, always shorter than its idle
+    /// timeout, so a server that waits for the client instead is caught.
+    cut_short_silence_ticks_max: u32,
 };
 
 pub const requests_max = 16;
@@ -78,7 +82,38 @@ pub const Target = union(enum) {
     status: u16,
     /// `/big/<n>`: answered with n bytes.
     big: u32,
+    /// `/stream/<n>/<k>`: `/big/<n>`'s bytes, streamed in k pieces, a
+    /// chunk each (an empty piece is no chunk).
+    stream: Stream,
+    /// `/abort/<n>/<k>`: the stream's first k/2 pieces, then the handler
+    /// gives up: the response is cut short and the connection closed.
+    abort: Stream,
 };
+
+pub const Stream = struct {
+    bytes: u32,
+    pieces: u8,
+};
+
+/// The most pieces a streamed answer has, and so chunks a response.
+pub const stream_pieces_max = 8;
+
+/// Where piece `index` of a stream of `bytes` in `pieces` starts and ends:
+/// as even as integers allow, so a piece is empty only when bytes < pieces.
+pub fn stream_piece(bytes: u32, pieces: u8, index: u8) struct { start: u32, end: u32 } {
+    assert(pieces >= 1 and pieces <= stream_pieces_max);
+    assert(index < pieces);
+    const start: u32 = @intCast(@as(u64, bytes) * index / pieces);
+    const end: u32 = @intCast(@as(u64, bytes) * (index + 1) / pieces);
+    assert(start <= end and end <= bytes);
+    return .{ .start = start, .end = end };
+}
+
+/// The pieces an aborted stream sends before it gives up.
+pub fn abort_pieces(pieces: u8) u8 {
+    assert(pieces >= 1 and pieces <= stream_pieces_max);
+    return pieces / 2;
+}
 
 pub const Spec = struct {
     kind: Kind,
@@ -118,6 +153,8 @@ pub const Failure = enum {
     response_unsolicited,
     response_truncated,
     closed_without_response,
+    /// A stream cut short, and the connection left open.
+    cut_short_not_closed,
 };
 
 // --- generation ----------------------------------------------------------------
@@ -167,10 +204,16 @@ fn generate_method(prng: *Prng) Method {
 
 fn generate_target(prng: *Prng, limits: Limits) Target {
     const statuses = [_]u16{ 200, 201, 204, 304, 404, 418, 500 };
-    return switch (prng.int_less_than(u32, 8)) {
+    const stream: Stream = .{
+        .bytes = prng.int_at_most(u32, 0, limits.big_bytes_max),
+        .pieces = prng.int_at_most(u8, 1, stream_pieces_max),
+    };
+    return switch (prng.int_less_than(u32, 11)) {
         0 => .root,
         1, 2 => .{ .status = statuses[prng.int_less_than(usize, statuses.len)] },
         3 => .{ .big = prng.int_at_most(u32, 0, limits.big_bytes_max) },
+        4, 5 => .{ .stream = stream },
+        6 => .{ .abort = stream },
         else => .{ .echo = prng.int_less_than(u32, 1_000_000) },
     };
 }
@@ -195,6 +238,10 @@ fn target_text(spec: *const Spec, out: []u8) []const u8 {
         .echo => |n| std.fmt.bufPrint(out, "/echo/{d}?q={d}", .{ n, n % 7 }) catch unreachable,
         .status => |code| std.fmt.bufPrint(out, "/s/{d}", .{code}) catch unreachable,
         .big => |n| std.fmt.bufPrint(out, "/big/{d}", .{n}) catch unreachable,
+        .stream => |s| std.fmt.bufPrint(out, "/stream/{d}/{d}", .{ s.bytes, s.pieces }) catch
+            unreachable,
+        .abort => |s| std.fmt.bufPrint(out, "/abort/{d}/{d}", .{ s.bytes, s.pieces }) catch
+            unreachable,
     };
 }
 
@@ -328,9 +375,11 @@ pub fn answer(
     }
     if (std.mem.startsWith(u8, path, "/big/")) {
         const length = std.fmt.parseInt(u32, path[5..], 10) catch 0;
-        assert(length <= out.len);
-        for (out[0..length], 0..) |*byte, offset| byte.* = body_byte(length, offset);
-        return .{ .status = 200, .body = out[0..length] };
+        return .{ .status = 200, .body = big_body(length, out) };
+    }
+    if (stream_target(path)) |target| {
+        // The whole stream; the application sends it in pieces.
+        return .{ .status = 200, .body = big_body(target.stream.bytes, out) };
     }
     const text = std.fmt.bufPrint(out, "{s} {s} {d} {x}\n", .{
         method, path, body_bytes, body_checksum,
@@ -338,39 +387,82 @@ pub fn answer(
     return .{ .status = 200, .body = text };
 }
 
+fn big_body(length: u32, out: []u8) []const u8 {
+    assert(length <= out.len);
+    for (out[0..length], 0..) |*byte, offset| byte.* = body_byte(length, offset);
+    return out[0..length];
+}
+
+pub const StreamTarget = struct { stream: Stream, aborted: bool };
+
+/// `/stream/<n>/<k>` or `/abort/<n>/<k>`, read back; null for any other
+/// path, and for one the clients never send.
+pub fn stream_target(path: []const u8) ?StreamTarget {
+    const aborted = std.mem.startsWith(u8, path, "/abort/");
+    if (!aborted and !std.mem.startsWith(u8, path, "/stream/")) return null;
+    const rest = path[if (aborted) "/abort/".len else "/stream/".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const bytes = std.fmt.parseInt(u32, rest[0..slash], 10) catch return null;
+    const pieces = std.fmt.parseInt(u8, rest[slash + 1 ..], 10) catch return null;
+    if (pieces < 1 or pieces > stream_pieces_max) return null;
+    return .{ .stream = .{ .bytes = bytes, .pieces = pieces }, .aborted = aborted };
+}
+
 pub const Expectation = struct {
     status: u16,
     body: []const u8,
-    /// HEAD: a Content-Length but no body.
+    /// HEAD: a Content-Length (or chunked framing) but no body.
     head: bool,
     /// The server closes after it.
     closes: bool,
     /// A 503 (and close) is also correct: the body buffers were all taken.
     may_be_unavailable: bool,
+    /// Streamed: `Transfer-Encoding: chunked`, a chunk per non-empty piece.
+    chunked: bool,
+    chunk_sizes: [stream_pieces_max]u32,
+    chunk_count: u8,
+    /// The handler gave up: the chunks above, then the connection closes
+    /// with no last chunk.
+    cut_short: bool,
 };
 
 pub fn expect(spec: *const Spec, out: []u8) Expectation {
-    if (spec.kind != .valid) {
-        return .{
-            .status = spec.kind.status(),
-            .body = "",
-            .head = false,
-            .closes = true,
-            // A bad chunk is found only while reading the body, which needs
-            // a body buffer first: without one, 503 comes before the 400.
-            .may_be_unavailable = spec.kind == .bad_chunk_size,
-        };
-    }
+    var expectation: Expectation = .{
+        .status = if (spec.kind == .valid) 0 else spec.kind.status(),
+        .body = "",
+        .head = false,
+        .closes = true,
+        // A bad chunk is found only while reading the body, which needs
+        // a body buffer first: without one, 503 comes before the 400.
+        .may_be_unavailable = spec.kind == .bad_chunk_size,
+        .chunked = false,
+        .chunk_sizes = @splat(0),
+        .chunk_count = 0,
+        .cut_short = false,
+    };
+    if (spec.kind != .valid) return expectation;
     var target_buffer: [64]u8 = undefined;
     const path = target_text(spec, &target_buffer);
     const result = answer(@tagName(spec.method), path, spec.body_bytes, spec_checksum(spec), out);
-    return .{
-        .status = result.status,
-        .body = result.body,
-        .head = spec.method == .HEAD,
-        .closes = spec.close,
-        .may_be_unavailable = spec.has_body(),
-    };
+    expectation.status = result.status;
+    expectation.body = result.body;
+    expectation.head = spec.method == .HEAD;
+    expectation.closes = spec.close;
+    expectation.may_be_unavailable = spec.has_body();
+    const target = stream_target(path) orelse return expectation;
+    expectation.chunked = true;
+    expectation.cut_short = target.aborted;
+    const pieces = if (target.aborted) abort_pieces(target.stream.pieces) else target.stream.pieces;
+    for (0..pieces) |index| {
+        const piece = stream_piece(target.stream.bytes, target.stream.pieces, @intCast(index));
+        if (piece.end == piece.start) continue;
+        expectation.chunk_sizes[expectation.chunk_count] = piece.end - piece.start;
+        expectation.chunk_count += 1;
+        expectation.body = result.body[0..piece.end];
+    }
+    if (expectation.chunk_count == 0) expectation.body = "";
+    if (expectation.head) expectation.chunk_count = 0;
+    return expectation;
 }
 
 /// Appends to a fixed buffer, recording overflow.
@@ -410,6 +502,12 @@ pub const Response = struct {
     content_length: u64,
     closes: bool,
     has_date: bool,
+    /// `Transfer-Encoding: chunked`: the body is its chunks, decoded.
+    chunked: bool,
+    chunk_sizes: [stream_pieces_max]u32,
+    chunk_count: u8,
+    /// Read by `parse_cut_short`: the server ended the stream early.
+    cut_short: bool,
     body: []const u8,
     /// Bytes of the response, head and body.
     bytes: usize,
@@ -421,9 +519,10 @@ pub const ParseResult = union(enum) {
     response: Response,
 };
 
-/// One response from the start of `bytes`: strict, because the server's
-/// output must be exactly well-formed. `head` says the request was HEAD.
-pub fn parse_response(bytes: []const u8, head: bool) ParseResult {
+/// The head of a response, and where its body starts.
+const ParsedHead = struct { response: Response, length_seen: bool, body_start: usize };
+
+fn parse_head(bytes: []const u8) union(enum) { incomplete, malformed, head: ParsedHead } {
     const head_end = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse return .incomplete;
     var lines = std.mem.splitSequence(u8, bytes[0..head_end], "\r\n");
     const status_line = lines.next().?;
@@ -431,39 +530,193 @@ pub fn parse_response(bytes: []const u8, head: bool) ParseResult {
     if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) return .malformed;
     if (status_line[12] != ' ') return .malformed;
     const status = std.fmt.parseInt(u16, status_line[9..12], 10) catch return .malformed;
-    var response: Response = .{
+    var parsed: ParsedHead = .{ .response = .{
         .status = status,
         .content_length = 0,
         .closes = false,
         .has_date = false,
+        .chunked = false,
+        .chunk_sizes = @splat(0),
+        .chunk_count = 0,
+        .cut_short = false,
         .body = "",
         .bytes = 0,
-    };
-    var length_seen = false;
+    }, .length_seen = false, .body_start = head_end + 4 };
+    const response = &parsed.response;
     for (0..256) |_| {
         const line = lines.next() orelse break;
         const colon = std.mem.indexOf(u8, line, ": ") orelse return .malformed;
         const name = line[0..colon];
         const value = line[colon + 2 ..];
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            if (length_seen) return .malformed;
-            length_seen = true;
+            if (parsed.length_seen) return .malformed;
+            parsed.length_seen = true;
             response.content_length = std.fmt.parseInt(u64, value, 10) catch return .malformed;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            // The server writes exactly this, once, or nothing.
+            if (response.chunked or !std.mem.eql(u8, value, "chunked")) return .malformed;
+            response.chunked = true;
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             response.closes = std.mem.eql(u8, value, "close");
         } else if (std.ascii.eqlIgnoreCase(name, "date")) {
             response.has_date = value.len == 29 and std.mem.endsWith(u8, value, " GMT");
         }
     } else return .malformed;
+    const framed = parsed.length_seen or response.chunked;
     const no_body = status < 200 or status == 204 or status == 304;
-    if (no_body and length_seen) return .malformed;
-    if (!no_body and !length_seen) return .malformed;
-    const body_bytes: usize = if (head or no_body) 0 else @intCast(response.content_length);
-    const total = head_end + 4 + body_bytes;
+    if (parsed.length_seen and response.chunked) return .malformed;
+    if (no_body == framed) return .malformed;
+    return .{ .head = parsed };
+}
+
+/// One response from the start of `bytes`: strict, because the server's
+/// output must be exactly well-formed. `head` says the request was HEAD.
+/// A chunked body is decoded into `decoded`.
+pub fn parse_response(bytes: []const u8, head: bool, decoded: []u8) ParseResult {
+    const parsed = switch (parse_head(bytes)) {
+        .incomplete => return .incomplete,
+        .malformed => return .malformed,
+        .head => |parsed| parsed,
+    };
+    var response = parsed.response;
+    const no_body = response.status < 200 or response.status == 204 or response.status == 304;
+    if (head or no_body) {
+        response.bytes = parsed.body_start;
+        return .{ .response = response };
+    }
+    if (response.chunked) {
+        const chunks = switch (decode_chunks(bytes[parsed.body_start..], decoded)) {
+            .malformed => return .malformed,
+            .chunks => |chunks| chunks,
+        };
+        if (!chunks.last) return .incomplete;
+        return .{ .response = with_chunks(response, chunks, parsed.body_start, decoded) };
+    }
+    const total = parsed.body_start + @as(usize, @intCast(response.content_length));
     if (bytes.len < total) return .incomplete;
-    response.body = bytes[head_end + 4 .. total];
+    response.body = bytes[parsed.body_start..total];
     response.bytes = total;
     return .{ .response = response };
+}
+
+/// A streamed response the server cut short: a chunked head, whole chunks,
+/// and nothing more (no last chunk, no partial one). Null when `bytes` are
+/// not exactly that.
+pub fn parse_cut_short(bytes: []const u8, decoded: []u8) ?Response {
+    const parsed = switch (parse_head(bytes)) {
+        .incomplete, .malformed => return null,
+        .head => |parsed| parsed,
+    };
+    if (!parsed.response.chunked) return null;
+    const rest = bytes[parsed.body_start..];
+    const chunks = switch (decode_chunks(rest, decoded)) {
+        .malformed => return null,
+        .chunks => |chunks| chunks,
+    };
+    if (chunks.last or chunks.consumed != rest.len) return null;
+    var response = with_chunks(parsed.response, chunks, parsed.body_start, decoded);
+    response.cut_short = true;
+    return response;
+}
+
+fn with_chunks(response: Response, chunks: Chunks, body_start: usize, decoded: []u8) Response {
+    var result = response;
+    result.chunk_sizes = chunks.sizes;
+    result.chunk_count = chunks.count;
+    result.body = decoded[0..chunks.body_bytes];
+    result.bytes = body_start + chunks.consumed;
+    return result;
+}
+
+const Chunks = struct {
+    sizes: [stream_pieces_max]u32,
+    count: u8,
+    body_bytes: usize,
+    /// Bytes of whole chunks read (and of the last chunk, when `last`).
+    consumed: usize,
+    last: bool,
+};
+
+/// The whole chunks at the start of a chunked body, as fourneau writes
+/// them: lowercase hex sizes with no leading zero, no extensions, data,
+/// CRLF; the last chunk `0` with no trailers. More chunks than a stream
+/// has pieces is malformed too.
+fn decode_chunks(bytes: []const u8, decoded: []u8) union(enum) { malformed, chunks: Chunks } {
+    var chunks: Chunks = .{
+        .sizes = @splat(0),
+        .count = 0,
+        .body_bytes = 0,
+        .consumed = 0,
+        .last = false,
+    };
+    for (0..stream_pieces_max + 2) |_| {
+        const rest = bytes[chunks.consumed..];
+        const line_end = std.mem.indexOf(u8, rest, "\r\n") orelse {
+            // Up to 16 digits may still be on their way; more cannot be.
+            return if (rest.len > 16) .malformed else .{ .chunks = chunks };
+        };
+        const digits = rest[0..line_end];
+        if (digits.len == 0 or digits.len > 16) return .malformed;
+        if (digits.len > 1 and digits[0] == '0') return .malformed;
+        for (digits) |digit| {
+            if (!std.ascii.isDigit(digit) and !(digit >= 'a' and digit <= 'f')) return .malformed;
+        }
+        const size = std.fmt.parseInt(u64, digits, 16) catch return .malformed;
+        if (size == 0) {
+            if (rest.len < line_end + 4) return .{ .chunks = chunks };
+            if (!std.mem.eql(u8, rest[line_end..][0..4], "\r\n\r\n")) return .malformed;
+            chunks.consumed += line_end + 4;
+            chunks.last = true;
+            return .{ .chunks = chunks };
+        }
+        if (chunks.count == stream_pieces_max) return .malformed;
+        if (size > decoded.len - chunks.body_bytes) return .malformed;
+        const data_start = line_end + 2;
+        if (rest.len < data_start + size + 2) return .{ .chunks = chunks };
+        const data = rest[data_start..][0..@intCast(size)];
+        if (!std.mem.eql(u8, rest[data_start + data.len ..][0..2], "\r\n")) return .malformed;
+        @memcpy(decoded[chunks.body_bytes..][0..data.len], data);
+        chunks.sizes[chunks.count] = @intCast(size);
+        chunks.count += 1;
+        chunks.body_bytes += data.len;
+        chunks.consumed += data_start + data.len + 2;
+    }
+    return .malformed; // more chunks than any stream sends
+}
+
+test "sim_client: chunked responses decode strictly" {
+    const head = "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n";
+    const whole = head ++ "3\r\nabc\r\na\r\n0123456789\r\n0\r\n\r\n";
+    var decoded: [64]u8 = undefined;
+    const parsed = parse_response(whole, false, &decoded).response;
+    try std.testing.expectEqualStrings("abc0123456789", parsed.body);
+    try std.testing.expectEqual(@as(u8, 2), parsed.chunk_count);
+    try std.testing.expectEqual(@as(u32, 10), parsed.chunk_sizes[1]);
+    try std.testing.expectEqual(whole.len, parsed.bytes);
+    // Every proper prefix is incomplete, never malformed and never whole.
+    for (0..whole.len) |length| {
+        try std.testing.expect(parse_response(whole[0..length], false, &decoded) == .incomplete);
+    }
+    // HEAD: chunked framing, no body.
+    try std.testing.expectEqual(head.len, parse_response(head, true, &decoded).response.bytes);
+    const bad = [_][]const u8{
+        head ++ "03\r\nabc\r\n0\r\n\r\n", // a leading zero
+        head ++ "A\r\n0123456789\r\n0\r\n\r\n", // uppercase
+        head ++ "3;x=1\r\nabc\r\n0\r\n\r\n", // an extension
+        head ++ "3\r\nabcd\r\n0\r\n\r\n", // data longer than its size
+        head ++ "3\r\nabc\r\n0\r\nX: 1\r\n\r\n", // a trailer
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
+    };
+    for (bad) |bytes| {
+        try std.testing.expect(parse_response(bytes, false, &decoded) == .malformed);
+    }
+    // Cut short: whole chunks and nothing after them, or it is not that.
+    const cut = head ++ "3\r\nabc\r\n";
+    try std.testing.expectEqualStrings("abc", parse_cut_short(cut, &decoded).?.body);
+    try std.testing.expect(parse_cut_short(head, &decoded).?.chunk_count == 0);
+    try std.testing.expect(parse_cut_short(cut ++ "2\r\nx", &decoded) == null);
+    try std.testing.expect(parse_cut_short(whole, &decoded) == null);
 }
 
 test "sim_client: requests are well-formed and answers agree with the model" {
@@ -475,6 +728,7 @@ test "sim_client: requests are well-formed and answers agree with the model" {
         .big_bytes_max = 1000,
         .idle_ticks_max = 10,
         .pause_ticks_max = 10,
+        .cut_short_silence_ticks_max = 10,
     };
     var prng = Prng.init(1);
     var request_buffer: [request_bytes_max]u8 = undefined;
@@ -492,21 +746,22 @@ test "sim_client: requests are well-formed and answers agree with the model" {
 }
 
 test "sim_client: responses parse strictly" {
+    var no_chunks: [16]u8 = undefined;
     const ok = "HTTP/1.1 200 OK\r\n" ++
         "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 2\r\n\r\nhi";
-    const parsed = parse_response(ok, false).response;
+    const parsed = parse_response(ok, false, &no_chunks).response;
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
     try std.testing.expectEqualStrings("hi", parsed.body);
     try std.testing.expect(parsed.has_date);
-    try std.testing.expect(parse_response(ok[0 .. ok.len - 1], false) == .incomplete);
+    try std.testing.expect(parse_response(ok[0 .. ok.len - 1], false, &no_chunks) == .incomplete);
     try std.testing.expectEqual(
         @as(usize, ok.len - 2),
-        parse_response(ok[0 .. ok.len - 2], true).response.bytes,
+        parse_response(ok[0 .. ok.len - 2], true, &no_chunks).response.bytes,
     );
-    try std.testing.expect(parse_response("HTTP/1.1 200 OK\r\n\r\n", false) == .malformed);
-    try std.testing.expect(
-        parse_response("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", false) == .malformed,
-    );
+    const unframed = "HTTP/1.1 200 OK\r\n\r\n";
+    try std.testing.expect(parse_response(unframed, false, &no_chunks) == .malformed);
+    const framed_204 = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expect(parse_response(framed_204, false, &no_chunks) == .malformed);
 }
 
 // --- a client running its script ----------------------------------------------
@@ -537,7 +792,11 @@ pub const Client = struct {
     response: [response_bytes_max]u8 = undefined,
     response_bytes: u32 = 0,
     expected: [response_bytes_max]u8 = undefined,
+    /// A chunked response's body, decoded.
+    decoded: [response_bytes_max]u8 = undefined,
     wake_tick: u64 = 0,
+    /// When the last response byte arrived.
+    last_byte_tick: u64 = 0,
     idle_drawn: bool = false,
     failure: Failure = .none,
     failure_index: u32 = 0,
@@ -552,6 +811,8 @@ pub const Client = struct {
         retries: u32 = 0,
         timed_out: u32 = 0,
         reconnects: u32 = 0,
+        /// Streams the application gave up on, received as far as they went.
+        cut_short: u32 = 0,
     };
 
     pub fn init(client: *Client, seed: u64, limits: Limits, start_tick: u64) void {
@@ -575,9 +836,12 @@ pub const Client = struct {
         // A pause holds back writing only: a client always reads what
         // arrives, so a pause never stalls the server's sends.
         if (client.connection) |connection| {
+            const before = client.response_bytes;
             client.receive(io);
+            if (client.response_bytes != before) client.last_byte_tick = tick;
             if (client.failure != .none) return;
             if (io.client_sees_end(connection)) return client.on_end(io);
+            client.check_cut_short_closes(tick);
         }
         if (tick < client.wake_tick) return;
         if (client.connection == null) {
@@ -608,6 +872,20 @@ pub const Client = struct {
         io.client_close(client.connection.?);
         client.connection = null;
         client.send_offset = 0;
+    }
+
+    /// A stream the application gave up on is followed by the end of the
+    /// connection, promptly: a client is never left waiting on a response
+    /// that will not finish.
+    fn check_cut_short_closes(client: *Client, tick: u64) void {
+        if (client.response_bytes == 0) return;
+        if (client.receive_index == client.specs_count) return;
+        const spec = &client.specs[client.receive_index];
+        if (spec.kind != .valid or spec.target != .abort or spec.method == .HEAD) return;
+        assert(tick >= client.last_byte_tick);
+        if (tick - client.last_byte_tick > client.limits.cut_short_silence_ticks_max) {
+            client.fail(.cut_short_not_closed);
+        }
     }
 
     fn fail(client: *Client, failure: Failure) void {
@@ -642,7 +920,7 @@ pub const Client = struct {
         }
         const spec = &client.specs[client.receive_index];
         const bytes = client.response[0..client.response_bytes];
-        const response = switch (parse_response(bytes, spec.method == .HEAD)) {
+        const response = switch (parse_response(bytes, spec.method == .HEAD, &client.decoded)) {
             .incomplete => return false,
             .malformed => {
                 client.fail(.response_malformed);
@@ -690,17 +968,51 @@ pub const Client = struct {
         }
         if (response.status != expected.status) return client.fail(.response_wrong);
         if (response.closes != expected.closes) return client.fail(.response_wrong);
+        if (response.chunked != expected.chunked) return client.fail(.response_wrong);
+        // A HEAD's stream has no body to cut short.
+        const cut_short = expected.cut_short and !expected.head;
+        if (response.cut_short != cut_short) return client.fail(.response_wrong);
         if (expected.head) {
             if (response.body.len != 0) return client.fail(.response_wrong);
-            if (response.content_length != expected.body.len) return client.fail(.response_wrong);
+            const length = if (expected.chunked) 0 else expected.body.len;
+            if (response.content_length != length) return client.fail(.response_wrong);
             return;
+        }
+        if (response.chunk_count != expected.chunk_count) return client.fail(.response_wrong);
+        const sizes = response.chunk_sizes[0..response.chunk_count];
+        if (!std.mem.eql(u32, sizes, expected.chunk_sizes[0..expected.chunk_count])) {
+            return client.fail(.response_wrong);
         }
         if (!std.mem.eql(u8, response.body, expected.body)) return client.fail(.response_wrong);
     }
 
+    /// What is left, taken as a stream cut short, when the request was for
+    /// one; false when it was not, or the bytes are not one.
+    fn take_cut_short(client: *Client) bool {
+        assert(client.response_bytes > 0);
+        if (client.receive_index == client.specs_count) return false;
+        const spec = &client.specs[client.receive_index];
+        if (spec.kind != .valid or spec.target != .abort) return false;
+        const bytes = client.response[0..client.response_bytes];
+        const response = parse_cut_short(bytes, &client.decoded) orelse return false;
+        assert(response.bytes == bytes.len);
+        client.check(spec, response);
+        client.receive_index += 1;
+        client.connection_responses += 1;
+        client.stats.responses += 1;
+        client.stats.cut_short += 1;
+        client.response_bytes = 0;
+        return true;
+    }
+
     /// The server closed the connection and everything it sent is read.
     fn on_end(client: *Client, io: anytype) void {
-        if (client.response_bytes > 0) return client.fail(.response_truncated);
+        if (client.response_bytes > 0) {
+            // A stream the application gave up on: what it sent, then the
+            // end, is its response. Anything else left over is truncation.
+            if (!client.take_cut_short()) return client.fail(.response_truncated);
+            if (client.failure != .none) return;
+        }
         const outstanding = client.receive_index < client.send_index or
             (client.receive_index == client.send_index and client.send_offset > 0);
         if (outstanding) {
@@ -757,7 +1069,7 @@ pub const Client = struct {
         // and needs no interim answer.
         const previous = &client.specs[client.send_index - 1];
         const keeps_open = previous.kind == .valid and !previous.close and
-            !previous.expect_continue;
+            !previous.expect_continue and previous.target != .abort;
         return client.behavior.pipeline and keeps_open;
     }
 
@@ -825,5 +1137,10 @@ fn report(spec: *const Spec, response: Response, expected: Expectation) void {
     const body = response.body[0..@min(response.body.len, 80)];
     std.debug.print("  got:      status={d} closes={} length={d} body({d})={s}\n", .{
         response.status, response.closes, response.content_length, response.body.len, body,
+    });
+    std.debug.print("  chunks:   expected {d} {any} cut_short={}, " ++
+        "got {d} {any} cut_short={}\n", .{
+        expected.chunk_count, expected.chunk_sizes[0..expected.chunk_count], expected.cut_short,
+        response.chunk_count, response.chunk_sizes[0..response.chunk_count], response.cut_short,
     });
 }
