@@ -98,7 +98,7 @@ const Thread = struct {
     /// fourneau: ThreadSanitizer's fiber for `idle_context`.
     tsan_idle: tsan.Fiber,
     /// fourneau: what this thread asked of the kernel, for experiments
-    /// (EXPERIMENTS 18): submissions queued, `io_uring_enter` calls,
+    /// (experiment 18): submissions queued, `io_uring_enter` calls,
     /// completions reaped. Only this thread writes them.
     counts: Counts = .{},
     current_context: *Io.fiber.Context,
@@ -263,7 +263,7 @@ const Fiber = struct {
     const max_result_size = max_result_align.forward(512);
     /// This includes any stack realignments that need to happen, and also the
     /// initial frame return address slot and argument frame, depending on target.
-    /// fourneau: 8 MiB, a thread's default, not 60 MiB (EXPERIMENTS 22).
+    /// fourneau: 8 MiB, a thread's default, not 60 MiB (experiment 22).
     /// With the header at the top (below), the size hardly matters to the
     /// TLB (256 KiB measured the same); 8 MiB keeps a margin for deep Roc
     /// recursion, and the guard page turns an overflow into a crash.
@@ -6227,7 +6227,18 @@ fn netListenIp(
     }
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
-    try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
+    // fourneau: bind with the system call, not IORING_OP_BIND, which Linux
+    // gained only in 6.11 (Ubuntu 24.04's 6.8 answers EINVAL). A listener
+    // binds once, at startup, so nothing is lost by blocking.
+    switch (linux.errno(linux.bind(socket_fd, &storage.any, addr_len))) {
+        .SUCCESS => {},
+        .ACCES => return error.AccessDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .NOMEM => return error.SystemResources,
+        else => |err| return unexpectedErrno(err),
+    }
     switch (linux.errno(linux.listen(socket_fd, options.kernel_backlog))) {
         .SUCCESS => {},
         .ADDRINUSE => return error.AddressInUse,
@@ -6278,7 +6289,7 @@ const stream_iovecs_max = 16;
 /// submission: the receive is linked behind the send and starts only once
 /// every byte is sent (MSG_WAITALL), and a sent send posts no completion.
 /// So a request-response turn costs one completion and one wake, not two
-/// (EXPERIMENTS 18: +15% on fourneau-floor). Not in `std.Io`, which has no
+/// (experiment 18: +15% on fourneau-floor). Not in `std.Io`, which has no
 /// ordered pair of operations; fourneau's server takes it as an option.
 pub fn sendThenReceive(
     io_instance: Io,
@@ -6336,7 +6347,7 @@ fn netReadStream(ev: *Evented, o: Io.Operation.NetRead) (Io.Operation.NetRead.Er
         const thread = try cancel_region.awaitIoUring();
         const sqe = thread.enqueue();
         // fourneau: one buffer (the usual case) is a plain RECV: the kernel
-        // imports no msghdr or iovec array (EXPERIMENTS 18).
+        // imports no msghdr or iovec array (experiment 18).
         if (count == 1) {
             const buffer: []u8 = @as([*]u8, @ptrCast(iovecs[0].base))[0..iovecs[0].len];
             sqe.prep_recv(o.socket_handle, buffer, linux.MSG.NOSIGNAL);
