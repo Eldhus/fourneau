@@ -973,3 +973,26 @@ M7's core, in the order it went:
   page; three requests on one connection; an 18 KB response across
   records; TLS 1.2 refused. The suite and a 200-seed sweep pass; roux's
   platform builds (the exported `fourneau` module carries `tls`).
+
+## 2026-10-06: plain HTTP on the HTTPS port; HTTPS under load
+
+Plain HTTP sent to the HTTPS port waited out the head timeout (tls.zig
+read `GET ` as a record header and waited for its length). The first
+byte of a TLS connection is a handshake record (0x16); anything else now
+gets a plain 400, "This port speaks HTTPS: use https://", at once (11 ms).
+
+HTTP against HTTPS, `fourneau-static` ReleaseSafe on one core (taskset 0,
+one shard), oha 1.16.0 on cores 2-7, 64 connections, 8 s, a 6-byte page,
+interleaved twice:
+
+| | requests/s | p99 |
+|---|---|---|
+| HTTP | 262,735; 219,922 | 0.52; 0.57 ms |
+| HTTPS (kTLS, AES-256-GCM) | 140,699; 121,802 | 0.99; 1.10 ms |
+
+    taskset -c 2-7 oha -z 8s -c 64 --insecure --no-tui URL
+
+HTTPS is about 55% of HTTP here: the kernel encrypts and authenticates
+every tiny response, and HTTPS connections lose the linked
+send-then-receive (Todo). Laptop numbers, wall clock: the benchmarking
+skill's caveats apply.

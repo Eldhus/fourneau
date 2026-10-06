@@ -31,8 +31,10 @@
    - Where it stands (2026-10-06): M7's core works: tls.zig vendored,
      the handshake on the connection's fiber, kTLS; `fourneau-static
      --cert --key` serves HTTPS (curl, openssl s_client, keep-alive, an
-     18 KB response across records; TLS 1.2 refused). Next for M7: Zig's
-     own TLS client, testssl.sh, a load run over HTTPS; then M8 (ACME),
+     18 KB response across records; TLS 1.2 refused; plain HTTP gets a
+     400). Load on one core: HTTPS about 55% of HTTP for a 6-byte page
+     (DIARY). Next for M7: Zig's own TLS client and testssl.sh; then M8
+     (ACME),
      M10; templates in roux and the dragrace (their TODOs); M6; M9.
 
 ## Plan
@@ -194,10 +196,9 @@ Read the diary, keep the tests, delete what did not pay, write it again.
   completions, not one; experiment 18's +15% lost on HTTPS). Without
   WAITALL a short send would let the receive run early; measure whether
   a send-then-poll or a retried send keeps the gain. (2026-10-06)
-- [ ] Plain HTTP sent to an HTTPS port waits out the head timeout (tls.zig
-  reads the request line as a record header and waits for that many
-  bytes). Refuse it at once: a first byte that is not a TLS handshake
-  record (0x16) is not TLS. (2026-10-06)
+- [ ] `fourneau-static` names the file that broke a limit at load
+  (`StreamTooLong` alone, 2026-10-06, for a 33 MB file in the root).
+  (2026-10-06)
 
 ## Tickler
 
