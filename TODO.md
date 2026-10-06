@@ -66,7 +66,8 @@ roux (its TODO): M4 and M5 are roux's; M6 and M10 have a half in each.
 
 ### M6. Static files and compression
 
-- Static files (ETag, Range, precompressed, zero-copy), and
+- Static files (ETag; gzip copies made at load, done 2026-10-06; Range,
+  zero-copy), and
   `fourneau-static`, the pure-Zig static file server.
 - Compression: gzip from the standard library; then our own brotli
   encoder (RFC 7932).

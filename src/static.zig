@@ -35,12 +35,29 @@ const file_bytes_max = 16 * 1024 * 1024;
 const site_bytes_max = 64 * 1024 * 1024;
 const shards_max = 256;
 
-const File = struct {
+/// One file as sent: its bytes and the headers that go with them.
+const Variant = struct {
     body: []const u8,
-    /// Content-Type, Cache-Control and ETag, made once at load.
+    /// Content-Type, Cache-Control, ETag (and Content-Encoding, Vary), made
+    /// once at load.
     headers: []const http1_response.Header,
     /// The ETag, quoted, as a client sends it back in If-None-Match.
     etag: []const u8,
+};
+
+/// A file, and its gzip-compressed copy when compressing it paid: made at
+/// load, so a request costs no compression (M6).
+const File = struct {
+    identity: Variant,
+    gzip: ?Variant = null,
+
+    /// The copy this request may have: gzip when it says it accepts it.
+    fn variant(file: *const File, headers: []const http1_head.Header) *const Variant {
+        if (file.gzip) |*compressed| {
+            if (accepts_gzip(headers)) return compressed;
+        }
+        return &file.identity;
+    }
 };
 
 /// The site: every route and its file, built before the first shard starts
@@ -65,17 +82,19 @@ const App = struct {
         const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
         const allowed = head.method == .get or head.method == .head;
         if (!allowed) return .{ .status = 405, .headers = &.{}, .body = "" };
-        if (app.site.routes.get(path)) |file| {
+        if (app.site.routes.getPtr(path)) |file| {
+            const sent = file.variant(head.headers);
             // Every file is no-cache: a browser asks again each time, and a
             // copy it already has costs a 304, not the bytes. So a deploy is
             // seen on the next load, with no versioned file names.
-            if (fresh(head.headers, file.etag)) {
-                return .{ .status = 304, .headers = file.headers, .body = "" };
+            if (fresh(head.headers, sent.etag)) {
+                return .{ .status = 304, .headers = sent.headers, .body = "" };
             }
-            return .{ .status = 200, .headers = file.headers, .body = file.body };
+            return .{ .status = 200, .headers = sent.headers, .body = sent.body };
         }
-        if (app.site.not_found) |file| {
-            return .{ .status = 404, .headers = file.headers, .body = file.body };
+        if (app.site.not_found) |*file| {
+            const sent = file.variant(head.headers);
+            return .{ .status = 404, .headers = sent.headers, .body = sent.body };
         }
         return .{ .status = 404, .headers = &.{}, .body = "" };
     }
@@ -158,13 +177,142 @@ fn content_type(name: []const u8) []const u8 {
 fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8) !File {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
-    const etag = try std.fmt.allocPrint(gpa, "\"{x}\"", .{digest[0..8]});
-    const headers = try gpa.alloc(http1_response.Header, 4);
-    headers[0] = .{ .name = "Content-Type", .value = content_type(name) };
-    headers[1] = .{ .name = "Cache-Control", .value = "no-cache" };
-    headers[2] = .{ .name = "ETag", .value = etag };
-    headers[3] = .{ .name = "X-Content-Type-Options", .value = "nosniff" };
-    return .{ .body = body, .headers = headers, .etag = etag };
+    const compressed = if (compressible(name, body.len)) try gzip(gpa, body) else null;
+    // A copy at least a tenth smaller is worth its CPU and memory.
+    const worth = if (compressed) |bytes| bytes.len * 10 < body.len * 9 else false;
+    const tag = try std.fmt.allocPrint(gpa, "{x}", .{digest[0..8]});
+    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth) };
+    if (worth) {
+        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true);
+    } else if (compressed) |bytes| gpa.free(bytes);
+    return file;
+}
+
+/// The headers of one copy. `vary`: the file has another copy, so caches
+/// must key on Accept-Encoding.
+fn make_variant(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    body: []const u8,
+    tag: []const u8,
+    encoding: ?[]const u8,
+    vary: bool,
+) !Variant {
+    // Each copy its own ETag, as each has its own bytes.
+    const etag = if (encoding) |coding|
+        try std.fmt.allocPrint(gpa, "\"{s}-{s}\"", .{ tag, coding })
+    else
+        try std.fmt.allocPrint(gpa, "\"{s}\"", .{tag});
+    var headers: std.ArrayList(http1_response.Header) = .empty;
+    try headers.append(gpa, .{ .name = "Content-Type", .value = content_type(name) });
+    try headers.append(gpa, .{ .name = "Cache-Control", .value = "no-cache" });
+    try headers.append(gpa, .{ .name = "ETag", .value = etag });
+    try headers.append(gpa, .{ .name = "X-Content-Type-Options", .value = "nosniff" });
+    if (encoding) |coding| {
+        try headers.append(gpa, .{ .name = "Content-Encoding", .value = coding });
+    }
+    if (vary) try headers.append(gpa, .{ .name = "Vary", .value = "Accept-Encoding" });
+    return .{ .body = body, .headers = try headers.toOwnedSlice(gpa), .etag = etag };
+}
+
+/// Text compresses; images and fonts are compressed already. Tiny files are
+/// not worth a header.
+fn compressible(name: []const u8, len: usize) bool {
+    if (len < 256) return false;
+    const text_types = [_][]const u8{ ".html", ".css", ".js", ".json", ".svg", ".txt", ".xml" };
+    for (text_types) |extension| {
+        if (std.mem.endsWith(u8, name, extension)) return true;
+    }
+    return false;
+}
+
+/// gzip at the best level: once, at load.
+fn gzip(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    var output = try std.Io.Writer.Allocating.initCapacity(gpa, body.len / 2 + 64);
+    errdefer output.deinit();
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    const compress = try gpa.create(flate.Compress);
+    defer gpa.destroy(compress);
+    compress.* = try .init(&output.writer, window, .gzip, .best);
+    try compress.writer.writeAll(body);
+    try compress.finish();
+    return output.toOwnedSlice();
+}
+
+/// Whether Accept-Encoding allows gzip: `gzip` (or `*`) listed, and not
+/// with q=0 (RFC 9110 §12.5.3).
+fn accepts_gzip(headers: []const http1_head.Header) bool {
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) continue;
+        var codings = std.mem.splitScalar(u8, header.value, ',');
+        // n bytes split into at most n + 1 codings, then the end.
+        for (0..header.value.len + 2) |_| {
+            const coding = codings.next() orelse break;
+            var parts = std.mem.splitScalar(u8, coding, ';');
+            const coding_name = std.mem.trim(u8, parts.first(), " \t");
+            const named = std.ascii.eqlIgnoreCase(coding_name, "gzip") or
+                std.mem.eql(u8, coding_name, "*");
+            if (named) return !refused(parts.rest());
+        } else unreachable;
+    }
+    return false;
+}
+
+/// A coding's parameters say q=0 (or 0.0, 0.00, 0.000).
+fn refused(parameters: []const u8) bool {
+    var params = std.mem.splitScalar(u8, parameters, ';');
+    for (0..parameters.len + 2) |_| {
+        const param = std.mem.trim(u8, params.next() orelse return false, " \t");
+        if (param.len < 2 or !std.ascii.eqlIgnoreCase(param[0..2], "q=")) continue;
+        const value = param[2..];
+        if (value.len == 0 or value[0] != '0') return false;
+        for (value[1..]) |c| {
+            if (c != '.' and c != '0') return false;
+        }
+        return true;
+    } else unreachable;
+}
+
+test "static: Accept-Encoding, as RFC 9110 reads it" {
+    const cases = [_]struct { value: []const u8, gzip: bool }{
+        .{ .value = "gzip, deflate, br", .gzip = true },
+        .{ .value = "br;q=1.0, gzip;q=0.8", .gzip = true },
+        .{ .value = "*", .gzip = true },
+        .{ .value = "gzip;q=0", .gzip = false },
+        .{ .value = "gzip; q=0.000", .gzip = false },
+        .{ .value = "br, deflate", .gzip = false },
+        .{ .value = "gzipped", .gzip = false },
+        .{ .value = "", .gzip = false },
+    };
+    for (cases) |case| {
+        const headers = [_]http1_head.Header{.{ .name = "Accept-Encoding", .value = case.value }};
+        try std.testing.expectEqual(case.gzip, accepts_gzip(&headers));
+    }
+    try std.testing.expect(!accepts_gzip(&.{}));
+}
+
+test "static: a compressible file gets a smaller gzip copy that inflates back" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var page_buffer: std.ArrayList(u8) = .empty;
+    for (0..20) |_| {
+        const line = "<p>a page that repeats itself, a page that repeats itself</p>\n";
+        try page_buffer.appendSlice(arena, line);
+    }
+    const page = page_buffer.items;
+    const file = try make_file(arena, "page.html", page);
+    const compressed = file.gzip orelse return error.TestExpectedGzip;
+    try std.testing.expect(compressed.body.len < page.len / 4);
+    var input: std.Io.Reader = .fixed(compressed.body);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &window);
+    const inflated = try decompress.reader.allocRemaining(arena, .limited(64 * 1024));
+    try std.testing.expectEqualStrings(page, inflated);
+    try std.testing.expect(!std.mem.eql(u8, file.identity.etag, compressed.etag));
 }
 
 /// Read every file under `root` into `site`, with its routes.
@@ -429,14 +577,14 @@ test "static: routes for pages, directories and the 404" {
     try add_routes(arena, &site, "about.html", page);
     try add_routes(arena, &site, "docs/index.html", index);
     try add_routes(arena, &site, "404.html", missing);
-    try std.testing.expectEqualStrings("index", site.routes.get("/").?.body);
-    try std.testing.expectEqualStrings("page", site.routes.get("/about").?.body);
-    try std.testing.expectEqualStrings("page", site.routes.get("/about.html").?.body);
-    try std.testing.expectEqualStrings("index", site.routes.get("/docs").?.body);
-    try std.testing.expectEqualStrings("index", site.routes.get("/docs/").?.body);
+    try std.testing.expectEqualStrings("index", site.routes.get("/").?.identity.body);
+    try std.testing.expectEqualStrings("page", site.routes.get("/about").?.identity.body);
+    try std.testing.expectEqualStrings("page", site.routes.get("/about.html").?.identity.body);
+    try std.testing.expectEqualStrings("index", site.routes.get("/docs").?.identity.body);
+    try std.testing.expectEqualStrings("index", site.routes.get("/docs/").?.identity.body);
     try std.testing.expectEqual(@as(?File, null), site.routes.get("/../etc/passwd"));
     try std.testing.expectEqual(@as(?File, null), site.routes.get("/docs/../about.html"));
-    try std.testing.expectEqualStrings("missing", site.not_found.?.body);
+    try std.testing.expectEqualStrings("missing", site.not_found.?.identity.body);
     try std.testing.expectEqualStrings("text/css; charset=utf-8", content_type("style.css"));
 }
 

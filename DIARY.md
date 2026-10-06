@@ -1051,3 +1051,18 @@ current certificate while it lasts (else systemd's restarts would order
 again and again into a rate limit; the unit also waits 60 s now), and the
 CA that issued `cert.pem` is recorded beside it, so moving from staging
 to production orders anew instead of keeping the staging certificate.
+
+## 2026-10-06: gzip, compressed once at load
+
+M6's first piece. `fourneau-static` compresses each text file (html, css,
+js, json, svg, txt, xml, 256 bytes or more) once, at load, at gzip's best
+level, and keeps the copy when it is at least a tenth smaller; a request
+whose Accept-Encoding allows gzip (RFC 9110: listed or `*`, not q=0) gets
+it, with its own ETag and `Vary: Accept-Encoding`. No compression per
+request. The dragrace site: index 3,966 to 1,767 bytes, style.css 8,506
+to 2,992, race.js 11,703 to 3,856, latest.json 18,801 to 3,818; curl
+`--compressed` gets the page back byte for byte.
+
+The test caught my loop bounds: n bytes split into n + 1 pieces and then
+the end, so a split loop needs n + 2 passes; `for ... else unreachable`
+said so on the empty header.
