@@ -1035,3 +1035,19 @@ to `https://<host><path?query>` for GET and HEAD, 308 for anything else
 (`--https-host`, default the ACME identifier), never the request's Host
 header. Two shards, Pebble's certificate: GET 301, POST 308, and curl
 following the redirect gets 200 with the chain verified.
+
+## 2026-10-06: HTTPS on the internet, nothing in front
+
+The dragrace site host (fourneau-dragrace's `site install-server`) now
+runs `fourneau-static --port 443 --redirect-port 80 --acme-*`. Let's
+Encrypt staging first: a certificate for `IP Address:174.138.75.219`
+from "(STAGING) Baloney Bulgur YE2" in two seconds, the page served, the
+redirect 301. Then production: issuer YE2, valid six days, and `curl
+https://174.138.75.219/` verifies with the system's trust
+(`ssl_verify=0`).
+
+Two robustness fixes on the way: a failed renewal keeps serving the
+current certificate while it lasts (else systemd's restarts would order
+again and again into a rate limit; the unit also waits 60 s now), and the
+CA that issued `cert.pem` is recorded beside it, so moving from staging
+to production orders anew instead of keeping the staging certificate.

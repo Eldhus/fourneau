@@ -28,18 +28,16 @@
    https": M7 (TLS), M8 (ACME), M10 (deploy: the dragrace site on 443),
    with roux's templates and the dragrace's templates workload; then M6
    and M9. Iteratively, TigerStyle, data-oriented, until deployed.
-   - Where it stands (2026-10-06): M7's core works: tls.zig vendored,
-     the handshake on the connection's fiber, kTLS; `fourneau-static
-     --cert --key` serves HTTPS (curl, openssl s_client, keep-alive, an
-     18 KB response across records; TLS 1.2 refused; plain HTTP gets a
-     400). Load on one core: HTTPS about 55% of HTTP for a 6-byte page
-     (DIARY). M8's core works against Pebble: `fourneau-static
-     --acme-*` obtains a certificate for an IP address (http-01, the
-     short-lived profile) at startup and serves HTTPS with it; a restart
-     reuses a fresh one. Next: M10 (port 80 redirecting, the site host on
-     443 with Let's Encrypt, staging first), then M7's last checks (Zig's
-     TLS client, testssl.sh), then
-     M10; templates in roux and the dragrace (their TODOs); M6; M9.
+   - Where it stands (2026-10-06): HTTPS is deployed. M7's core (tls.zig
+     vendored, the handshake on the connection's fiber, kTLS), M8's
+     (ACME at startup, http-01, a failed renewal keeps the current
+     certificate, a change of CA orders anew) and M10's for
+     fourneau-static (443 with Let's Encrypt for the host's IP address,
+     the six-day profile; port 80 redirecting; renewal by a daily
+     restart): the dragrace site, https://174.138.75.219/, verified by
+     curl with the system's trust. Next: templates in roux and the
+     dragrace (their TODOs); M7's last checks (Zig's TLS client,
+     testssl.sh); M6; M9; M10's graceful restart and the roux app.
 
 ## Plan
 
