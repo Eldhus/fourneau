@@ -2,9 +2,14 @@
 //!
 //!   fourneau-static --root DIR [--address A] [--port P] [--shards N]
 //!                   [--cert CHAIN.pem --key KEY.pem]
+//!                   [--acme-directory URL --acme-identifier IP-OR-NAME
+//!                    --acme-state DIR [--acme-profile P] [--acme-http-port N]
+//!                    [--acme-ca BUNDLE.pem]]
 //!
 //! With a certificate and key, every connection is HTTPS (TLS 1.3, the
-//! keys then the kernel's: server.zig, tls.zig).
+//! keys then the kernel's: server.zig, tls.zig). With ACME, the server
+//! obtains its certificate itself at startup when it has none fresh
+//! (acme.zig), then serves HTTPS with it.
 //!
 //! Every file under DIR is read once, at startup, into one table (the
 //! TigerStyle way: all memory taken before serving, none after), and the
@@ -23,6 +28,7 @@ const server_module = @import("server.zig");
 const http1_response = @import("http1_response.zig");
 const http1_head = @import("http1_head.zig");
 const tls = @import("tls.zig");
+const acme = @import("acme.zig");
 
 const files_max = 4096;
 const file_bytes_max = 16 * 1024 * 1024;
@@ -194,6 +200,12 @@ const Options = struct {
     shards: u32 = 0,
     cert: ?[]const u8 = null,
     key: ?[]const u8 = null,
+    acme_directory: ?[]const u8 = null,
+    acme_identifier: ?[]const u8 = null,
+    acme_state: ?[]const u8 = null,
+    acme_profile: ?[]const u8 = null,
+    acme_http_port: u16 = 80,
+    acme_ca: ?[]const u8 = null,
 };
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -215,11 +227,27 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.cert = value;
         } else if (std.mem.eql(u8, arg, "--key")) {
             options.key = value;
+        } else if (std.mem.eql(u8, arg, "--acme-directory")) {
+            options.acme_directory = value;
+        } else if (std.mem.eql(u8, arg, "--acme-identifier")) {
+            options.acme_identifier = value;
+        } else if (std.mem.eql(u8, arg, "--acme-state")) {
+            options.acme_state = value;
+        } else if (std.mem.eql(u8, arg, "--acme-profile")) {
+            options.acme_profile = value;
+        } else if (std.mem.eql(u8, arg, "--acme-http-port")) {
+            options.acme_http_port = try std.fmt.parseInt(u16, value, 10);
+        } else if (std.mem.eql(u8, arg, "--acme-ca")) {
+            options.acme_ca = value;
         } else return error.Usage;
     }
     if (options.root == null) return error.Usage;
     // Both or neither: half a certificate is a mistake, not plain HTTP.
     if ((options.cert == null) != (options.key == null)) return error.Usage;
+    const acme_given = options.acme_directory != null;
+    if (acme_given != (options.acme_identifier != null)) return error.Usage;
+    if (acme_given != (options.acme_state != null)) return error.Usage;
+    if (acme_given and options.cert != null) return error.Usage; // one source of certificate
     return options;
 }
 
@@ -235,6 +263,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // The certificate, loaded once and shared read-only by every shard.
     var auth: tls.CertKeyPair = undefined;
     var context: tls.Context = undefined;
+    if (options.acme_directory != null) try use_acme(gpa, io, &options);
     const https = options.cert != null;
     if (https) {
         const cwd = std.Io.Dir.cwd();
@@ -256,6 +285,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
         options.shards,
     });
     run_shard(&shared, options);
+}
+
+/// A fresh certificate in the ACME state directory (obtained now if need
+/// be), then served as if given with --cert and --key.
+fn use_acme(gpa: std.mem.Allocator, io: std.Io, options: *Options) !void {
+    const value = options.acme_identifier.?;
+    const identifier: acme.Identifier = if (std.Io.net.IpAddress.parse(value, 0)) |address|
+        .{ .ip = address }
+    else |_|
+        .{ .dns = value };
+    const state = options.acme_state.?;
+    try acme.ensure(gpa, io, .{
+        .directory_url = options.acme_directory.?,
+        .identifier = identifier,
+        .profile = options.acme_profile,
+        .state_dir = state,
+        .http_port = options.acme_http_port,
+        .ca_bundle_path = options.acme_ca,
+    });
+    options.cert = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ state, acme.cert_file });
+    options.key = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ state, acme.key_file });
 }
 
 /// What every shard reads and none writes.

@@ -996,3 +996,32 @@ HTTPS is about 55% of HTTP here: the kernel encrypts and authenticates
 every tiny response, and HTTPS connections lose the linked
 send-then-receive (Todo). Laptop numbers, wall clock: the benchmarking
 skill's caveats apply.
+
+## 2026-10-06: ACME, the certificate obtained at startup
+
+M8's core, three layers, each tested before the next:
+
+- `der.zig`: the little DER ACME needs, into a fixed buffer; a value that
+  does not fit is an error. My hand-computed test length was off by one;
+  the encoder was right.
+- `acme_crypto.zig`: P-256 keys, the JWK and its thumbprint, JWS (ES256),
+  the CSR naming one IP address or DNS name, the key as SEC1 PEM. OpenSSL
+  agrees: `req -verify` OK, the SAN is `IP Address:203.0.113.7`, the key
+  valid and the CSR's own.
+- `acme.zig`: directory, nonces (a badNonce retried once), account, one
+  order with one authorization, http-01 answered by a blocking responder
+  on its own thread (the answer published once, release/acquire; the
+  shards, which exist only after, keep their no-locks rule), finalize,
+  the chain; files written whole and renamed, 0600.
+
+Against Pebble (letsencrypt/pebble 1fcb30c, `PEBBLE_VA_NOSLEEP=1`, its
+default 5% nonce rejection on), first run: account, order, challenge on
+:5002, a two-certificate chain for `IP Address:127.0.0.1`, valid six days
+(the shortlived profile), and `curl --cacert` verifies the site through
+Pebble's root. A restart finds it fresh and keeps it.
+
+    fourneau-static --root SITE --port 8446 --acme-directory https://localhost:14000/dir \
+      --acme-identifier 127.0.0.1 --acme-state STATE --acme-http-port 5002 \
+      --acme-ca pebble/test/certs/pebble.minica.pem --acme-profile shortlived
+
+The plan said tls-alpn-01; this is http-01 (DESIGN.md, Layers: acme).

@@ -33,8 +33,12 @@
      --cert --key` serves HTTPS (curl, openssl s_client, keep-alive, an
      18 KB response across records; TLS 1.2 refused; plain HTTP gets a
      400). Load on one core: HTTPS about 55% of HTTP for a 6-byte page
-     (DIARY). Next for M7: Zig's own TLS client and testssl.sh; then M8
-     (ACME),
+     (DIARY). M8's core works against Pebble: `fourneau-static
+     --acme-*` obtains a certificate for an IP address (http-01, the
+     short-lived profile) at startup and serves HTTPS with it; a restart
+     reuses a fresh one. Next: M10 (port 80 redirecting, the site host on
+     443 with Let's Encrypt, staging first), then M7's last checks (Zig's
+     TLS client, testssl.sh), then
      M10; templates in roux and the dragrace (their TODOs); M6; M9.
 
 ## Plan

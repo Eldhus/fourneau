@@ -18,4 +18,7 @@ test {
     _ = @import("stdx.zig");
     _ = @import("tidy.zig");
     _ = @import("tls.zig");
+    _ = @import("der.zig");
+    _ = @import("acme_crypto.zig");
+    _ = @import("acme.zig");
 }

@@ -166,9 +166,17 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   signals are ignored (RFC 9113 §5.3.2 allows it). Every attack in the
   record (rapid reset, CONTINUATION floods, HPACK bombs, ping and
   settings floods, flow-control stalls) is a limit with a counter.
-- **acme** (planned, M8; RFC 8555, `tls-alpn-01` RFC 8737): the server obtains and
-  renews its certificate on port 443 itself, so port 80 is needed only
-  to redirect browsers to HTTPS.
+- **acme** (`acme.zig`, `acme_crypto.zig`, `der.zig`; M8; RFC 8555):
+  the server obtains its own certificate, at startup, before any shard
+  exists, when it has none with a third of its life left; renewal is a
+  daily restart that renews only when due (Let's Encrypt's short-lived
+  IP certificates live six days). The challenge is http-01, answered by
+  a small responder on port 80 while the order is validated, not the
+  tls-alpn-01 first planned: tls-alpn-01 needs the TLS server to switch
+  certificates inside a handshake, and port 80 is open anyway to redirect
+  browsers (owner may revisit). Account and certificate keys are P-256;
+  requests are JWS (ES256); the CSR is our DER. State: an account key,
+  the chain and the certificate key, written whole and renamed, 0600.
 
 ### Resources
 
