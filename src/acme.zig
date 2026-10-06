@@ -13,7 +13,8 @@
 //! anyway, to redirect browsers.)
 //!
 //! State directory: `account.key` (the account's P-256 secret, 0600),
-//! `cert.pem` (the chain), `key.pem` (the certificate's key, SEC1, 0600).
+//! `cert.pem` (the chain), `key.pem` (the certificate's key, SEC1, 0600),
+//! `directory` (the CA that issued it: a change of CA orders anew).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -43,6 +44,8 @@ pub const Options = struct {
 pub const cert_file = "cert.pem";
 pub const key_file = "key.pem";
 const account_file = "account.key";
+/// The directory URL of the CA that issued cert.pem.
+const directory_file = "directory";
 
 /// Bounds: polls of an authorization or order, and the bytes of any one
 /// response from the CA.
@@ -58,7 +61,10 @@ pub fn ensure(gpa: Allocator, io: Io, options: Options) !void {
     const arena = arena_state.allocator();
     const dir = try Io.Dir.cwd().createDirPathOpen(io, options.state_dir, .{});
     defer dir.close(io);
-    const state = try certificate_state(arena, io, dir);
+    // A certificate from another CA (staging, before production) does not
+    // count: the directory that issued it is kept beside it.
+    const same_ca = try issued_by(arena, io, dir, options.directory_url);
+    const state = if (same_ca) try certificate_state(arena, io, dir) else .missing;
     if (state == .fresh) {
         log.info("certificate in {s} is fresh", .{options.state_dir});
         return;
@@ -78,6 +84,15 @@ pub fn ensure(gpa: Allocator, io: Io, options: Options) !void {
 }
 
 const CertificateState = enum { missing, expired, valid, fresh };
+
+fn issued_by(arena: Allocator, io: Io, dir: Io.Dir, directory_url: []const u8) !bool {
+    const limit: Io.Limit = .limited(1024);
+    const recorded = dir.readFileAlloc(io, directory_file, arena, limit) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    return std.mem.eql(u8, recorded, directory_url);
+}
 
 /// Fresh: more than a third of its validity left. Valid: not expired.
 fn certificate_state(arena: Allocator, io: Io, dir: Io.Dir) !CertificateState {
@@ -278,6 +293,7 @@ fn obtain(arena: Allocator, io: Io, dir: Io.Dir, options: Options) !void {
     var key_buffer: [512]u8 = undefined;
     try write_private(io, dir, key_file, try crypto.private_key_pem(certificate_key, &key_buffer));
     try write_private(io, dir, cert_file, chain.body);
+    try write_private(io, dir, directory_file, options.directory_url);
     log.info("certificate obtained: {s}/{s}", .{ options.state_dir, cert_file });
 }
 
