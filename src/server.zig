@@ -277,10 +277,18 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             pub fn stream_end(request: *Request) StreamError!void {
                 return request.connection.stream_end();
             }
+
+            /// Where this request's stream is: for a host whose application
+            /// it does not trust to call the stream functions in order (a
+            /// Roc app), so it refuses what would trip an assertion, and
+            /// returns `streamed_status` exactly when it must.
+            pub fn stream_state(request: *const Request) StreamState {
+                return request.connection.stream_state;
+            }
         };
 
         /// Where a request's streamed response is (`Request.stream_start`).
-        const StreamState = enum { none, streaming, ended };
+        pub const StreamState = enum { none, streaming, ended };
 
         const BodyState = union(enum) {
             none,
