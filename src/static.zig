@@ -90,6 +90,9 @@ const App = struct {
             if (fresh(head.headers, sent.etag)) {
                 return .{ .status = 304, .headers = sent.headers, .body = "" };
             }
+            if (header_value(head.headers, "range")) |range| {
+                return partial(request, &file.identity, range);
+            }
             return .{ .status = 200, .headers = sent.headers, .body = sent.body };
         }
         if (app.site.not_found) |*file| {
@@ -99,11 +102,104 @@ const App = struct {
         return .{ .status = 404, .headers = &.{}, .body = "" };
     }
 
+    /// A Range request (RFC 9110 §14): one byte range of the uncompressed
+    /// copy, 206 with Content-Range; an unsatisfiable one, 416; anything
+    /// else (several ranges, another unit, an If-Range that no longer
+    /// matches) the whole file, which the RFC allows.
+    fn partial(request: *Server.Request, file: *const Variant, range: []const u8) Response {
+        const whole: Response = .{ .status = 200, .headers = file.headers, .body = file.body };
+        if (header_value(request.head.headers, "if-range")) |if_range| {
+            if (!std.mem.eql(u8, if_range, file.etag)) return whole;
+        }
+        const len: u64 = file.body.len;
+        var memory = std.heap.FixedBufferAllocator.init(request.scratch);
+        const allocator = memory.allocator();
+        const headers = allocator.alloc(http1_response.Header, file.headers.len + 1) catch
+            return whole;
+        @memcpy(headers[0..file.headers.len], file.headers);
+        switch (parse_range(range, len)) {
+            .whole => return whole,
+            .unsatisfiable => {
+                const value = std.fmt.allocPrint(allocator, "bytes */{d}", .{len}) catch
+                    return whole;
+                headers[file.headers.len] = .{ .name = "Content-Range", .value = value };
+                return .{ .status = 416, .headers = headers, .body = "" };
+            },
+            .bytes => |bytes| {
+                assert(bytes.first <= bytes.last and bytes.last < len);
+                const value = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{
+                    bytes.first, bytes.last, len,
+                }) catch return whole;
+                headers[file.headers.len] = .{ .name = "Content-Range", .value = value };
+                const body = file.body[@intCast(bytes.first)..@intCast(bytes.last + 1)];
+                return .{ .status = 206, .headers = headers, .body = body };
+            },
+        }
+    }
+
     pub fn release(app: *App, response: *Response) void {
         _ = app;
         response.* = undefined;
     }
 };
+
+const RangeResult = union(enum) {
+    /// Serve the whole file (no usable range).
+    whole,
+    unsatisfiable,
+    bytes: struct { first: u64, last: u64 },
+};
+
+/// `bytes=a-b`, `bytes=a-` or `bytes=-n` against a file of `len` bytes.
+fn parse_range(value: []const u8, len: u64) RangeResult {
+    const prefix = "bytes=";
+    if (!std.mem.startsWith(u8, value, prefix)) return .whole;
+    const spec = std.mem.trim(u8, value[prefix.len..], " \t");
+    if (std.mem.indexOfScalar(u8, spec, ',') != null) return .whole; // several: whole
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return .whole;
+    const first_text = spec[0..dash];
+    const last_text = spec[dash + 1 ..];
+    if (first_text.len == 0) {
+        // The last n bytes.
+        const n = std.fmt.parseInt(u64, last_text, 10) catch return .whole;
+        if (n == 0 or len == 0) return .unsatisfiable;
+        return .{ .bytes = .{ .first = len - @min(n, len), .last = len - 1 } };
+    }
+    const first = std.fmt.parseInt(u64, first_text, 10) catch return .whole;
+    if (first >= len) return .unsatisfiable;
+    const last = if (last_text.len == 0)
+        len - 1
+    else
+        @min(std.fmt.parseInt(u64, last_text, 10) catch return .whole, len - 1);
+    if (last < first) return .whole; // invalid: ignored, as the RFC says
+    return .{ .bytes = .{ .first = first, .last = last } };
+}
+
+/// The value of the first header with this name, any case.
+fn header_value(headers: []const http1_head.Header, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
+test "static: Range, as RFC 9110 §14 reads it" {
+    const B = @FieldType(RangeResult, "bytes");
+    const cases = [_]struct { value: []const u8, want: RangeResult }{
+        .{ .value = "bytes=0-9", .want = .{ .bytes = B{ .first = 0, .last = 9 } } },
+        .{ .value = "bytes=90-", .want = .{ .bytes = B{ .first = 90, .last = 99 } } },
+        .{ .value = "bytes=-5", .want = .{ .bytes = B{ .first = 95, .last = 99 } } },
+        .{ .value = "bytes=-500", .want = .{ .bytes = B{ .first = 0, .last = 99 } } },
+        .{ .value = "bytes=50-999", .want = .{ .bytes = B{ .first = 50, .last = 99 } } },
+        .{ .value = "bytes=100-", .want = .unsatisfiable },
+        .{ .value = "bytes=-0", .want = .unsatisfiable },
+        .{ .value = "bytes=0-1,5-6", .want = .whole },
+        .{ .value = "items=0-1", .want = .whole },
+        .{ .value = "bytes=9-3", .want = .whole },
+        .{ .value = "bytes=x-3", .want = .whole },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.want, parse_range(case.value, 100));
+}
 
 const Server = server_module.ServerType(App, .{ .send_then_receive = Evented.sendThenReceive });
 
@@ -209,6 +305,8 @@ fn make_variant(
     try headers.append(gpa, .{ .name = "Cache-Control", .value = "no-cache" });
     try headers.append(gpa, .{ .name = "ETag", .value = etag });
     try headers.append(gpa, .{ .name = "X-Content-Type-Options", .value = "nosniff" });
+    // Ranges are cut from the uncompressed copy (App.partial).
+    if (encoding == null) try headers.append(gpa, .{ .name = "Accept-Ranges", .value = "bytes" });
     if (encoding) |coding| {
         try headers.append(gpa, .{ .name = "Content-Encoding", .value = coding });
     }
