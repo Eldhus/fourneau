@@ -33,6 +33,7 @@ const http1_head = @import("http1_head.zig");
 const http1_chunked = @import("http1_chunked.zig");
 const http1_response = @import("http1_response.zig");
 const http_date = @import("http_date.zig");
+const tls = @import("tls.zig");
 
 const Io = std.Io;
 const net = Io.net;
@@ -64,6 +65,9 @@ pub const Config = struct {
     requests_per_connection_max: u32 = 1 << 24,
     /// Real sockets want it (see `no_delay`); a simulated one has none.
     tcp_nodelay: bool = true,
+    /// HTTPS: TLS 1.3 on every connection, the keys then given to the
+    /// kernel (`tls.zig`). Real sockets only: a simulated one has no kTLS.
+    tls: ?*const tls.Context = null,
 
     pub fn assert_valid(config: Config) void {
         assert(config.connections_max > 0);
@@ -73,6 +77,11 @@ pub const Config = struct {
         assert(config.tick_ms > 0);
         assert(config.tick_ms <= config.head_timeout_ms);
         config.head_limits().assert_valid();
+        if (config.tls != null) {
+            // The handshake borrows the scratch (both of tls.zig's buffers)
+            // and receives the client's early bytes into `recv`.
+            assert(config.scratch_bytes_max >= tls.input_bytes_min + tls.output_bytes_min);
+        }
     }
 
     fn head_limits(config: Config) http1_head.Limits {
@@ -144,6 +153,8 @@ pub const Stats = struct {
     requests: u64 = 0,
     refused: u64 = 0,
     timeouts: u64 = 0,
+    handshakes: u64 = 0,
+    handshakes_failed: u64 = 0,
 };
 
 /// The address of this, per thread, names the thread a shard runs on.
@@ -238,6 +249,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             continue_sent: bool,
             keep_alive: bool,
             requests: u32,
+            /// The kernel holds this connection's TLS keys (kTLS). Its
+            /// sends refuse `MSG_WAITALL`, which the linked send-then-
+            /// receive needs, so such a connection flushes, then reads.
+            kernel_tls: bool,
 
             fn read_body(connection: *Connection, buffer: []u8) BodyError!usize {
                 assert(buffer.len > 0);
@@ -338,10 +353,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             /// enforces by shutting the socket down (the read returns 0).
             /// Flushes first: a connection never waits for its client with
             /// a response the client may be waiting for.
-            fn read_some(connection: *Connection, buffer: []u8, timeout_ms: u32) !u32 {
+            pub fn read_some(connection: *Connection, buffer: []u8, timeout_ms: u32) !u32 {
                 assert(buffer.len > 0);
                 const server = connection.server;
-                if (type_options.send_then_receive != null and connection.send_used > 0) {
+                const linked = type_options.send_then_receive != null and !connection.kernel_tls;
+                if (linked and connection.send_used > 0) {
                     return connection.send_and_read(buffer, timeout_ms);
                 }
                 if (!connection.flush()) return error.Disconnected;
@@ -380,7 +396,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 return @intCast(got);
             }
 
-            fn write_all(connection: *Connection, head: []const u8, body: []const u8) bool {
+            pub fn write_all(connection: *Connection, head: []const u8, body: []const u8) bool {
                 const server = connection.server;
                 const total = head.len + body.len;
                 assert(total > 0);
@@ -535,6 +551,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.recv_used = 0;
             connection.send_used = 0;
             connection.requests = 0;
+            connection.kernel_tls = false;
         }
 
         fn close_connection(server: *Server, connection: *Connection) void {
@@ -550,10 +567,42 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn serve_connection(server: *Server, index: u32) void {
             const connection = &server.connections[index];
             defer server.close_connection(connection);
+            if (server.config.tls) |context| {
+                if (!server.handshake(connection, context)) return;
+            }
 
             for (0..server.config.requests_per_connection_max) |_| {
                 if (!server.serve_request(connection)) return;
             }
+        }
+
+        /// TLS 1.3 before the first request: tls.zig's handshake in the
+        /// connection's scratch, then kTLS; the client's first bytes after
+        /// it (decrypted) start `recv`. False: close the connection.
+        fn handshake(server: *Server, connection: *Connection, context: *const tls.Context) bool {
+            assert(connection.recv_used == 0);
+            assert(connection.requests == 0);
+            const Transport = tls.TransportType(Connection);
+            var transport: Transport = undefined;
+            const half = connection.scratch.len / 2;
+            transport.init(
+                connection,
+                server.config.head_timeout_ms,
+                connection.scratch[0..half],
+                connection.scratch[half..],
+            );
+            const socket = connection.stream.socket.handle;
+            const recv = connection.recv;
+            const early = tls.handshake(server.io, &transport, socket, context, recv) catch |err| {
+                server.stats.handshakes_failed += 1;
+                log.debug("handshake: {t}", .{err});
+                return false;
+            };
+            assert(early <= connection.recv.len);
+            connection.recv_used = early;
+            connection.kernel_tls = true;
+            server.stats.handshakes += 1;
+            return true;
         }
 
         /// One request, start to finish. False: close the connection.

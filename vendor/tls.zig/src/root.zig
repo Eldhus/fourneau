@@ -1,0 +1,366 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const Io = std.Io;
+
+pub const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_record_len;
+
+/// Buffer of this size will fit any tls ciphertext record sent by other side.
+/// To decrypt we need full record, smaller buffer will not work in general
+/// case. Bigger can be used for performance reason.
+pub const input_buffer_len = max_ciphertext_record_len; // 16645 bytes
+
+/// Needed output buffer during handshake is the size of the tls hello message,
+/// which is (when client authentication is not used) ~1600 bytes. After
+/// handshake it limits how big tls record can be produced. This suggested value
+/// can hold max ciphertext record produced with this implementation.
+pub const output_buffer_len = @import("cipher.zig").max_encrypted_record_len; // 16469 bytes
+
+pub const Connection = @import("connection.zig").Connection;
+
+const handshake = struct {
+    const Client = @import("handshake_client.zig").Handshake;
+    const Server = @import("handshake_server.zig").Handshake;
+};
+
+/// Upgrades existing stream to the tls connection by the client tls handshake.
+pub inline fn clientFromStream(io: std.Io, stream: anytype, opt: config.Client) !Connection {
+    const input, const output = streamToReaderWriter(io, stream);
+    return try client(input, output, opt);
+}
+
+pub fn client(input: *Io.Reader, output: *Io.Writer, opt: config.Client) !Connection {
+    assert(input.buffer.len >= input_buffer_len);
+    assert(output.buffer.len >= 2048); // client hello requires: 1572 + opt.host.len
+
+    var hc: handshake.Client = .{ .input = input, .output = output };
+    const cipher, const session_resumption_secret_idx = try hc.handshake(opt);
+    return .{
+        .cipher = cipher,
+        .input = input,
+        .output = output,
+        .session_resumption_secret_idx = session_resumption_secret_idx,
+        .session_resumption = opt.session_resumption,
+        .strict_close_notify = opt.strict_close_notify,
+        .alpn_protocol = findAlpnProtocol(opt.alpn_protocols, hc.alpn_protocol),
+    };
+}
+
+/// Upgrades existing stream to the tls connection by the server side tls handshake.
+pub inline fn serverFromStream(io: Io, stream: anytype, opt: config.Server) !Connection {
+    const input, const output = streamToReaderWriter(io, stream);
+    return try server(input, output, opt);
+}
+
+pub fn server(input: *Io.Reader, output: *Io.Writer, opt: config.Server) !Connection {
+    var hs: handshake.Server = .{ .input = input, .output = output };
+    const cipher = try hs.handshake(opt);
+    return .{
+        .cipher = cipher,
+        .input = input,
+        .output = output,
+        .alpn_protocol = hs.alpn_protocol,
+        .strict_close_notify = opt.strict_close_notify,
+    };
+}
+
+fn findAlpnProtocol(protocols: []const []const u8, selected: ?[]const u8) ?[]const u8 {
+    if (selected) |sel| {
+        for (protocols) |proto| {
+            if (std.mem.eql(u8, proto, sel)) return proto;
+        }
+        // if we got a protocol that is not in the list, that's a violation of RFC 7301
+    }
+    return null;
+}
+
+/// With default buffer sizes
+inline fn streamToReaderWriter(io: std.Io, stream: anytype) struct { *Io.Reader, *Io.Writer } {
+    var input_buf: [input_buffer_len]u8 = undefined;
+    var output_buf: [output_buffer_len]u8 = undefined;
+    var reader = stream.reader(io, &input_buf);
+    var writer = stream.writer(io, &output_buf);
+    const input = if (@hasField(@TypeOf(reader), "interface")) &reader.interface else reader.interface();
+    const output = &writer.interface;
+    return .{ input, output };
+}
+
+pub const Cipher = @import("cipher.zig").Cipher;
+pub const config = struct {
+    const proto = @import("protocol.zig");
+    const common = @import("handshake_common.zig");
+
+    pub const CipherSuite = @import("cipher.zig").CipherSuite;
+    pub const PrivateKey = @import("PrivateKey.zig");
+    pub const NamedGroup = proto.NamedGroup;
+    pub const Version = proto.Version;
+    pub const cert = common.cert;
+    pub const CertKeyPair = common.CertKeyPair;
+
+    pub const cipher_suites = @import("cipher.zig").cipher_suites;
+    pub const key_log = @import("key_log.zig");
+
+    pub const Client = @import("handshake_client.zig").Options;
+    pub const Server = @import("handshake_server.zig").Options;
+    pub const ClientAuth = @import("handshake_server.zig").ClientAuth;
+};
+
+/// Non-blocking client/server handshake and connection. Handshake produces
+/// cipher used in connection to encrypt data for sending and decrypt received
+/// data.
+pub const nonblock = struct {
+    pub const Client = @import("handshake_client.zig").NonBlock;
+    pub const Server = @import("handshake_server.zig").NonBlock;
+    pub const Connection = @import("connection.zig").NonBlock;
+};
+
+pub const Ktls = @import("Ktls.zig");
+
+test "nonblock handshake and connection" {
+    const testing = @import("std").testing;
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    // data from server to the client
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    // data from client to the server
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // client/server handshake produces ciphers
+    const cli_cipher, const srv_cipher = brk: {
+        var cli = nonblock.Client.init(.{
+            .rng = rng,
+            .root_ca = .empty,
+            .host = &.{},
+            .insecure_skip_verify = true,
+            .now = .zero,
+        });
+        var srv = nonblock.Server.init(.{
+            .rng = rng,
+            .auth = null,
+            .now = .zero,
+        });
+
+        // client flight1; client hello is in buf1
+        var cr = try cli.run(&sc_buf, &cs_buf);
+        try testing.expectEqual(0, cr.recv_pos);
+        try testing.expect(cr.send.len > 0);
+        try testing.expect(!cli.done());
+
+        { // short read, partial buffer received
+            for (0..cr.send_pos) |i| {
+                const sr = try srv.run(cs_buf[0..i], &sc_buf);
+                try testing.expectEqual(0, sr.recv_pos);
+                try testing.expectEqual(0, sr.send_pos);
+            }
+        }
+
+        // server flight 1; server parses client hello from buf2 and writes server hello into buf1
+        var sr = try srv.run(&cs_buf, &sc_buf);
+        try testing.expectEqual(sr.recv_pos, cr.send_pos);
+        try testing.expect(sr.send.len > 0);
+        try testing.expect(!srv.done());
+
+        { // short read, partial buffer received
+            for (0..sr.send_pos) |i| {
+                cr = try cli.run(sc_buf[0..i], &cs_buf);
+                try testing.expectEqual(0, cr.recv_pos);
+                try testing.expectEqual(0, cr.send_pos);
+            }
+        }
+
+        // client flight 2; client parses server hello from buf1 and writes finished into buf2
+        cr = try cli.run(&sc_buf, &cs_buf);
+        try testing.expectEqual(sr.send_pos, cr.recv_pos);
+        try testing.expect(cr.send.len > 0);
+        try testing.expect(cli.done()); // client is done
+        try testing.expect(cli.cipher() != null);
+
+        // server parses client finished
+        sr = try srv.run(&cs_buf, &sc_buf);
+        try testing.expectEqual(sr.recv_pos, cr.send_pos);
+        try testing.expectEqual(0, sr.send.len);
+        try testing.expect(srv.done()); // server is done
+        try testing.expect(srv.cipher() != null);
+
+        break :brk .{ cli.cipher().?, srv.cipher().? };
+    };
+    { // use ciphers in connection
+        var cli = nonblock.Connection.init(cli_cipher);
+        var srv = nonblock.Connection.init(srv_cipher);
+
+        const cleartext = "Lorem ipsum dolor sit amet";
+        { // client to server
+            const e = try cli.encrypt(cleartext, &cs_buf);
+            try testing.expectEqual(cleartext.len, e.cleartext_pos);
+            try testing.expect(e.ciphertext.len > cleartext.len);
+            try testing.expect(e.unused_cleartext.len == 0);
+
+            const d = try srv.decrypt(e.ciphertext, &sc_buf);
+            try testing.expectEqualSlices(u8, cleartext, d.cleartext);
+            try testing.expectEqual(e.ciphertext.len, d.ciphertext_pos);
+            try testing.expectEqual(0, d.unused_ciphertext.len);
+        }
+        { // server to client
+            const e = try srv.encrypt(cleartext, &sc_buf);
+            const d = try cli.decrypt(e.ciphertext, &cs_buf);
+            try testing.expectEqualSlices(u8, cleartext, d.cleartext);
+        }
+        { // server sends close
+            const close_buf = try srv.close(&sc_buf);
+            const d = try cli.decrypt(close_buf, &cs_buf);
+            try testing.expectEqual(close_buf.len, d.ciphertext_pos);
+            try testing.expectEqual(0, d.unused_ciphertext.len);
+            try testing.expect(d.closed);
+        }
+    }
+}
+
+test "ALPN negotiation: h2 selected" {
+    const testing = @import("std").testing;
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    var cli = nonblock.Client.init(.{
+        .rng = rng,
+        .root_ca = .empty,
+        .host = &.{},
+        .insecure_skip_verify = true,
+        .now = .zero,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+    });
+    var srv = nonblock.Server.init(.{
+        .rng = rng,
+        .auth = null,
+        .now = .zero,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+    });
+
+    // client flight 1
+    var cr = try cli.run(&sc_buf, &cs_buf);
+    // server flight 1
+    var sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    // client flight 2
+    cr = try cli.run(sc_buf[0..sr.send_pos], &cs_buf);
+    try testing.expect(cli.done());
+    // server parses client finished
+    sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    try testing.expect(srv.done());
+
+    // Both sides should have negotiated "h2"
+    try testing.expectEqualStrings("h2", cli.alpnProtocol().?);
+    try testing.expectEqualStrings("h2", srv.alpnProtocol().?);
+}
+
+test "ALPN negotiation: server picks preferred protocol" {
+    const testing = @import("std").testing;
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // Client offers http/1.1 and h2; server only supports http/1.1
+    var cli = nonblock.Client.init(.{
+        .rng = rng,
+        .root_ca = .empty,
+        .host = &.{},
+        .insecure_skip_verify = true,
+        .now = .zero,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+    });
+    var srv = nonblock.Server.init(.{
+        .rng = rng,
+        .auth = null,
+        .now = .zero,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+
+    var cr = try cli.run(&sc_buf, &cs_buf);
+    var sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    cr = try cli.run(sc_buf[0..sr.send_pos], &cs_buf);
+    try testing.expect(cli.done());
+    sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    try testing.expect(srv.done());
+
+    try testing.expectEqualStrings("http/1.1", cli.alpnProtocol().?);
+    try testing.expectEqualStrings("http/1.1", srv.alpnProtocol().?);
+}
+
+test "ALPN negotiation: no ALPN when not configured" {
+    const testing = @import("std").testing;
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // Neither side configures ALPN
+    var cli = nonblock.Client.init(.{
+        .rng = rng,
+        .root_ca = .empty,
+        .host = &.{},
+        .insecure_skip_verify = true,
+        .now = .zero,
+    });
+    var srv = nonblock.Server.init(.{
+        .rng = rng,
+        .auth = null,
+        .now = .zero,
+    });
+
+    var cr = try cli.run(&sc_buf, &cs_buf);
+    var sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    cr = try cli.run(sc_buf[0..sr.send_pos], &cs_buf);
+    try testing.expect(cli.done());
+    sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    try testing.expect(srv.done());
+
+    // No ALPN negotiated
+    try testing.expectEqual(@as(?[]const u8, null), cli.alpnProtocol());
+    try testing.expectEqual(@as(?[]const u8, null), srv.alpnProtocol());
+}
+
+test "ALPN negotiation: no common protocol is error" {
+    const testing = @import("std").testing;
+    const rng_impl: std.Random.IoSource = .{ .io = testing.io };
+    const rng = rng_impl.interface();
+
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // Client only offers h2, server only supports http/1.1
+    var cli = nonblock.Client.init(.{
+        .rng = rng,
+        .root_ca = .empty,
+        .host = &.{},
+        .insecure_skip_verify = true,
+        .now = .zero,
+        .alpn_protocols = &.{"h2"},
+    });
+    var srv = nonblock.Server.init(.{
+        .rng = rng,
+        .auth = null,
+        .now = .zero,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+
+    const cr = try cli.run(&sc_buf, &cs_buf);
+    // Server should reject with no_application_protocol
+    try testing.expectError(error.TlsNoApplicationProtocol, srv.run(cs_buf[0..cr.send_pos], &sc_buf));
+}
+
+test {
+    _ = @import("handshake_common.zig");
+    _ = @import("handshake_server.zig");
+    _ = @import("handshake_client.zig");
+
+    _ = @import("connection.zig");
+    _ = @import("cipher.zig");
+    _ = @import("protocol.zig");
+    _ = @import("record.zig");
+    _ = @import("transcript.zig");
+    _ = @import("PrivateKey.zig");
+}

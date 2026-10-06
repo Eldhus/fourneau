@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
     });
     // The simulator's fiber switch (src/sim_io.zig).
     tests.root_module.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
+    // TLS 1.3: the handshake (vendor/tls.zig, ianic/tls.zig), its keys to kTLS.
+    tests.root_module.addImport("tls", b.createModule(.{
+        .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
+        .target = target,
+        .optimize = test_optimize,
+    }));
     // Programs over the port (fourneau-static) have tests too.
     tests.root_module.addImport("zig_io_evented", b.createModule(.{
         .root_source_file = b.path("vendor/zig-io-evented/Uring.zig"),
@@ -37,7 +43,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     // For programs that embed fourneau (fourneau-dragrace's competitors):
     // the server and our port of Evented, in the importer's mode and target.
-    _ = b.addModule("fourneau", .{ .root_source_file = b.path("src/fourneau.zig") });
+    // The server needs tls.zig, so the module carries it: importers add nothing.
+    const exported_tls = b.addModule("tls", .{
+        .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
+    });
+    _ = b.addModule("fourneau", .{
+        .root_source_file = b.path("src/fourneau.zig"),
+        .imports = &.{.{ .name = "tls", .module = exported_tls }},
+    });
     // The style checker, for repositories built on fourneau (roux's host).
     _ = b.addModule("tidy", .{ .root_source_file = b.path("src/tidy.zig") });
     const exported_port = b.addModule("zig_io_evented", .{
@@ -60,6 +73,11 @@ pub fn build(b: *std.Build) void {
     });
     // Our context switch, which the port and the simulator share.
     zig_io_evented.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
+    const tls = b.createModule(.{
+        .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const hello = b.addExecutable(.{
         .name = "fourneau-hello",
         .root_module = b.createModule(.{
@@ -67,7 +85,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
-            .imports = &.{.{ .name = "zig_io_evented", .module = zig_io_evented }},
+            .imports = &.{
+                .{ .name = "zig_io_evented", .module = zig_io_evented },
+                .{ .name = "tls", .module = tls },
+            },
         }),
     });
     b.installArtifact(hello);
@@ -82,7 +103,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/static.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zig_io_evented", .module = zig_io_evented }},
+            .imports = &.{
+                .{ .name = "zig_io_evented", .module = zig_io_evented },
+                .{ .name = "tls", .module = tls },
+            },
         }),
     });
     b.installArtifact(static);
@@ -130,6 +154,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     sim.root_module.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
+    sim.root_module.addImport("tls", tls); // the server compiles with it; the simulator uses none
     b.installArtifact(sim);
     const run_sim = b.addRunArtifact(sim);
     run_sim.addPassthruArgs();
