@@ -402,7 +402,11 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
         assert(shared.tls != null); // redirecting to an HTTPS site
         redirect = .{ .host = options.https_host.? };
         const plain = try std.Io.net.IpAddress.parse(options.address, port);
-        const plain_listener = try plain.listen(io, .{ .reuse_address = true, .kernel_backlog = 1024 });
+        const listen_options: std.Io.net.IpAddress.ListenOptions = .{
+            .reuse_address = true,
+            .kernel_backlog = 1024,
+        };
+        const plain_listener = try plain.listen(io, listen_options);
         redirect_server = try RedirectServer.init(gpa, io, &redirect, plain_listener, .{
             .connections_max = 64,
             .scratch_bytes_max = 16 * 1024,
