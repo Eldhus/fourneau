@@ -88,6 +88,41 @@ const App = struct {
 
 const Server = server_module.ServerType(App, .{ .send_then_receive = Evented.sendThenReceive });
 
+/// Plain HTTP beside HTTPS (port 80): every request goes to the same path
+/// on `https://host` (301; 308 for methods other than GET and HEAD, which
+/// keeps the method and body), so a browser that types the address bare
+/// lands on HTTPS. The host is the configured one, never the request's
+/// Host header.
+const Redirect = struct {
+    host: []const u8,
+
+    pub const Response = App.Response;
+
+    pub fn handle(redirect: *Redirect, request: *RedirectServer.Request) Response {
+        const head = request.head;
+        var memory = std.heap.FixedBufferAllocator.init(request.scratch);
+        const allocator = memory.allocator();
+        const location = std.fmt.allocPrint(allocator, "https://{s}{s}", .{
+            redirect.host,
+            head.path_and_query,
+        }) catch return .{ .status = 414, .headers = &.{}, .body = "" };
+        const headers = allocator.alloc(http1_response.Header, 1) catch
+            return .{ .status = 414, .headers = &.{}, .body = "" };
+        headers[0] = .{ .name = "Location", .value = location };
+        const keeps_method = head.method == .get or head.method == .head;
+        return .{ .status = if (keeps_method) 301 else 308, .headers = headers, .body = "" };
+    }
+
+    pub fn release(redirect: *Redirect, response: *Response) void {
+        _ = redirect;
+        response.* = undefined;
+    }
+};
+
+const RedirectServer = server_module.ServerType(Redirect, .{
+    .send_then_receive = Evented.sendThenReceive,
+});
+
 /// True when the request's If-None-Match names this ETag (or `*`).
 fn fresh(headers: []const http1_head.Header, etag: []const u8) bool {
     for (headers) |header| {
@@ -206,6 +241,10 @@ const Options = struct {
     acme_profile: ?[]const u8 = null,
     acme_http_port: u16 = 80,
     acme_ca: ?[]const u8 = null,
+    /// A plain-HTTP port that redirects to HTTPS (80 in production).
+    redirect_port: ?u16 = null,
+    /// The host the redirect names: the ACME identifier unless given.
+    https_host: ?[]const u8 = null,
 };
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -239,6 +278,10 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.acme_http_port = try std.fmt.parseInt(u16, value, 10);
         } else if (std.mem.eql(u8, arg, "--acme-ca")) {
             options.acme_ca = value;
+        } else if (std.mem.eql(u8, arg, "--redirect-port")) {
+            options.redirect_port = try std.fmt.parseInt(u16, value, 10);
+        } else if (std.mem.eql(u8, arg, "--https-host")) {
+            options.https_host = value;
         } else return error.Usage;
     }
     if (options.root == null) return error.Usage;
@@ -248,6 +291,9 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
     if (acme_given != (options.acme_identifier != null)) return error.Usage;
     if (acme_given != (options.acme_state != null)) return error.Usage;
     if (acme_given and options.cert != null) return error.Usage; // one source of certificate
+    if (options.https_host == null) options.https_host = options.acme_identifier;
+    // A redirect needs an HTTPS site and a host to name.
+    if (options.redirect_port != null and options.https_host == null) return error.Usage;
     return options;
 }
 
@@ -325,6 +371,10 @@ fn cpu_count() u32 {
     return @min(count, shards_max);
 }
 
+fn run_redirect(redirect_server: *RedirectServer) void {
+    redirect_server.run() catch |err| std.debug.panic("redirect: {t}", .{err});
+}
+
 fn run_shard(shared: *const Shared, options: Options) void {
     run_shard_or_fail(shared, options) catch |err| std.debug.panic("shard: {t}", .{err});
 }
@@ -345,6 +395,20 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
         .connections_max = @max(64, 1024 / options.shards),
         .tls = shared.tls,
     });
+    var group: std.Io.Group = .init;
+    var redirect: Redirect = undefined;
+    var redirect_server: RedirectServer = undefined;
+    if (options.redirect_port) |port| {
+        assert(shared.tls != null); // redirecting to an HTTPS site
+        redirect = .{ .host = options.https_host.? };
+        const plain = try std.Io.net.IpAddress.parse(options.address, port);
+        const plain_listener = try plain.listen(io, .{ .reuse_address = true, .kernel_backlog = 1024 });
+        redirect_server = try RedirectServer.init(gpa, io, &redirect, plain_listener, .{
+            .connections_max = 64,
+            .scratch_bytes_max = 16 * 1024,
+        });
+        try group.concurrent(io, run_redirect, .{&redirect_server});
+    }
     try server.run();
 }
 
