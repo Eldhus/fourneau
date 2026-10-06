@@ -20,7 +20,8 @@
      one core: within ~5-10% of fourneau-floor (raw io_uring), the kernel
      ~85% of a request (experiments 18-23: the 8-entry ring, the fiber
      layout, the send path). Split out of roux into this repository
-     2026-10-06 (DIARY). Next: idle eviction and the fiber pool (Todo),
+     2026-10-06 (DIARY). Idle eviction is back (2026-10-06). Next: the
+     fiber pool (Todo),
      then M6 (static files and compression).
 
 2. **HTTPS and templates, end to end and deployed.** (owner, 2026-10-06)
@@ -71,7 +72,7 @@ roux (its TODO): M4 and M5 are roux's; M6 and M10 have a half in each.
   `fourneau-static`, the pure-Zig static file server.
 - Compression: gzip from the standard library; then our own brotli
   encoder (RFC 7932).
-- Graceful shutdown; idle eviction under pressure.
+- Graceful shutdown; idle eviction under pressure (done 2026-10-06).
 
 **Proves it:** `fourneau-static` agrees with Go's `FileServer` on what
 both offer (fourneau-dragrace's `dragrace diff`).
@@ -132,10 +133,6 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 - [ ] A ~2 s worst-case request in the safe-build pipelined run (p99.9
   13.8 ms; DIARY 2026-10-05): find where it waited (the accept backlog at
   start-up is the first suspect). (2026-10-05)
-- [ ] Idle eviction under pressure, lost in the move to evented: when every
-  slot is taken, close the longest-idle keep-alive connection so a new
-  client is served (the state-machine server did; the old platform's load
-  test showed idle keep-alives holding every slot). (2026-10-05)
 - [ ] Fibers from a pool sized at startup in the port (static allocation
   and a bound), not allocated per task; the layout (header on top, guard
   page) is done. (2026-10-05)

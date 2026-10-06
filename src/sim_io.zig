@@ -141,6 +141,8 @@ const Connection = struct {
     client_closed: bool = false,
     reset: bool = false,
     server_shutdown: bool = false,
+    /// Shut for reading only (eviction): reads see the end, writes go on.
+    server_read_shut: bool = false,
     server_closed: bool = false,
 };
 
@@ -270,7 +272,7 @@ pub const Sim = struct {
     fn readable(sim: *const Sim, connection: *const Connection) bool {
         _ = sim;
         return connection.to_server.count > 0 or connection.client_closed or
-            connection.reset or connection.server_shutdown;
+            connection.reset or connection.server_shutdown or connection.server_read_shut;
     }
 
     fn writable(sim: *const Sim, connection: *const Connection) bool {
@@ -411,7 +413,7 @@ pub const Sim = struct {
         for (0..std.math.maxInt(u32)) |_| {
             const connection = &sim.connections[index];
             if (connection.reset) return errno_connection_reset;
-            if (connection.server_shutdown) return 0;
+            if (connection.server_shutdown or connection.server_read_shut) return 0;
             if (connection.to_server.count > 0) {
                 const available = @min(buffer.len, connection.to_server.count);
                 const wanted = sim.prng.int_at_most(usize, 1, available);
@@ -457,9 +459,13 @@ pub const Sim = struct {
         sim.release_if_done(index);
     }
 
-    fn shutdown(sim: *Sim, fd: i32) void {
+    fn shutdown(sim: *Sim, fd: i32, how: net.ShutdownHow) void {
         const index = sim.connection_of(fd);
-        sim.connections[index].server_shutdown = true;
+        switch (how) {
+            .both => sim.connections[index].server_shutdown = true,
+            .recv => sim.connections[index].server_read_shut = true,
+            .send => unreachable, // the server never shuts only its sending side
+        }
     }
 
     fn release_if_done(sim: *Sim, index: u32) void {
@@ -490,7 +496,8 @@ pub const Sim = struct {
         const connection = &sim.connections[index];
         assert(connection.state != .free);
         assert(!connection.client_closed);
-        if (connection.reset or connection.server_closed or connection.server_shutdown) {
+        const gone = connection.server_closed or connection.server_shutdown;
+        if (connection.reset or gone or connection.server_read_shut) {
             return @intCast(bytes.len); // into the void, as a real socket would
         }
         return connection.to_server.push(bytes);
@@ -759,8 +766,7 @@ pub const Sim = struct {
         handle: net.Socket.Handle,
         how: net.ShutdownHow,
     ) net.ShutdownError!void {
-        assert(how == .both);
-        from(userdata).shutdown(handle);
+        from(userdata).shutdown(handle, how);
     }
 
     fn vtable_now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {

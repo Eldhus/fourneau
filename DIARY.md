@@ -1066,3 +1066,24 @@ to 2,992, race.js 11,703 to 3,856, latest.json 18,801 to 3,818; curl
 The test caught my loop bounds: n bytes split into n + 1 pieces and then
 the end, so a split loop needs n + 2 passes; `for ... else unreachable`
 said so on the empty header.
+
+## 2026-10-06: idle eviction under pressure
+
+Lost in the move to fibers: a full server stopped accepting, so 1,024 idle
+keep-alive connections locked every new client out for up to the idle
+timeout (30 s). Now the acceptor accepts first; when no slot is free it
+closes the connection idle longest (a separate `idle_since` array of
+ticks, scanned once, like the deadlines) and waits for its slot.
+
+The first version flushed before marking a connection idle, so no
+response could be cut short; that split the linked send-then-receive in
+two on every unpipelined keep-alive request, experiment 18's +15%. Instead
+eviction shuts the socket for reading only: a response being sent is sent
+whole, then the read returns 0 and the fiber closes. The simulator had
+modelled only a full shutdown (`assert(how == .both)` caught it); it now
+models the read side too. Suite and a 1000-seed sweep pass.
+
+Measured (fourneau-static, one shard, 1,024 slots, Python clients): 1,024
+idle connections, then a new client: served in 1 ms, exactly one idle
+connection closed; the next two, after it closed, needed none. (A first
+count said 429: my loop spent 51 s reading, past the idle timeout.)
