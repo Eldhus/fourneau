@@ -58,7 +58,8 @@ pub fn ensure(gpa: Allocator, io: Io, options: Options) !void {
     const arena = arena_state.allocator();
     const dir = try Io.Dir.cwd().createDirPathOpen(io, options.state_dir, .{});
     defer dir.close(io);
-    if (try certificate_fresh(arena, io, dir)) {
+    const state = try certificate_state(arena, io, dir);
+    if (state == .fresh) {
         log.info("certificate in {s} is fresh", .{options.state_dir});
         return;
     }
@@ -66,24 +67,34 @@ pub fn ensure(gpa: Allocator, io: Io, options: Options) !void {
         try options.identifier.format_value(try arena.alloc(u8, 256)),
         options.directory_url,
     });
-    try obtain(arena, io, dir, options);
+    obtain(arena, io, dir, options) catch |err| switch (state) {
+        // A failed renewal (the CA down, a rate limit) must not take a
+        // working site down: serve the old certificate while it lasts,
+        // and try again at the next restart.
+        .valid => log.warn("renewal failed ({t}); serving the current certificate", .{err}),
+        .missing, .expired => return err,
+        .fresh => unreachable,
+    };
 }
 
-/// Fresh: present, parseable, and more than a third of its validity left.
-fn certificate_fresh(arena: Allocator, io: Io, dir: Io.Dir) !bool {
+const CertificateState = enum { missing, expired, valid, fresh };
+
+/// Fresh: more than a third of its validity left. Valid: not expired.
+fn certificate_state(arena: Allocator, io: Io, dir: Io.Dir) !CertificateState {
     const text = dir.readFileAlloc(io, cert_file, arena, .limited(response_bytes_max)) catch |err|
         switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound => return .missing,
             else => |e| return e,
         };
-    const der_bytes = (try first_pem_block(arena, text)) orelse return false;
+    const der_bytes = (try first_pem_block(arena, text)) orelse return .missing;
     const certificate: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
-    const parsed = certificate.parse() catch return false;
+    const parsed = certificate.parse() catch return .missing;
     const validity = parsed.validity;
-    if (validity.not_after <= validity.not_before) return false;
+    if (validity.not_after <= validity.not_before) return .missing;
     const now: u64 = @intCast(Io.Clock.real.now(io).toSeconds());
+    if (now >= validity.not_after) return .expired;
     const life = validity.not_after - validity.not_before;
-    return now + life / 3 < validity.not_after;
+    return if (now + life / 3 < validity.not_after) .fresh else .valid;
 }
 
 fn first_pem_block(arena: Allocator, text: []const u8) !?[]u8 {
