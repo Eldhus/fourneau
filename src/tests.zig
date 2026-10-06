@@ -17,4 +17,5 @@ test {
     _ = @import("static.zig");
     _ = @import("stdx.zig");
     _ = @import("tidy.zig");
+    _ = @import("tls.zig");
 }

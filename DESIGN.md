@@ -60,7 +60,7 @@ on it (roux) adds its own. Nothing is fetched at build time.
   - **zig-io-evented** (`vendor/zig-io-evented/`): upstream's
     `Io/Uring.zig` at the pinned release, with our changes marked
     `// fourneau:`.
-  - **tls.zig** (`vendor/tls.zig/`, planned in M7; ianic/tls.zig, MIT): the TLS 1.3
+  - **tls.zig** (`vendor/tls.zig/`, ianic/tls.zig, MIT): the TLS 1.3
     server handshake. The owner decided (2026-10-04) not to own a TLS
     protocol implementation; Zig's standard library has only a client,
     and tls.zig is the Zig community's, built on `std.crypto`.
@@ -134,14 +134,22 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   (RFC 9112 §6.3, §11.2): both `Content-Length` and `Transfer-Encoding`,
   conflicting lengths, bare CR, obsolete line folding, whitespace before
   a colon are refused, never guessed at.
-- **tls** (planned, M7): TLS 1.3 only (RFC 8446). The handshake is tls.zig's, run on
-  the connection's own fiber (it is blocking-style code over `std.Io`
-  streams, which is what a fiber runs); then the keys go to the kernel
-  (kTLS: AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) and the fiber reads
-  and writes plaintext. ALPN chooses `h2` or `http/1.1`. ECDSA P-256
-  certificates. No 0-RTT, which allows replay; no TLS 1.2, whose surface
-  is most of TLS's history of attacks. Known costs: the host needs the
-  kernel's `tls` module; a client's KeyUpdate closes the connection (the
+- **tls** (`tls.zig`, M7): TLS 1.3 only (RFC 8446). The handshake is
+  tls.zig's, run on the connection's own fiber (blocking-style code over
+  `std.Io` streams, which is what a fiber runs), in memory the connection
+  already has: before its first request its scratch holds tls.zig's two
+  buffers. Then the keys go to the kernel (kTLS: AES-128-GCM,
+  AES-256-GCM, ChaCha20-Poly1305) and the fiber reads and writes
+  plaintext through the same io_uring path as HTTP. What the client sent
+  behind its Finished (usually its first request) is decrypted in user
+  space first, so the kernel's record counter starts after it. ALPN:
+  `http/1.1` until HTTP/2 (M9). ECDSA P-256 certificates. No 0-RTT, which
+  allows replay; no TLS 1.2, whose surface is most of TLS's history of
+  attacks. Known costs: the kernel's `tls` module must be loaded (an
+  unprivileged server cannot make the kernel load it: the site host loads
+  it at boot); a kTLS socket refuses `MSG_WAITALL`, so HTTPS connections
+  flush and then read rather than use the linked send-then-receive
+  (experiment 18's +15%); a client's KeyUpdate closes the connection (the
   kernel will not decode it for us); no ML-KEM hybrid until tls.zig's
   server has one.
 - **static files and compression** (M6; ETag today): answered in fourneau, never entering

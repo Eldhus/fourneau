@@ -28,9 +28,12 @@
    https": M7 (TLS), M8 (ACME), M10 (deploy: the dragrace site on 443),
    with roux's templates and the dragrace's templates workload; then M6
    and M9. Iteratively, TigerStyle, data-oriented, until deployed.
-   - Where it stands (2026-10-06): started. Order: M7 (tls.zig vendored,
-     handshake on the connection's fiber, kTLS), M8, M10; templates in
-     roux and the dragrace (their TODOs); M6; M9.
+   - Where it stands (2026-10-06): M7's core works: tls.zig vendored,
+     the handshake on the connection's fiber, kTLS; `fourneau-static
+     --cert --key` serves HTTPS (curl, openssl s_client, keep-alive, an
+     18 KB response across records; TLS 1.2 refused). Next for M7: Zig's
+     own TLS client, testssl.sh, a load run over HTTPS; then M8 (ACME),
+     M10; templates in roux and the dragrace (their TODOs); M6; M9.
 
 ## Plan
 
@@ -115,8 +118,8 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 
 - **Vendored sources**, monthly and when a security release appears:
   `vendor/zig-io-evented/` against upstream `Io/Uring.zig` (what upstream
-  changed; can a patch go?), and `vendor/tls.zig/` (github.com/ianic/tls.zig)
-  once vendored. Run the suite, note what changed in the diary.
+  changed; can a patch go?), and `vendor/tls.zig/` (github.com/ianic/tls.zig;
+  its README says how). Run the suite, note what changed in the diary.
   - Last done: 2026-10-04 (the port vendored).
 
 ## Todo
@@ -186,6 +189,15 @@ Read the diary, keep the tests, delete what did not pay, write it again.
   send-then-receive with its completion skipped +15%; multishot receive
   and registered files within noise; `RECVSEND_POLL_FIRST` -7%. Left:
   fewer `io_uring_enter` calls. (2026-10-05)
+- [ ] A kTLS-safe linked send-then-receive: kTLS sends refuse
+  `MSG_WAITALL`, so HTTPS connections flush and then read (two
+  completions, not one; experiment 18's +15% lost on HTTPS). Without
+  WAITALL a short send would let the receive run early; measure whether
+  a send-then-poll or a retried send keeps the gain. (2026-10-06)
+- [ ] Plain HTTP sent to an HTTPS port waits out the head timeout (tls.zig
+  reads the request line as a record header and waits for that many
+  bytes). Refuse it at once: a first byte that is not a TLS handshake
+  record (0x16) is not TLS. (2026-10-06)
 
 ## Tickler
 

@@ -1,6 +1,10 @@
 //! fourneau-static: a directory of files, served from memory.
 //!
 //!   fourneau-static --root DIR [--address A] [--port P] [--shards N]
+//!                   [--cert CHAIN.pem --key KEY.pem]
+//!
+//! With a certificate and key, every connection is HTTPS (TLS 1.3, the
+//! keys then the kernel's: server.zig, tls.zig).
 //!
 //! Every file under DIR is read once, at startup, into one table (the
 //! TigerStyle way: all memory taken before serving, none after), and the
@@ -18,6 +22,7 @@ const Evented = @import("zig_io_evented");
 const server_module = @import("server.zig");
 const http1_response = @import("http1_response.zig");
 const http1_head = @import("http1_head.zig");
+const tls = @import("tls.zig");
 
 const files_max = 4096;
 const file_bytes_max = 16 * 1024 * 1024;
@@ -187,6 +192,8 @@ const Options = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     shards: u32 = 0,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
 };
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -204,9 +211,15 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.port = try std.fmt.parseInt(u16, value, 10);
         } else if (std.mem.eql(u8, arg, "--shards")) {
             options.shards = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, arg, "--cert")) {
+            options.cert = value;
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            options.key = value;
         } else return error.Usage;
     }
     if (options.root == null) return error.Usage;
+    // Both or neither: half a certificate is a mistake, not plain HTTP.
+    if ((options.cert == null) != (options.key == null)) return error.Usage;
     return options;
 }
 
@@ -219,20 +232,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var site: Site = .{};
     try load(gpa, io, options.root.?, &site);
     if (site.routes.count() == 0) return error.EmptySite;
+    // The certificate, loaded once and shared read-only by every shard.
+    var auth: tls.CertKeyPair = undefined;
+    var context: tls.Context = undefined;
+    const https = options.cert != null;
+    if (https) {
+        const cwd = std.Io.Dir.cwd();
+        auth = try tls.CertKeyPair.fromFilePath(gpa, io, cwd, options.cert.?, options.key.?);
+        context = .{ .auth = &auth };
+    }
+    const shared: Shared = .{ .site = &site, .tls = if (https) &context else null };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
     var threads: [shards_max]std.Thread = undefined;
     for (threads[1..options.shards]) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, run_shard, .{ &site, options });
+        thread.* = try std.Thread.spawn(.{}, run_shard, .{ &shared, options });
     }
-    std.debug.print("fourneau-static: {d} routes on http://{s}:{d} ({d} shards)\n", .{
+    std.debug.print("fourneau-static: {d} routes on {s}://{s}:{d} ({d} shards)\n", .{
         site.routes.count(),
+        if (https) "https" else "http",
         options.address,
         options.port,
         options.shards,
     });
-    run_shard(&site, options);
+    run_shard(&shared, options);
 }
+
+/// What every shard reads and none writes.
+const Shared = struct {
+    site: *const Site,
+    tls: ?*const tls.Context,
+};
 
 fn cpu_count() u32 {
     const linux = std.os.linux;
@@ -245,11 +275,11 @@ fn cpu_count() u32 {
     return @min(count, shards_max);
 }
 
-fn run_shard(site: *const Site, options: Options) void {
-    run_shard_or_fail(site, options) catch |err| std.debug.panic("shard: {t}", .{err});
+fn run_shard(shared: *const Shared, options: Options) void {
+    run_shard_or_fail(shared, options) catch |err| std.debug.panic("shard: {t}", .{err});
 }
 
-fn run_shard_or_fail(site: *const Site, options: Options) !void {
+fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     const gpa = std.heap.page_allocator;
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{
@@ -260,9 +290,10 @@ fn run_shard_or_fail(site: *const Site, options: Options) !void {
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse(options.address, options.port);
     const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
-    var app: App = .{ .site = site };
+    var app: App = .{ .site = shared.site };
     var server = try Server.init(gpa, io, &app, listener, .{
         .connections_max = @max(64, 1024 / options.shards),
+        .tls = shared.tls,
     });
     try server.run();
 }

@@ -946,3 +946,30 @@ reused.
     Resources.)
 23. **Evented's default ring: 8 entries.** (settled 2026-10-05: 4,096
     entries, +3-13% on one core; DESIGN, Layers.)
+
+## 2026-10-06: TLS, the handshake on the fiber and the keys to the kernel
+
+M7's core, in the order it went:
+
+- tls.zig (ianic, bd22bcb) is already on Zig 0.17 and has a `Ktls`
+  conversion: its server handshake takes a `std.Io` reader and writer, so
+  it runs on the connection's fiber unchanged. Vendored whole.
+- `src/tls.zig`: a reader and writer over the connection's deadline-armed
+  reads and writes, the handshake in the connection's scratch (both
+  16 KiB buffers: no new memory), then `TCP_ULP` "tls" and the TX and RX
+  keys. A client usually sends its request right behind its Finished, so
+  the input buffer may hold an encrypted record the kernel never saw: it
+  is decrypted in user space first and becomes the start of `recv`; the
+  keys go to the kernel with the receive counter past it.
+- First run: `kTLS: NOENT`. The kernel loads the `tls` module for a
+  `TCP_ULP` request only with CAP_NET_ADMIN; `modprobe tls` once (the site
+  host will load it at boot).
+- Second run: the request arrived (78 bytes, through io_uring, decrypted
+  by the kernel) and no response left. The linked send-then-receive sends
+  with `MSG_WAITALL`, which a kTLS socket refuses (EOPNOTSUPP), and the
+  linked receive was cancelled under the fiber. HTTPS connections now
+  flush, then read (Todo: a kTLS-safe linked send).
+- Then: curl and `openssl s_client` (TLS 1.3, AES-256-GCM) get every
+  page; three requests on one connection; an 18 KB response across
+  records; TLS 1.2 refused. The suite and a 200-seed sweep pass; roux's
+  platform builds (the exported `fourneau` module carries `tls`).

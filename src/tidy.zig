@@ -60,7 +60,13 @@ const long_functions = [_]struct { file: []const u8, name: []const u8, lines: u3
 /// `indirection`: banned except in files that implement an interface of
 /// `std`'s, which is a table of function pointers over opaque userdata by
 /// its own design (`std.Io`): each tree lists those files in `interfaces`.
-const banned = [_]struct { text: []const u8, why: []const u8, indirection: bool = false }{
+const banned = [_]struct {
+    text: []const u8,
+    why: []const u8,
+    indirection: bool = false,
+    /// Files where the text is right, each said why below.
+    allowed_in: []const []const u8 = &.{},
+}{
     .{ .text = "Self = " ++ "@This()", .why = "give @This() a real name" },
     .{ .text = "== " ++ "error.", .why = "switch on the error" },
     .{ .text = "!= " ++ "error.", .why = "switch on the error" },
@@ -77,7 +83,14 @@ const banned = [_]struct { text: []const u8, why: []const u8, indirection: bool 
         .why = "no function pointers: a switch, or comptime",
         .indirection = true,
     },
-    .{ .text = "std." ++ "Random", .why = "prng.zig: a seed must mean the same forever" },
+    .{
+        .text = "std." ++ "Random",
+        .why = "prng.zig: a seed must mean the same forever",
+        // tls.zig: TLS needs cryptographic randomness, which tls.zig takes
+        // as this interface; it is drawn from `Io`, so a simulated Io
+        // still decides it.
+        .allowed_in = &.{"tls.zig"},
+    },
 };
 
 const File = struct {
@@ -177,6 +190,7 @@ fn check_lines(f: File) u32 {
         }
         for (banned) |b| {
             if (b.indirection and contains(f.tree.interfaces, f.name)) continue;
+            if (contains(b.allowed_in, f.name)) continue;
             if (std.mem.indexOf(u8, line, b.text) != null) {
                 problems += problem(f, number, "\"{s}\": {s}", .{ b.text, b.why });
             }
