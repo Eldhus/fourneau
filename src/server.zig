@@ -112,6 +112,20 @@ const recv_window_bytes = 4096;
 
 pub const BodyError = error{ BadRequest, ContentTooLarge, Disconnected };
 
+pub const StreamError = error{
+    /// The peer is gone, or stopped reading for longer than the send
+    /// timeout: what was not sent never will be.
+    Disconnected,
+    /// The head cannot be sent (a status without a body, a header that
+    /// could break the framing, a head too large): the application's bug.
+    /// Nothing was sent, so it still answers, with a 500.
+    HeadRefused,
+};
+
+/// The status a handler returns when it streamed its response: the
+/// response is on its way already, and there is nothing more to send.
+pub const streamed_status: u16 = 0;
+
 /// What the server's type is built with: what its `Io` offers beyond
 /// `std.Io`, known at compile time, so a call is direct.
 pub const Options = struct {
@@ -166,7 +180,9 @@ threadlocal var thread_marker: u8 = 0;
 ///   const Response: struct with `status: u16`, `headers: []const
 ///     http1_response.Header` and `body: []const u8`;
 ///   fn handle(app: *App, request: *Request) App.Response, called on the
-///     connection's fiber: it may block (yield) as long as it likes;
+///     connection's fiber: it may block (yield) as long as it likes; a
+///     handler that streams (`Request.stream_start`) returns
+///     `streamed_status`, and only such a handler does;
 ///   fn release(app: *App, response: *App.Response) void, once sent.
 /// `handle` runs on many fibers at once, all on the shard's thread: `App`
 /// may hold per-shard state; per-request memory is `request.scratch`.
@@ -224,7 +240,47 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             pub fn read_body(request: *Request, buffer: []u8) BodyError!usize {
                 return request.connection.read_body(buffer);
             }
+
+            /// A streamed response (server-sent events), chunked: this
+            /// head, a chunk per `stream_send`, the last at `stream_end`;
+            /// then the handler returns `streamed_status`. Read the body
+            /// first: a body is not read once a stream has started.
+            ///
+            /// Chunks wait in the send buffer, as pipelined responses do,
+            /// so chunks made together go out together; they are sent when
+            /// the buffer fills, at `stream_flush`, and at the connection's
+            /// next read. Flush before waiting on anything but this
+            /// connection, or the client waits too. A handler that returns
+            /// without `stream_end` (it failed, or the peer is gone) closes
+            /// the connection without the last chunk: the client sees a
+            /// response cut short, never a complete wrong one.
+            pub fn stream_start(
+                request: *Request,
+                status: u16,
+                headers: []const http1_response.Header,
+            ) StreamError!void {
+                return request.connection.stream_start(status, headers);
+            }
+
+            /// One chunk: these bytes, which may be reused once it returns.
+            /// No bytes, no chunk (an empty one would end the stream).
+            pub fn stream_send(request: *Request, bytes: []const u8) StreamError!void {
+                return request.connection.stream_send(bytes);
+            }
+
+            /// Send what waits: every chunk so far reaches the client.
+            pub fn stream_flush(request: *Request) StreamError!void {
+                return request.connection.stream_flush();
+            }
+
+            /// The last chunk: the response is whole.
+            pub fn stream_end(request: *Request) StreamError!void {
+                return request.connection.stream_end();
+            }
         };
+
+        /// Where a request's streamed response is (`Request.stream_start`).
+        const StreamState = enum { none, streaming, ended };
 
         const BodyState = union(enum) {
             none,
@@ -252,6 +308,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             /// body is consumed.
             request_end: u32,
             body: BodyState,
+            stream_state: StreamState,
             continue_sent: bool,
             keep_alive: bool,
             requests: u32,
@@ -262,6 +319,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
             fn read_body(connection: *Connection, buffer: []u8) BodyError!usize {
                 assert(buffer.len > 0);
+                // A 100 Continue after a stream's head would be a second
+                // head: the body is read before the response starts.
+                assert(connection.stream_state == .none);
                 return switch (connection.body) {
                     .none => 0,
                     .length => connection.read_length_body(buffer),
@@ -344,6 +404,107 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 }
                 @memcpy(connection.send[connection.send_used..][0..line.len], line);
                 connection.send_used += line.len;
+            }
+
+            fn stream_start(
+                connection: *Connection,
+                status: u16,
+                headers: []const http1_response.Header,
+            ) StreamError!void {
+                assert(connection.stream_state == .none);
+                // A body left unread cannot be skipped safely: the
+                // connection closes after this response, and its head
+                // must say so now.
+                if (connection.body != .none) connection.keep_alive = false;
+                const result = connection.write_head(.{
+                    .status = status,
+                    .headers = headers,
+                    .framing = .chunked,
+                    .keep_alive = connection.keep_alive,
+                    .date = connection.server.date(),
+                }) orelse return error.Disconnected;
+                switch (result) {
+                    .bytes => {},
+                    .refusal => |refusal| {
+                        log.err("stream refused: {t} (status {d})", .{ refusal, status });
+                        return error.HeadRefused;
+                    },
+                }
+                connection.stream_state = .streaming;
+            }
+
+            fn stream_send(connection: *Connection, bytes: []const u8) StreamError!void {
+                assert(connection.stream_state == .streaming);
+                if (bytes.len == 0) return;
+                // HEAD: the head said chunked; no body follows it (RFC
+                // 9110 §9.3.2).
+                if (connection.head.method == .head) return;
+                var line_buffer: [http1_response.chunk_size_line_bytes_max]u8 = undefined;
+                const line = http1_response.chunk_size_line(&line_buffer, bytes.len);
+                const tail = http1_response.chunk_tail;
+                const total = line.len + bytes.len + tail.len;
+                if (total > connection.send.len - connection.send_used) {
+                    if (!connection.flush()) return error.Disconnected;
+                }
+                if (total <= connection.send.len - connection.send_used) {
+                    connection.append(line);
+                    connection.append(bytes);
+                    connection.append(tail);
+                    return;
+                }
+                // Larger than the whole send buffer: straight from the
+                // handler's memory, behind what was flushed.
+                assert(connection.send_used == 0);
+                if (!connection.write_all(line, bytes)) return error.Disconnected;
+                connection.append(tail);
+            }
+
+            fn stream_flush(connection: *Connection) StreamError!void {
+                assert(connection.stream_state == .streaming);
+                if (!connection.flush()) return error.Disconnected;
+                assert(connection.send_used == 0);
+            }
+
+            fn stream_end(connection: *Connection) StreamError!void {
+                assert(connection.stream_state == .streaming);
+                if (connection.head.method != .head) {
+                    const last = http1_response.chunk_last;
+                    if (connection.send.len - connection.send_used < last.len) {
+                        if (!connection.flush()) return error.Disconnected;
+                    }
+                    connection.append(last);
+                }
+                connection.stream_state = .ended;
+            }
+
+            /// A response head into the send buffer, after what waits
+            /// there (flushed first when the largest head might not fit).
+            /// Null: the peer is gone.
+            fn write_head(
+                connection: *Connection,
+                head: http1_response.Head,
+            ) ?http1_response.Result {
+                const head_max = connection.server.config.response_head_bytes_max;
+                if (connection.send.len - connection.send_used < head_max) {
+                    if (!connection.flush()) return null;
+                }
+                const start = connection.send_used;
+                const result = http1_response.write(connection.send[start..][0..head_max], head);
+                switch (result) {
+                    .bytes => |bytes| {
+                        assert(bytes <= head_max);
+                        connection.send_used = start + bytes;
+                    },
+                    .refusal => assert(connection.send_used == start),
+                }
+                return result;
+            }
+
+            /// Bytes into the send buffer, which has room for them.
+            fn append(connection: *Connection, bytes: []const u8) void {
+                assert(bytes.len <= connection.send.len - connection.send_used);
+                @memcpy(connection.send[connection.send_used..][0..bytes.len], bytes);
+                connection.send_used += @intCast(bytes.len);
             }
 
             /// Send what waits in the send buffer. False: the peer is gone.
@@ -664,16 +825,15 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             var response = server.app.handle(&request);
             defer server.app.release(&response);
 
-            // A body the handler left unread cannot be skipped safely:
-            // the connection closes after this response.
-            if (connection.body != .none) connection.keep_alive = false;
-            const omit_body = connection.head.method == .head;
-            const written = server.write_response(connection, .{
-                .status = response.status,
-                .headers = response.headers,
-                .body = response.body,
-                .omit_body = omit_body,
-            });
+            const streamed = connection.stream_state != .none;
+            assert(streamed == (response.status == streamed_status));
+            const written = switch (connection.stream_state) {
+                .none => server.write_unstreamed(connection, response),
+                .ended => true,
+                // Left without its last chunk: closed without it, so the
+                // client sees the response cut short.
+                .streaming => false,
+            };
             if (!written or !connection.keep_alive) return false;
             connection.requests += 1;
             server.next_request(connection);
@@ -723,6 +883,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.head_bytes = head_bytes;
             connection.request_end = head_bytes;
             connection.keep_alive = head.keep_alive;
+            connection.stream_state = .none;
             connection.continue_sent = false;
             connection.body = switch (head.body) {
                 .none => .none,
@@ -751,6 +912,20 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             omit_body: bool = false,
         };
 
+        /// The handler's response, sent whole.
+        fn write_unstreamed(server: *Server, connection: *Connection, response: App.Response) bool {
+            assert(connection.stream_state == .none);
+            // A body the handler left unread cannot be skipped safely:
+            // the connection closes after this response.
+            if (connection.body != .none) connection.keep_alive = false;
+            return server.write_response(connection, .{
+                .status = response.status,
+                .headers = response.headers,
+                .body = response.body,
+                .omit_body = connection.head.method == .head,
+            });
+        }
+
         /// Into the send buffer, which goes out at the next read or close;
         /// a body too large to wait there goes out now, straight from the
         /// handler's memory, behind what was waiting.
@@ -760,22 +935,17 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 .none
             else
                 .{ .length = options.body.len };
-            const head_max = server.config.response_head_bytes_max;
-            if (connection.send.len - connection.send_used < head_max) {
-                if (!connection.flush()) return false;
-            }
-            const start = connection.send_used;
-            const result = http1_response.write(connection.send[start..][0..head_max], .{
+            const result = connection.write_head(.{
                 .status = options.status,
                 .headers = options.headers,
                 .framing = framing,
                 .keep_alive = connection.keep_alive,
                 .date = server.date(),
-            });
+            }) orelse return false;
             switch (result) {
-                .bytes => |bytes| {
+                .bytes => {
                     const body = if (options.omit_body or forbids_body) "" else options.body;
-                    const head_end = start + bytes;
+                    const head_end = connection.send_used;
                     if (body.len <= connection.send.len - head_end) {
                         @memcpy(connection.send[head_end..][0..body.len], body);
                         connection.send_used = @intCast(head_end + body.len);

@@ -128,7 +128,13 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   built at comptime, a digit loop, table-driven header checks, the Date
   refreshed per tick; experiment 7). Pipelined responses are coalesced:
   the send buffer is flushed only before a read that may block
-  (experiment 16).
+  (experiment 16). A handler may stream instead (server-sent events):
+  a chunked head, then a chunk per send, waiting in the same buffer, so
+  chunks made together go out together; the handler flushes before it
+  waits on anything but its connection. A stream the handler leaves
+  without its end (it failed, or the peer left) closes the connection
+  without the last chunk: the client sees a response cut short, never a
+  complete wrong one. The body is read before a stream starts.
 - **http1**: request line, headers, `Content-Length` and chunked bodies,
   keep-alive. It is strict where looseness is how smuggling happens
   (RFC 9112 §6.3, §11.2): both `Content-Length` and `Transfer-Encoding`,

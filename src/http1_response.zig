@@ -10,6 +10,7 @@
 const std = @import("std");
 const stdx = @import("stdx.zig");
 const http_date = @import("http_date.zig");
+const Prng = @import("prng.zig").Prng;
 const assert = std.debug.assert;
 
 pub const Header = struct {
@@ -93,6 +94,54 @@ pub fn write(buffer: []u8, head: Head) Result {
     assert(writer.used <= buffer.len);
     assert(std.mem.endsWith(u8, buffer[0..writer.used], "\r\n\r\n"));
     return .{ .bytes = @intCast(writer.used) };
+}
+
+// --- chunks (RFC 9112 §7.1): a streamed body ---------------------------------
+
+/// The longest chunk size line: 16 hex digits (a u64) and CRLF.
+pub const chunk_size_line_bytes_max = 16 + 2;
+/// What follows a chunk's data.
+pub const chunk_tail = "\r\n";
+/// The last chunk, with no trailer section: the end of a streamed body.
+pub const chunk_last = "0\r\n\r\n";
+
+/// A chunk's size line: lowercase hex, no extensions, no leading zeros.
+/// Zero is the last chunk and never a size line: a data chunk is not empty.
+pub fn chunk_size_line(buffer: *[chunk_size_line_bytes_max]u8, size: u64) []const u8 {
+    assert(size > 0);
+    const digits = "0123456789abcdef";
+    var index: usize = chunk_size_line_bytes_max - 2;
+    var rest = size;
+    for (0..16) |_| {
+        index -= 1;
+        buffer[index] = digits[@intCast(rest & 0xf)];
+        rest >>= 4;
+        if (rest == 0) break;
+    } else unreachable; // a u64 has at most 16 hex digits
+    buffer[chunk_size_line_bytes_max - 2 ..][0..2].* = "\r\n".*;
+    const line = buffer[index..];
+    assert(line.len >= 3);
+    assert(line[0] != '0');
+    return line;
+}
+
+test "http1: response: chunk size lines" {
+    var buffer: [chunk_size_line_bytes_max]u8 = undefined;
+    try testing.expectEqualStrings("1\r\n", chunk_size_line(&buffer, 1));
+    try testing.expectEqualStrings("3a\r\n", chunk_size_line(&buffer, 58));
+    try testing.expectEqualStrings("1000\r\n", chunk_size_line(&buffer, 4096));
+    try testing.expectEqualStrings(
+        "ffffffffffffffff\r\n",
+        chunk_size_line(&buffer, std.math.maxInt(u64)),
+    );
+    // Every size reads back as itself, through the strict parse a client does.
+    var prng = Prng.init(1);
+    for (0..1000) |_| {
+        const size = prng.next() >> @intCast(prng.int_less_than(u64, 64)) | 1;
+        const line = chunk_size_line(&buffer, size);
+        const parsed = try std.fmt.parseInt(u64, line[0 .. line.len - 2], 16);
+        try testing.expectEqual(size, parsed);
+    }
 }
 
 /// 1xx, 204 No Content and 304 Not Modified carry no body (RFC 9110

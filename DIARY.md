@@ -1114,3 +1114,37 @@ ranges, another unit, an invalid range or an `If-Range` that no longer
 matches the ETag, the whole file (the RFC allows ignoring Range). Every
 uncompressed copy says `Accept-Ranges: bytes`. Curl: `-r 0-14` gets
 `<!doctype html>`, `-r -7` the last seven bytes, `-r 99999-` a 416.
+
+## 2026-10-06: streamed responses
+
+For server-sent events: roux's `Sse`, and fourneau-dragrace's new SSE
+workload (a Datastar action, ten events, one chunk each). `Request`
+gains `stream_start` (a chunked head), `stream_send` (one chunk),
+`stream_flush` and `stream_end` (the last chunk); a handler that
+streamed returns `streamed_status` (0), and only such a handler does,
+asserted both ways. Chunks wait in the send buffer as pipelined
+responses do, so events made together leave in one write (hyper does
+the same; Go flushes each). A chunk larger than the buffer goes
+straight from the handler's memory. A stream left without its end
+closes the connection without the last chunk, so the client sees a cut
+response, not a whole wrong one. Reading the body after a stream
+starts is an assertion: its 100 Continue would be a second head.
+
+The simulator learned streams: `/stream/n/k` (the `/big/n` bytes in k
+pieces, some flushed with a 1 ms wait between) and `/abort/n/k` (half
+the pieces, then the handler gives up); the clients decode chunks
+strictly (lowercase hex, no leading zero, no extensions, no trailers)
+and check every chunk's size, and take a cut stream as its response
+only when the bytes end exactly at a chunk boundary and the request was
+an abort. 2,000 seeds pass (`zig build sim -Doptimize=ReleaseSafe --
+--seeds 2000`, 50 s; 16,388 streams cut short among them).
+
+The tests, tested: six bugs injected into the stream path, each swept
+over 400 seeds. Five were caught at once (no chunk tail; no last chunk;
+a body for HEAD; a size line off by one; a large chunk without its
+tail). The sixth was not: a cut stream that kept its connection open.
+The client just waited until the idle timeout closed it, and took the
+response then. A browser would have waited 30 seconds on a response
+that would never finish. The clients now fail when a cut stream's
+silence outlasts a few network turns (`cut_short_silence_ticks_max`,
+asserted below the idle timeout), and the sixth is caught on seed 0.

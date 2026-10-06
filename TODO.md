@@ -77,6 +77,10 @@ roux (its TODO): M4 and M5 are roux's; M6 and M10 have a half in each.
 - Compression: gzip from the standard library; then our own brotli
   encoder (RFC 7932).
 - Graceful shutdown; idle eviction under pressure (done 2026-10-06).
+- Streamed responses (server-sent events): a chunked head, a chunk per
+  send, coalesced in the send buffer, the last chunk at the end; a
+  stream the handler abandons closes without it (done 2026-10-06, for
+  roux's `Sse` and fourneau-dragrace's SSE workload).
 
 **Proves it:** `fourneau-static` agrees with Go's `FileServer` on what
 both offer (fourneau-dragrace's `dragrace diff`).

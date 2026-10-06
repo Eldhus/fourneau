@@ -57,6 +57,9 @@ pub fn setup(prng: *Prng) Setup {
     const transfer_ms = (@max(head_bytes_max, body_bytes_max) / window_bytes + 4) *
         (latency_ticks_max + 1) * 4;
     const tick_ms = 10;
+    // After a stream cut short: the server's last writes and its close,
+    // each a network turn late at most, with room for the scheduler.
+    const cut_short_silence_ticks_max = (latency_ticks_max + 1) * 4 + 2;
     const server: server_module.Config = .{
         .connections_max = connections_max,
         .head_bytes_max = head_bytes_max,
@@ -75,6 +78,9 @@ pub fn setup(prng: *Prng) Setup {
         .tick_ms = tick_ms,
         .tcp_nodelay = false,
     };
+    // A server that waits for the client after a stream cut short is
+    // closed by its idle timeout at the soonest: the silence must be less.
+    assert(cut_short_silence_ticks_max < server.idle_timeout_ms);
     return .{
         .server = server,
         .network = .{
@@ -96,6 +102,7 @@ pub fn setup(prng: *Prng) Setup {
             .big_bytes_max = prng.int_at_most(u32, 0, 16 * 1024),
             .idle_ticks_max = server.idle_timeout_ms * 2,
             .pause_ticks_max = server.head_timeout_ms * 2,
+            .cut_short_silence_ticks_max = cut_short_silence_ticks_max,
         },
         .clients_count = prng.int_at_most(u32, 1, 32),
         .linked = prng.boolean(),
@@ -109,6 +116,8 @@ pub fn setup(prng: *Prng) Setup {
 /// (sim_client.answer) into the connection's scratch memory.
 const App = struct {
     canary: bool,
+    /// For the waits between pieces of a stream.
+    io: std.Io,
     handled: u64 = 0,
 
     const answer_bytes_max = 16 * 1024 + 256;
@@ -142,6 +151,10 @@ const App = struct {
             body_bytes += got;
         } else unreachable; // a body is bounded by body_bytes_max
         const head = request.head;
+        if (sim_client.stream_target(head.path_and_query)) |target| {
+            app.handled += 1;
+            return app.stream(request, target);
+        }
         const result = sim_client.answer(
             head.method_text,
             head.path_and_query,
@@ -157,6 +170,40 @@ const App = struct {
             .headers = headers,
             .body = result.body,
         };
+    }
+
+    const streamed: Response = .{
+        .status = server_module.streamed_status,
+        .headers = &.{},
+        .body = "",
+    };
+
+    /// `/stream/` and `/abort/`: the answer in pieces, a `stream_send` each;
+    /// after some, a flush and a wait (other fibers run, the timekeeper
+    /// ticks), as a stream whose events come over time. `/abort/` gives up
+    /// after half of them, without the end.
+    fn stream(app: *App, request: anytype, target: sim_client.StreamTarget) Response {
+        const path = request.head.path_and_query;
+        const whole = sim_client.answer("GET", path, 0, 0, request.scratch).body;
+        assert(whole.len == target.stream.bytes);
+        request.stream_start(200, headers) catch |err| switch (err) {
+            // Nothing was started: an ordinary answer, which a peer that
+            // is gone never gets.
+            error.Disconnected => return .{ .status = 500, .headers = &.{}, .body = "" },
+            error.HeadRefused => unreachable, // a 200 with plain headers
+        };
+        const pieces = target.stream.pieces;
+        const sent = if (target.aborted) sim_client.abort_pieces(pieces) else pieces;
+        for (0..sent) |index| {
+            const piece = sim_client.stream_piece(target.stream.bytes, pieces, @intCast(index));
+            request.stream_send(whole[piece.start..piece.end]) catch return streamed;
+            if ((piece.end + index) % 3 == 0) {
+                request.stream_flush() catch return streamed;
+                app.io.sleep(.fromMilliseconds(1), .awake) catch return streamed;
+            }
+        }
+        if (!target.aborted) request.stream_end() catch return streamed;
+        return streamed;
     }
 
     pub fn release(app: *App, response: *Response) void {
@@ -177,6 +224,8 @@ pub const Outcome = struct {
     responses: u64,
     retries: u64,
     timed_out: u64,
+    /// Streams the application gave up on, as the clients received them.
+    cut_short: u64,
 };
 
 pub fn run(gpa: std.mem.Allocator, seed: u64, canary: bool) !Outcome {
@@ -190,7 +239,7 @@ pub fn run(gpa: std.mem.Allocator, seed: u64, canary: bool) !Outcome {
 
     var sim = try sim_io.Sim.init(gpa, network_seed, plan.network);
     defer sim.deinit(gpa);
-    var app: App = .{ .canary = canary };
+    var app: App = .{ .canary = canary, .io = sim.io() };
     const listener: std.Io.net.Server = .{
         .socket = .{
             .handle = sim_io.listener_fd,
@@ -274,11 +323,13 @@ fn outcome(
         .responses = 0,
         .retries = 0,
         .timed_out = 0,
+        .cut_short = 0,
     };
     for (clients, 0..) |*client, index| {
         result.responses += client.stats.responses;
         result.retries += client.stats.retries;
         result.timed_out += client.stats.timed_out;
+        result.cut_short += client.stats.cut_short;
         if (client.failure != .none) {
             if (client.report_failures) std.debug.print("client {d}: {s} at request {d}\n", .{
                 index, @tagName(client.failure), client.failure_index,
@@ -294,8 +345,8 @@ pub fn print(seed: u64, result: Outcome) void {
     std.debug.print("seed={d} exit={d} ticks={d} requests={d} responses={d} refused={d} ", .{
         seed, result.exit_code, result.ticks, result.requests, result.responses, result.refused,
     });
-    std.debug.print("retries={d} timeouts={d}/{d}\n", .{
-        result.retries, result.timed_out, result.timeouts,
+    std.debug.print("retries={d} timeouts={d}/{d} cut_short={d}\n", .{
+        result.retries, result.timed_out, result.timeouts, result.cut_short,
     });
 }
 
