@@ -1104,3 +1104,13 @@ DROWN, LOGJAM, BEAST, LUCKY13, RC4: not vulnerable. Two notes:
 - No Strict-Transport-Security: now sent on an HTTPS site, a year.
   Browsers ignore it for an IP address; it counts once the site has a
   name.
+
+## 2026-10-06: byte ranges
+
+`fourneau-static` answers `Range` (RFC 9110 §14): one range, `a-b`, `a-`
+or the last n bytes `-n`, from the uncompressed copy, as 206 with
+`Content-Range`; a range past the end, 416 with `bytes */len`; several
+ranges, another unit, an invalid range or an `If-Range` that no longer
+matches the ETag, the whole file (the RFC allows ignoring Range). Every
+uncompressed copy says `Accept-Ranges: bytes`. Curl: `-r 0-14` gets
+`<!doctype html>`, `-r -7` the last seven bytes, `-r 99999-` a 416.

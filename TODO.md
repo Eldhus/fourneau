@@ -41,7 +41,7 @@
      the chain and name OK, no vulnerability (BREACH flagged for gzip:
      a static site has no secrets to leak); HSTS now sent. Templates in
      roux and the dragrace are done (their TODOs). Next: M6's rest
-     (Range, brotli, graceful shutdown), M9, M10's graceful restart and
+     (brotli, graceful shutdown, zero-copy), M9, M10's graceful restart and
      the roux app.
 
 ## Plan
@@ -71,8 +71,8 @@ roux (its TODO): M4 and M5 are roux's; M6 and M10 have a half in each.
 
 ### M6. Static files and compression
 
-- Static files (ETag; gzip copies made at load, done 2026-10-06; Range,
-  zero-copy), and
+- Static files (ETag; gzip copies made at load and single byte ranges,
+  done 2026-10-06; zero-copy), and
   `fourneau-static`, the pure-Zig static file server.
 - Compression: gzip from the standard library; then our own brotli
   encoder (RFC 7932).
