@@ -138,6 +138,11 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 
 ## Todo
 
+- [ ] kTLS's warning on a connection the peer closed right after the
+  handshake says `kTLS: NOTCONN (is the tls module loadable?)`: the
+  module is loaded (the dragrace site, 2026-10-07: a racer refusing the
+  certificate, and the odd scanner); NOTCONN is the peer gone, not the
+  module. Say so, and at a lower level. (2026-10-07)
 - [ ] A ~2 s worst-case request in the safe-build pipelined run (p99.9
   13.8 ms; DIARY 2026-10-05): find where it waited (the accept backlog at
   start-up is the first suspect). (2026-10-05)
