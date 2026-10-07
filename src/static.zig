@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Loading is a startup step: blocking reads on this thread, before any
     // shard exists.
     const io = std.Io.Threaded.global_single_threaded.io();
-    const site = try site_module.Site.load(gpa, io, options.root.?, "", options.https.enabled());
+    const site = try site_module.Site.load(gpa, io, options.root.?, "");
     if (site.routes.count() == 0) return error.EmptySite;
     // The certificate, loaded once and shared read-only by every shard.
     const shared: Shared = .{ .site = &site, .tls = try https.context(gpa, io, options.https) };

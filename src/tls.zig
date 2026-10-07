@@ -37,6 +37,11 @@ pub const Context = struct {
 
 pub const HandshakeError = error{
     HandshakeFailed,
+    /// The client left between its Finished and its keys reaching the
+    /// kernel: Linux attaches TLS only to an established connection
+    /// (TCP_ULP: ENOTCONN). A client that hangs up at once, a scanner, or
+    /// one that refused the certificate: routine, not a fault here.
+    PeerClosed,
     KernelTlsFailed,
     EarlyDataTooLarge,
     /// The first byte is not a TLS handshake record: plain HTTP, most
@@ -186,28 +191,149 @@ fn take_buffered(session: anytype, reader: *Io.Reader, early: []u8) HandshakeErr
     } else unreachable;
 }
 
+/// The keys to the kernel. That the kernel has TLS at all was checked at
+/// startup (`check_kernel`), so a failure here is about this connection.
 fn kernel_tls(socket: std.posix.socket_t, keys: *tls.Ktls) HandshakeError!void {
-    const ulp = "tls";
-    const steps = [_]struct { level: i32, name: u32, value: []const u8 }{
-        .{ .level = linux.IPPROTO.TCP, .name = linux.TCP.ULP, .value = ulp },
-        .{ .level = linux.SOL.TLS, .name = tls.Ktls.TX, .value = keys.txBytes() },
-        .{ .level = linux.SOL.TLS, .name = tls.Ktls.RX, .value = keys.rxBytes() },
-    };
-    for (steps) |step| {
-        assert(step.value.len > 0);
-        const result = linux.setsockopt(
-            socket,
-            step.level,
-            step.name,
-            step.value.ptr,
-            @intCast(step.value.len),
-        );
-        switch (linux.errno(result)) {
-            .SUCCESS => {},
-            else => |errno| {
-                std.log.scoped(.fourneau).warn("kTLS: {t} (is the tls module loadable?)", .{errno});
-                return error.KernelTlsFailed;
-            },
-        }
+    try set_option(socket, attach_step);
+    try set_option(socket, .{
+        .label = "TLS_TX",
+        .level = linux.SOL.TLS,
+        .name = tls.Ktls.TX,
+        .value = keys.txBytes(),
+    });
+    try set_option(socket, .{
+        .label = "TLS_RX",
+        .level = linux.SOL.TLS,
+        .name = tls.Ktls.RX,
+        .value = keys.rxBytes(),
+    });
+}
+
+const SocketOption = struct { label: []const u8, level: i32, name: u32, value: []const u8 };
+
+/// TLS onto the connection, before its keys.
+const attach_step: SocketOption = .{
+    .label = "TCP_ULP",
+    .level = linux.IPPROTO.TCP,
+    .name = linux.TCP.ULP,
+    .value = ulp,
+};
+
+fn set_option(socket: std.posix.socket_t, option: SocketOption) HandshakeError!void {
+    assert(option.label.len > 0);
+    assert(option.value.len > 0);
+    const result = linux.setsockopt(
+        socket,
+        option.level,
+        option.name,
+        option.value.ptr,
+        @intCast(option.value.len),
+    );
+    switch (linux.errno(result)) {
+        .SUCCESS => {},
+        .NOTCONN => return error.PeerClosed,
+        else => |errno| {
+            std.log.scoped(.fourneau).warn("kTLS: {s}: {t}", .{ option.label, errno });
+            return error.KernelTlsFailed;
+        },
     }
+}
+
+/// The upper layer protocol kTLS attaches as (TCP_ULP).
+const ulp = "tls";
+
+/// Linux's list of the upper layer protocols it has, space-separated:
+/// `tls` there once the tls module is loaded (or built in).
+const available_ulp_path = "/proc/sys/net/ipv4/tcp_available_ulp";
+
+pub const KernelError = error{KernelTlsUnavailable};
+
+/// Whether this kernel can take TLS keys, checked once at startup: without
+/// it every handshake would end at `kernel_tls`, each connection logging
+/// the same fault. A server without CAP_NET_ADMIN cannot have the module
+/// loaded on demand, so it is loaded at boot (modules-load.d).
+pub fn check_kernel(io: Io) KernelError!void {
+    var buffer: [4096]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, available_ulp_path, &buffer) catch |err| {
+        std.log.scoped(.fourneau).err("kTLS: {s}: {t}", .{ available_ulp_path, err });
+        return error.KernelTlsUnavailable;
+    };
+    if (!listed(text, ulp)) {
+        std.log.scoped(.fourneau).err("kTLS: the kernel has no `{s}` ({s} lists \"{s}\"): " ++
+            "load the tls module (modprobe tls; at boot, /etc/modules-load.d)", .{
+            ulp,
+            available_ulp_path,
+            std.mem.trim(u8, text, " \n"),
+        });
+        return error.KernelTlsUnavailable;
+    }
+}
+
+/// Whether `name` is one of the whitespace-separated words of `text`.
+fn listed(text: []const u8, name: []const u8) bool {
+    assert(name.len > 0);
+    var words = std.mem.tokenizeAny(u8, text, " \t\n");
+    while (words.next()) |word| {
+        if (std.mem.eql(u8, word, name)) return true;
+    }
+    return false;
+}
+
+test "tls: the kernel's list of upper layer protocols" {
+    try std.testing.expect(listed("espintcp mptcp tls\n", ulp));
+    try std.testing.expect(listed("tls\n", ulp));
+    try std.testing.expect(!listed("espintcp mptcp\n", ulp));
+    try std.testing.expect(!listed("\n", ulp));
+    // A word, not a part of one.
+    try std.testing.expect(!listed("ktls tlsx\n", ulp));
+}
+
+test "tls: a client gone before its keys is PeerClosed, not a kernel fault" {
+    var buffer: [4096]u8 = undefined;
+    const available = Io.Dir.cwd().readFile(std.testing.io, available_ulp_path, &buffer) catch
+        return error.SkipZigTest;
+    if (!listed(available, ulp)) return error.SkipZigTest; // no kTLS on this kernel
+    const listener = try test_listener();
+    defer _ = linux.close(listener.socket);
+    // Established: TLS attaches.
+    const open = try test_pair(listener);
+    defer _ = linux.close(open.client);
+    defer _ = linux.close(open.server);
+    try set_option(open.server, attach_step);
+    // The client closed, and its FIN is in (read says end of stream): the
+    // connection is CLOSE_WAIT, and Linux refuses TLS with ENOTCONN.
+    const gone = try test_pair(listener);
+    defer _ = linux.close(gone.server);
+    _ = try test_syscall(linux.close(gone.client));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 0), try test_syscall(linux.read(gone.server, &byte, 1)));
+    try std.testing.expectError(error.PeerClosed, set_option(gone.server, attach_step));
+}
+
+fn test_syscall(result: usize) !u32 {
+    if (linux.errno(result) != .SUCCESS) return error.Unexpected;
+    return @intCast(result);
+}
+
+fn test_listener() !struct { socket: i32, address: linux.sockaddr.in } {
+    const stream = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    const socket: i32 = @intCast(try test_syscall(linux.socket(linux.AF.INET, stream, 0)));
+    errdefer _ = linux.close(socket);
+    var address: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var length: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = try test_syscall(linux.bind(socket, @ptrCast(&address), length));
+    _ = try test_syscall(linux.listen(socket, 4));
+    _ = try test_syscall(linux.getsockname(socket, @ptrCast(&address), &length));
+    assert(address.port != 0);
+    return .{ .socket = socket, .address = address };
+}
+
+fn test_pair(listener: anytype) !struct { client: i32, server: i32 } {
+    const stream = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    const client: i32 = @intCast(try test_syscall(linux.socket(linux.AF.INET, stream, 0)));
+    errdefer _ = linux.close(client);
+    const length: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = try test_syscall(linux.connect(client, &listener.address, length));
+    const server: i32 = @intCast(try test_syscall(linux.accept(listener.socket, null, null)));
+    return .{ .client = client, .server = server };
 }

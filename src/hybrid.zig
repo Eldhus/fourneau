@@ -199,6 +199,7 @@ const Shard = struct {
             .framing = .{ .length = body.len },
             .keep_alive = keep_alive,
             .date = &shard.date_text,
+            .secure = false, // an instrument: plain HTTP only
         });
         const bytes = result.bytes; // a canned response cannot be refused
         assert(bytes + body.len <= buffer.len); // fourneau-load pipelines at most 64
