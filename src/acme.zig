@@ -14,7 +14,8 @@
 //!
 //! State directory: `account.key` (the account's P-256 secret, 0600),
 //! `cert.pem` (the chain), `key.pem` (the certificate's key, SEC1, 0600),
-//! `directory` (the CA that issued it: a change of CA orders anew).
+//! `directory` (the CA that issued it) and `identifier` (what it is for,
+//! `kind:value`): a change of either orders anew.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -46,6 +47,8 @@ pub const key_file = "key.pem";
 const account_file = "account.key";
 /// The directory URL of the CA that issued cert.pem.
 const directory_file = "directory";
+/// What cert.pem is for, as `ip:203.0.113.7` or `dns:example.com`.
+const identifier_file = "identifier";
 
 /// Bounds: polls of an authorization or order, and the bytes of any one
 /// response from the CA.
@@ -61,10 +64,15 @@ pub fn ensure(gpa: Allocator, io: Io, options: Options) !void {
     const arena = arena_state.allocator();
     const dir = try Io.Dir.cwd().createDirPathOpen(io, options.state_dir, .{});
     defer dir.close(io);
-    // A certificate from another CA (staging, before production) does not
-    // count: the directory that issued it is kept beside it.
-    const same_ca = try issued_by(arena, io, dir, options.directory_url);
-    const state = if (same_ca) try certificate_state(arena, io, dir) else .missing;
+    // A certificate from another CA (staging, before production), or for
+    // another identifier (an address, before a name: found 2026-10-07,
+    // the dragrace site kept serving its IP certificate for its new name),
+    // does not count: both are kept beside it.
+    var identifier_buffer: [identifier_record_bytes_max]u8 = undefined;
+    const identifier = try identifier_record(options.identifier, &identifier_buffer);
+    const same = try recorded(arena, io, dir, directory_file, options.directory_url) and
+        try recorded(arena, io, dir, identifier_file, identifier);
+    const state = if (same) try certificate_state(arena, io, dir) else .missing;
     if (state == .fresh) {
         log.info("certificate in {s} is fresh", .{options.state_dir});
         return;
@@ -85,13 +93,31 @@ pub fn ensure(gpa: Allocator, io: Io, options: Options) !void {
 
 const CertificateState = enum { missing, expired, valid, fresh };
 
-fn issued_by(arena: Allocator, io: Io, dir: Io.Dir, directory_url: []const u8) !bool {
+/// Whether the state file `name` holds exactly `expected`; a missing file
+/// (state from before the file existed) holds nothing.
+fn recorded(arena: Allocator, io: Io, dir: Io.Dir, name: []const u8, expected: []const u8) !bool {
+    assert(expected.len > 0);
     const limit: Io.Limit = .limited(1024);
-    const recorded = dir.readFileAlloc(io, directory_file, arena, limit) catch |err| switch (err) {
+    const text = dir.readFileAlloc(io, name, arena, limit) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => |e| return e,
     };
-    return std.mem.eql(u8, recorded, directory_url);
+    return std.mem.eql(u8, text, expected);
+}
+
+const identifier_record_bytes_max = 300;
+
+/// `kind:value`: the kind too, so a name that reads as an address cannot
+/// match one.
+fn identifier_record(identifier: Identifier, buffer: *[identifier_record_bytes_max]u8) ![]const u8 {
+    // format_value returns a name as it is, and writes only an address.
+    var value_buffer: [identifier_record_bytes_max - 8]u8 = undefined;
+    const value = try identifier.format_value(&value_buffer);
+    assert(value.len > 0);
+    return std.fmt.bufPrint(buffer, "{s}:{s}", .{ identifier.kind(), value }) catch |err|
+        switch (err) {
+            error.NoSpaceLeft => error.IdentifierTooLong,
+        };
 }
 
 /// Fresh: more than a third of its validity left. Valid: not expired.
@@ -294,6 +320,9 @@ fn obtain(arena: Allocator, io: Io, dir: Io.Dir, options: Options) !void {
     try write_private(io, dir, key_file, try crypto.private_key_pem(certificate_key, &key_buffer));
     try write_private(io, dir, cert_file, chain.body);
     try write_private(io, dir, directory_file, options.directory_url);
+    var identifier_buffer: [identifier_record_bytes_max]u8 = undefined;
+    const identifier = try identifier_record(options.identifier, &identifier_buffer);
+    try write_private(io, dir, identifier_file, identifier);
     log.info("certificate obtained: {s}/{s}", .{ options.state_dir, cert_file });
 }
 
@@ -522,3 +551,28 @@ const Responder = struct {
         return responder.answer[0..responder.answer_len];
     }
 };
+
+test "acme: a stored certificate counts only for its CA and its identifier" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [identifier_record_bytes_max]u8 = undefined;
+    const ip = try Io.net.IpAddress.parse("203.0.113.7", 0);
+    const address = try identifier_record(.{ .ip = ip }, &buffer);
+    try std.testing.expectEqualStrings("ip:203.0.113.7", address);
+    // State from before the identifier was kept: no file, a new order.
+    try std.testing.expect(!try recorded(arena, io, tmp.dir, identifier_file, address));
+    try write_private(io, tmp.dir, identifier_file, address);
+    try std.testing.expect(try recorded(arena, io, tmp.dir, identifier_file, address));
+    var name_buffer: [identifier_record_bytes_max]u8 = undefined;
+    const name = try identifier_record(.{ .dns = "site.example.com" }, &name_buffer);
+    try std.testing.expectEqualStrings("dns:site.example.com", name);
+    try std.testing.expect(!try recorded(arena, io, tmp.dir, identifier_file, name));
+    const staging = "https://acme-staging-v02.api.letsencrypt.org/directory";
+    try write_private(io, tmp.dir, directory_file, staging);
+    const production = "https://acme-v02.api.letsencrypt.org/directory";
+    try std.testing.expect(!try recorded(arena, io, tmp.dir, directory_file, production));
+}

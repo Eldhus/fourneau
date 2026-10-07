@@ -1148,3 +1148,15 @@ response then. A browser would have waited 30 seconds on a response
 that would never finish. The clients now fail when a cut stream's
 silence outlasts a few network turns (`cut_short_silence_ticks_max`,
 asserted below the idle timeout), and the sixth is caught on seed 0.
+
+## 2026-10-07: a certificate counts only for its identifier
+
+The dragrace site moved from its IP address to a name
+(fourneau.y2kbugger.com), and after the restart kept serving its IP
+certificate: `acme.ensure` reused any fresh certificate from the same CA,
+whatever it was issued for. The state directory now keeps `identifier`
+(`ip:203.0.113.7`, `dns:example.com`) beside `directory`, and a stored
+certificate counts only when both match; state from before the file
+reads as no certificate, so the first restart after this orders anew.
+A test covers the record and both refusals; roux builds and tests
+against it.
