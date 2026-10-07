@@ -151,9 +151,15 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   space first, so the kernel's record counter starts after it. ALPN:
   `http/1.1` until HTTP/2 (M9). ECDSA P-256 certificates. No 0-RTT, which
   allows replay; no TLS 1.2, whose surface is most of TLS's history of
-  attacks. Known costs: the kernel's `tls` module must be loaded (an
-  unprivileged server cannot make the kernel load it: the site host loads
-  it at boot); a kTLS socket refuses `MSG_WAITALL`, so HTTPS connections
+  attacks. Every response over TLS says `Strict-Transport-Security:
+  max-age=31536000` (no `includeSubDomains`: a server speaks for its own
+  host): the server's, like `Date`, so an application cannot drop or
+  weaken it; never over plain HTTP. Known costs: the kernel's `tls`
+  module must be loaded (an unprivileged server cannot make the kernel
+  load it: the site host loads it at boot), checked at startup
+  (`tcp_available_ulp`), so a server without it refuses to start rather
+  than fail every handshake; a client gone before its keys reach the
+  kernel is `PeerClosed` (ENOTCONN), routine. A kTLS socket refuses `MSG_WAITALL`, so HTTPS connections
   flush and then read rather than use the linked send-then-receive
   (experiment 18's +15%); a client's KeyUpdate closes the connection (the
   kernel will not decode it for us); no ML-KEM hybrid until tls.zig's

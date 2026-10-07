@@ -2,7 +2,8 @@
 //! into a caller's buffer.
 //!
 //! The server owns the framing: `Date`, `Content-Length` or
-//! `Transfer-Encoding`, and `Connection`. An application header with one
+//! `Transfer-Encoding`, and `Connection`; and, on HTTPS, the transport's
+//! policy: `Strict-Transport-Security`. An application header with one
 //! of those names, or with a name or value that could break the framing
 //! (CR, LF, NUL: header injection), is refused, never cleaned up: the
 //! caller answers 500 instead, and the application's bug is visible.
@@ -34,7 +35,18 @@ pub const Head = struct {
     /// False closes the connection after this response.
     keep_alive: bool,
     date: *const [http_date.length]u8,
+    /// The connection is HTTPS: the head says to keep to it
+    /// (`Strict-Transport-Security`). Never on plain HTTP, where a client
+    /// must ignore it (RFC 6797 §7.2, §8.1).
+    secure: bool,
 };
+
+/// HTTPS only, for a year, on every response over TLS. The server's own:
+/// one policy for the whole site, whatever the application answers. No
+/// `includeSubDomains`: a server speaks for its own host, not its
+/// siblings (fourneau.y2kbugger.com must not bind y2kbugger.com's
+/// others). Browsers ignore it for an IP address (RFC 6797 §8.1.1).
+const strict_transport_security_line = "Strict-Transport-Security: max-age=31536000\r\n";
 
 pub const Refusal = enum {
     status_invalid,
@@ -83,6 +95,7 @@ pub fn write(buffer: []u8, head: Head) Result {
         .none => {},
     }
     if (!head.keep_alive) writer.text("Connection: close\r\n");
+    if (head.secure) writer.text(strict_transport_security_line);
     for (head.headers) |header| {
         writer.text(header.name);
         writer.text(": ");
@@ -160,6 +173,7 @@ const reserved_names = [_][]const u8{
     "te",
     "trailer",
     "date",
+    "strict-transport-security",
 };
 
 fn header_refusal(header: Header) ?Refusal {
@@ -323,6 +337,7 @@ test "http1: response: a simple response" {
             .framing = .{ .length = 5 },
             .keep_alive = true,
             .date = test_date,
+            .secure = false,
         },
     );
 }
@@ -354,6 +369,7 @@ test "http1: response: refusals" {
         .framing = .{ .length = 0 },
         .keep_alive = true,
         .date = test_date,
+        .secure = false,
     };
     var head = ok;
     head.status = 99;
@@ -388,6 +404,22 @@ test "http1: response: refusals" {
     }
 }
 
+test "http1: response: HTTPS keeps to HTTPS, and only the server says so" {
+    var head = bare(200, .{ .length = 0 }, true);
+    head.secure = true;
+    try expect_written(
+        "HTTP/1.1 200 OK\r\nDate: " ++ test_date ++ "\r\nContent-Length: 0\r\n" ++
+            "Strict-Transport-Security: max-age=31536000\r\n\r\n",
+        head,
+    );
+    // Plain HTTP never carries it (RFC 6797 §7.2): see the simple response.
+    // An application's own would be a second policy, or a weaker one.
+    head.headers = &.{.{ .name = "strict-transport-security", .value = "max-age=0" }};
+    try expect_refused(.header_reserved, head);
+    head.secure = false;
+    try expect_refused(.header_reserved, head);
+}
+
 test "http1: response: a head that does not fit is refused" {
     var buffer: [40]u8 = undefined;
     const result = write(&buffer, .{
@@ -396,6 +428,7 @@ test "http1: response: a head that does not fit is refused" {
         .framing = .{ .length = 0 },
         .keep_alive = true,
         .date = test_date,
+        .secure = false,
     });
     try testing.expectEqual(Refusal.too_large, result.refusal);
 }
@@ -407,6 +440,7 @@ fn bare(status: u16, framing: Framing, keep_alive: bool) Head {
         .framing = framing,
         .keep_alive = keep_alive,
         .date = test_date,
+        .secure = false,
     };
 }
 

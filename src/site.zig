@@ -57,11 +57,10 @@ pub const Site = struct {
         io: std.Io,
         root: []const u8,
         mount: []const u8,
-        secure: bool,
     ) !Site {
         assert(mount.len == 0 or (mount[0] == '/' and mount[mount.len - 1] != '/'));
         var site: Site = .{};
-        try load_into(gpa, io, root, mount, &site, secure);
+        try load_into(gpa, io, root, mount, &site);
         return site;
     }
 
@@ -232,16 +231,16 @@ fn content_type(name: []const u8) []const u8 {
 }
 
 /// A file as served: its body and its headers, the ETag a hash of the body.
-fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8, secure: bool) !File {
+fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8) !File {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
     const compressed = if (compressible(name, body.len)) try gzip(gpa, body) else null;
     // A copy at least a tenth smaller is worth its CPU and memory.
     const worth = if (compressed) |bytes| bytes.len * 10 < body.len * 9 else false;
     const tag = try std.fmt.allocPrint(gpa, "{x}", .{digest[0..8]});
-    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth, secure) };
+    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth) };
     if (worth) {
-        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true, secure);
+        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true);
     } else if (compressed) |bytes| gpa.free(bytes);
     return file;
 }
@@ -255,7 +254,6 @@ fn make_variant(
     tag: []const u8,
     encoding: ?[]const u8,
     vary: bool,
-    secure: bool,
 ) !Variant {
     // Each copy its own ETag, as each has its own bytes.
     const etag = if (encoding) |coding|
@@ -273,12 +271,6 @@ fn make_variant(
         try headers.append(gpa, .{ .name = "Content-Encoding", .value = coding });
     }
     if (vary) try headers.append(gpa, .{ .name = "Vary", .value = "Accept-Encoding" });
-    // HTTPS from now on, for a year (browsers ignore it for an IP address:
-    // it takes effect when the site has a name).
-    if (secure) {
-        const policy = "max-age=31536000";
-        try headers.append(gpa, .{ .name = "Strict-Transport-Security", .value = policy });
-    }
     return .{ .body = body, .headers = try headers.toOwnedSlice(gpa), .etag = etag };
 }
 
@@ -371,7 +363,7 @@ test "site: a compressible file gets a smaller gzip copy that inflates back" {
         try page_buffer.appendSlice(arena, line);
     }
     const page = page_buffer.items;
-    const file = try make_file(arena, "page.html", page, false);
+    const file = try make_file(arena, "page.html", page);
     const compressed = file.gzip orelse return error.TestExpectedGzip;
     try std.testing.expect(compressed.body.len < page.len / 4);
     var input: std.Io.Reader = .fixed(compressed.body);
@@ -389,7 +381,6 @@ fn load_into(
     root: []const u8,
     mount: []const u8,
     site: *Site,
-    secure: bool,
 ) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
@@ -408,7 +399,7 @@ fn load_into(
         const body = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(file_bytes_max));
         site_bytes += body.len;
         if (site_bytes > site_bytes_max) return error.SiteTooLarge;
-        const file = try make_file(gpa, entry.basename, body, secure);
+        const file = try make_file(gpa, entry.basename, body);
         const route = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ mount, entry.path });
         try add_routes(gpa, site, route[1..], file);
     } else return error.TooManyEntries;
@@ -457,9 +448,9 @@ test "site: routes for pages, directories and the 404" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var site: Site = .{};
-    const page = try make_file(arena, "a.html", "page", false);
-    const index = try make_file(arena, "index.html", "index", false);
-    const missing = try make_file(arena, "404.html", "missing", false);
+    const page = try make_file(arena, "a.html", "page");
+    const index = try make_file(arena, "index.html", "index");
+    const missing = try make_file(arena, "404.html", "missing");
     try add_routes(arena, &site, "index.html", index);
     try add_routes(arena, &site, "about.html", page);
     try add_routes(arena, &site, "docs/index.html", index);

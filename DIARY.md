@@ -1160,3 +1160,35 @@ certificate counts only when both match; state from before the file
 reads as no certificate, so the first restart after this orders anew.
 A test covers the record and both refusals; roux builds and tests
 against it.
+
+## 2026-10-07: HSTS is the server's; kTLS's faults said rightly
+
+Two findings from the dragrace site's move to a name, fixed at their
+layer. HSTS: fourneau-static sent it from its file table, and roux's
+own responses never did, so the dragrace site's pages went without it.
+The response head writer now writes `Strict-Transport-Security:
+max-age=31536000` on every response over TLS (`Head.secure`, from the
+connection's kTLS), as it writes `Date`: one policy whatever the
+application, refused as an application header, never over plain HTTP
+(RFC 6797 §7.2). No includeSubDomains: the site is a name under the
+owner's domain, and must not bind the others. The static site's
+`secure` plumbing is gone.
+
+kTLS: `kTLS: NOTCONN (is the tls module loadable?)` appeared in the
+site's log on clients that hung up right after the handshake (a racer
+refusing the certificate, scanners), with the module loaded. Linux
+attaches TLS only to an established connection: ENOTCONN is the peer
+gone. Now `PeerClosed`, counted as a failed handshake and logged at
+debug like the others; any other errno warns with its step (TCP_ULP,
+TLS_TX, TLS_RX). Whether the kernel has TLS at all is checked once, at
+startup (`/proc/sys/net/ipv4/tcp_available_ulp` lists `tls`), before a
+certificate is ordered: a server without it refuses to start, where
+before every handshake failed and logged the same warning.
+
+Tests: the head with and without `secure`, an application's own HSTS
+refused; the ULP list parsed as words; and on the real kernel, a
+loopback pair whose client closed (read sees the FIN: CLOSE_WAIT)
+refuses TLS as `PeerClosed`, while an established one takes it (skipped
+on a kernel without kTLS). Each test caught its bug injected (NOTCONN
+mapped back to a fault; the policy's max-age changed). roux builds and
+tests against it.

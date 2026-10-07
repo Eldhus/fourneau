@@ -53,6 +53,9 @@ pub const Options = struct {
 /// Allocated once, for the life of the process.
 pub fn context(gpa: Allocator, io: Io, options: Options) !?*const tls.Context {
     if (!options.enabled()) return null;
+    // Before a certificate is ordered: a server that cannot hand its keys
+    // to the kernel would fail every handshake.
+    try tls.check_kernel(io);
     var cert = options.cert;
     var key = options.key;
     if (options.acme_directory) |directory| {

@@ -430,6 +430,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     .framing = .chunked,
                     .keep_alive = connection.keep_alive,
                     .date = connection.server.date(),
+                    .secure = connection.kernel_tls,
                 }) orelse return error.Disconnected;
                 switch (result) {
                     .bytes => {},
@@ -800,7 +801,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 log.debug("handshake: {t}", .{err});
                 switch (err) {
                     error.NotTls => server.refuse_plain_http(connection),
-                    error.HandshakeFailed, error.KernelTlsFailed, error.EarlyDataTooLarge => {},
+                    error.HandshakeFailed,
+                    error.PeerClosed,
+                    error.KernelTlsFailed,
+                    error.EarlyDataTooLarge,
+                    => {},
                 }
                 return false;
             };
@@ -949,6 +954,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 .framing = framing,
                 .keep_alive = connection.keep_alive,
                 .date = server.date(),
+                .secure = connection.kernel_tls,
             }) orelse return false;
             switch (result) {
                 .bytes => {
