@@ -35,9 +35,8 @@
      certificate, a change of CA orders anew) and M10's for
      fourneau-static (443 with Let's Encrypt for the host's IP address,
      the six-day profile; port 80 redirecting; renewal by a daily
-     restart): the dragrace site (then https://174.138.75.219/, https://104.248.175.105/
-     since 2026-10-07), verified by
-     curl with the system's trust. M7's checks done (2026-10-06): Zig's
+     restart): the dragrace site (then https://174.138.75.219/;
+     https://fourneau.y2kbugger.com/ since 2026-10-07), verified by curl with the system's trust. M7's checks done (2026-10-06): Zig's
      std.http.Client fetches the site; testssl.sh 3.2 finds TLS 1.3 only,
      the chain and name OK, no vulnerability (BREACH flagged for gzip:
      a static site has no secrets to leak); HSTS now sent. Templates in
