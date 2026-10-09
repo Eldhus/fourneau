@@ -1192,3 +1192,10 @@ refuses TLS as `PeerClosed`, while an established one takes it (skipped
 on a kernel without kTLS). Each test caught its bug injected (NOTCONN
 mapped back to a fault; the policy's max-age changed). roux builds and
 tests against it.
+
+## 2026-10-09: prng exported
+
+The `fourneau` module exports `prng`, for roux's host: its new test of
+the template compiler and VM together makes templates from a seed, and
+tidy refuses the standard library's random numbers. `zig build test`
+passes.
