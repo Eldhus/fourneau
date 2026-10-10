@@ -1479,3 +1479,38 @@ sizes are what the doubt predicted, gzip's (ReleaseSafe build):
 | random.bin | 100,000 | 100,049 | 100,005 | 100,005 |
 
 Next: the passes that make brotli brotli, each measured on this table.
+
+## 2026-10-10: brotli encoder, pass 2: optimal parsing
+
+Where do brotli's bytes come from? The reference at each quality on the
+same files (index.html): q4 7,841 (where pass 1 is), q5 7,102 (context
+modeling, block splitting), q9 7,050, q10 6,301 (optimal parsing), q11
+6,067. Two steps matter: q4 to q5, and q9 to q10.
+
+Optimal parsing, as brotli's q10 does it (Zopfli's method): positions
+are nodes, edges literals or copies priced in bits by the last parse's
+codes, the cheapest path is the next parse; three rounds. A copy's price
+depends on its path: the literals before it share its symbol, and its
+distance may be the cache's. Each node keeps the literals since the last
+command and a shortcut to the last command that moved the cache, which
+is rebuilt exactly by walking four such commands back (brotli's
+`ComputeDistanceCache`). The command coding moved into
+`brotli_command.zig`, so the parser prices exactly what the writer
+writes.
+
+Sizes (all decode with the reference): index.html 7,629 to 7,126
+(-6.6%), server.zig 13,578 to 13,060 (-3.8%), datastar 13,255 to
+12,966, style.css 5,304 to 5,187, DESIGN.md 7,344 to 7,245. Rounds: 1
+gives 7,159, 3 gives 7,126, 6 gives 7,125: three.
+
+Two slow paths found by timing (ReleaseFast): 70 KB of zeros took 15 s,
+then 2.4 s, and 2 MB of zeros 72 s. First the cache's distances were
+compared to the end of the run at every position (quadratic): now
+`long_length` (325) ahead. Then, inside a long match every position
+still priced ~650 lengths, each finding its codes by a scan: brotli's
+skip (no copies start inside a match longer than 325; literals still
+reach every node) and lookup tables for the insert and copy codes. 70 KB
+of zeros: 5 ms; 2 MB: 53 ms; index.html 39 ms. Sizes unchanged.
+
+Still 13% over the reference's q10 on index.html: its next edge is
+context modeling.
