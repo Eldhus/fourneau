@@ -66,14 +66,16 @@
       TODO. Left for later: block splitting, distance contexts (q11's
       last ~1-3%).
    5. ~~HTTP/2 (M9); a dragrace workload~~ (done 2026-10-10, DIARY;
-      the workload waits on the dragrace's branch `http2`, with roux's
-      branch `http2`, for the owner to merge after tonight's race).
-   6. Graceful restart (M10). Old and new processes overlap, so it
-      meets the locked-memory finding (DIARY 2026-10-09): io_uring
-      charges rings to `RLIMIT_MEMLOCK` (8 MiB here) and frees a dead
-      process's rings late; fourneau's programs panic where roux's host
-      waits. Move roux's wait into fourneau, and check the site host's
-      limit.
+      the workload waits on the dragrace's branch `after-race`, with
+      roux's branch `after-race`, for the owner to merge after tonight's
+      race).
+   6. ~~Graceful restart (M10)~~ (done 2026-10-10, DIARY): systemd's
+      socket activation, stop then start, none refused (`listen.zig`);
+      roux's wait for locked memory moved here; ACME's responder on the
+      held port 80. On the hosts: the dragrace's `after-race` branch has
+      the site's socket units; the owner runs `site install-server` once
+      it is merged. The old-and-new overlap the plan feared does not
+      happen (stop, then start), so the locked-memory limit holds.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
      release (checked). 1 to 4 done (2026-10-10). 5, HTTP/2: planned in
@@ -83,9 +85,9 @@
      machine (`3cf2f76`), the server over h2c (`137553a`), HTTPS by
      ALPN (`fef889c`), its load bugs fixed (a leak, a convoy, a drain
      that hung, an unaligned scratch: DIARY), and the dragrace workload
-     `plaintext-h2` (dragrace branch `http2`: every competitor speaks
-     h2c there; the whole race passes locally; roux's half on roux's
-     branch `http2`) done. Next, 6.
+     `plaintext-h2` (dragrace branch `after-race`: every competitor
+     speaks h2c there; the whole race passes locally; roux's half on
+     roux's branch `after-race`) done. 6 done. Next, 7.
      Left for later: the simulator speaking HTTP/2 (the load bugs were
      found by oha and a real-kernel test, not deterministically); each
      connection slot's machine is ~110 KB (its head and block buffers
