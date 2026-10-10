@@ -1,6 +1,9 @@
 //! The test root: every file whose tests run (tidy checks none is left out).
 
 test {
+    _ = @import("brotli_decode.zig");
+    _ = @import("brotli_tables.zig");
+    _ = @import("brotli_tool.zig");
     _ = @import("http1_chunked.zig");
     _ = @import("hello.zig");
     _ = @import("hybrid.zig");
