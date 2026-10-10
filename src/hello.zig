@@ -147,6 +147,7 @@ fn run_shard_or_fail(options: Options, stop: *const std.atomic.Value(bool)) !voi
     const config: server_module.Config = .{
         .connections_max = @max(1, options.connections / options.shards),
         .stop = stop,
+        .http2 = .{},
     };
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{
@@ -297,6 +298,158 @@ test "a stopped server drains: the request in flight is answered and closed" {
     try std.testing.expect(std.mem.endsWith(u8, answer, "\r\n\r\nhello\n"));
     try std.testing.expectEqual(1, server.stats.drain_idle);
     try std.testing.expectEqual(0, server.stats.drain_cut);
+}
+
+/// An HTTP/2 client by prior knowledge (h2c) on plain system calls, on its
+/// own thread: two requests on one connection, the frames read back.
+const Http2Client = struct {
+    port: u16,
+    stop: *std.atomic.Value(bool),
+    /// Each stream's status, and its body.
+    statuses: [2]u16 = @splat(0),
+    bodies: [2][256]u8 = undefined,
+    body_lengths: [2]usize = @splat(0),
+    goaway: bool = false,
+
+    const linux = std.os.linux;
+    const frame = @import("http2_frame.zig");
+    const hpack = @import("hpack.zig");
+
+    fn run(client: *Http2Client) void {
+        client.run_or_fail() catch |err| std.debug.panic("http2 client: {t}", .{err});
+    }
+
+    fn run_or_fail(client: *Http2Client) !void {
+        const fd = try DrainClient.connect(client.port);
+        defer _ = linux.close(fd);
+        var out: [1024]u8 = undefined;
+        var used: usize = 0;
+        @memcpy(out[0..24], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        used += 24;
+        used += put(out[used..], .settings, 0, 0, "");
+        var block: [256]u8 = undefined;
+        const whole = frame.flag_end_headers | frame.flag_end_stream;
+        var length = encode(&block, &.{ "GET", "/" }, &.{});
+        used += put(out[used..], .headers, whole, 1, block[0..length]);
+        const content_length: hpack.Header = .{ .name = "content-length", .value = "5" };
+        length = encode(&block, &.{ "POST", "/echo" }, &.{content_length});
+        used += put(out[used..], .headers, frame.flag_end_headers, 3, block[0..length]);
+        used += put(out[used..], .data, frame.flag_end_stream, 3, "abcde");
+        try DrainClient.send(fd, out[0..used]);
+        try client.read_responses(fd);
+        client.stop.store(true, .release);
+        // The drain: GOAWAY, then the end.
+        client.goaway = try client.read_until_goaway(fd);
+    }
+
+    fn put(out: []u8, kind: frame.Type, flags: u8, stream: u31, payload: []const u8) usize {
+        var header: [frame.header_bytes]u8 = undefined;
+        frame.write_header(&header, frame.frame_header(kind, flags, stream, payload.len));
+        @memcpy(out[0..frame.header_bytes], &header);
+        @memcpy(out[frame.header_bytes..][0..payload.len], payload);
+        return frame.header_bytes + payload.len;
+    }
+
+    fn encode(out: []u8, request: *const [2][]const u8, extra: []const hpack.Header) usize {
+        var used = hpack.encode_field(out, ":method", request[0]);
+        used += hpack.encode_field(out[used..], ":scheme", "http");
+        used += hpack.encode_field(out[used..], ":path", request[1]);
+        used += hpack.encode_field(out[used..], ":authority", "localhost");
+        for (extra) |field| used += hpack.encode_field(out[used..], field.name, field.value);
+        return used;
+    }
+
+    /// Frames until both streams have ended.
+    fn read_responses(client: *Http2Client, fd: linux.fd_t) !void {
+        var decoder: hpack.Decoder = try .init(std.testing.allocator, 4096);
+        defer decoder.deinit(std.testing.allocator);
+        var ended: u32 = 0;
+        for (0..64) |_| {
+            var payload: [16_384]u8 = undefined;
+            const header = try read_frame(fd, &payload);
+            const bytes = payload[0..header.length];
+            const index: usize = if (header.stream == 1) 0 else 1;
+            switch (header.type) {
+                .headers => {
+                    var storage: [512]u8 = undefined;
+                    var fields: [16]hpack.Header = undefined;
+                    _ = try decoder.decode(bytes, &storage, &fields);
+                    client.statuses[index] = try std.fmt.parseInt(u16, fields[0].value, 10);
+                },
+                .data => {
+                    const at = client.body_lengths[index];
+                    @memcpy(client.bodies[index][at..][0..bytes.len], bytes);
+                    client.body_lengths[index] += bytes.len;
+                },
+                else => continue,
+            }
+            if (header.flags & frame.flag_end_stream != 0) ended += 1;
+            if (ended == 2) return;
+        } else return error.TooManyFrames;
+    }
+
+    fn read_until_goaway(client: *Http2Client, fd: linux.fd_t) !bool {
+        _ = client;
+        for (0..16) |_| {
+            var payload: [16_384]u8 = undefined;
+            const header = read_frame(fd, &payload) catch return false;
+            if (header.type == .goaway) return true;
+        } else return false;
+    }
+
+    fn read_frame(fd: linux.fd_t, payload: *[16_384]u8) !frame.Header {
+        var header_bytes: [frame.header_bytes]u8 = undefined;
+        try read_exactly(fd, &header_bytes);
+        const header = frame.parse_header(&header_bytes);
+        if (header.length > payload.len) return error.FrameTooLarge;
+        try read_exactly(fd, payload[0..header.length]);
+        return header;
+    }
+
+    fn read_exactly(fd: linux.fd_t, buffer: []u8) !void {
+        var used: usize = 0;
+        for (0..buffer.len + 1) |_| {
+            if (used == buffer.len) return;
+            const result = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+            if (linux.errno(result) != .SUCCESS) return error.Receive;
+            if (result == 0) return error.Closed;
+            used += result;
+        } else unreachable;
+    }
+};
+
+test "HTTP/2 by prior knowledge: two streams on one connection, then a drain" {
+    const gpa = std.testing.allocator;
+    var stop: std.atomic.Value(bool) = .init(false);
+    const config: server_module.Config = .{
+        .connections_max = 4,
+        .tick_ms = 10,
+        .drain_timeout_ms = 5_000,
+        .stop = &stop,
+        .http2 = .{ .streams_max = 8 },
+    };
+    var runtime: Evented = undefined;
+    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = config.fibers_max() });
+    defer runtime.deinit();
+    const io = runtime.io();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try address.listen(io, .{ .reuse_address = false });
+    var app: App = .{};
+    var server = try Server.init(gpa, io, &app, listener, config);
+    defer server.deinit(gpa);
+
+    var client: Http2Client = .{ .port = listener.socket.address.getPort(), .stop = &stop };
+    const thread = try std.Thread.spawn(.{}, Http2Client.run, .{&client});
+    try server.run();
+    thread.join();
+    try std.testing.expectEqual(200, client.statuses[0]);
+    try std.testing.expectEqualStrings("hello\n", client.bodies[0][0..client.body_lengths[0]]);
+    try std.testing.expectEqual(200, client.statuses[1]);
+    const echo = "POST /echo host=localhost headers=1 body=5\n";
+    try std.testing.expectEqualStrings(echo, client.bodies[1][0..client.body_lengths[1]]);
+    try std.testing.expect(client.goaway);
+    try std.testing.expectEqual(1, server.stats.http2_connections);
+    try std.testing.expectEqual(2, server.stats.http2_streams);
 }
 
 test "the port's fibers: a pool mapped at init, refused beyond it, reused" {
