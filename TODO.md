@@ -207,6 +207,11 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 
 ## Todo
 
+- [ ] The TLS handshake: ~2,000 full handshakes a second against axum's
+  5,800 and Go's 3,300 in a local quick race (DIARY 2026-10-10); measure
+  on the dragrace's churn-tls, then profile tls.zig's ECDSA P-256 signing
+  and X25519 against aws-lc's. Also: no X25519MLKEM768, which browsers
+  offer first. (2026-10-10)
 - [ ] A ~2 s worst-case request in the safe-build pipelined run (p99.9
   13.8 ms; DIARY 2026-10-05): find where it waited (the accept backlog at
   start-up is the first suspect). (2026-10-05)

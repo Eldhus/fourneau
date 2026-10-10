@@ -48,6 +48,13 @@ pub const Protocols = enum {
     }
 };
 
+/// The TLS 1.3 ciphers offered. tls.zig takes the client's first that the
+/// server has, and rustls clients (oha) put AES-256-GCM first where
+/// browsers and Go's server choose AES-128-GCM, so AES-256 is left out:
+/// every TLS 1.3 client must have AES-128-GCM (RFC 8446, 9.1). ChaCha20
+/// stays for a client that asks for it first (one without AES hardware).
+const cipher_suites = [_]tls.config.CipherSuite{ .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 };
+
 pub const Established = struct {
     /// The first bytes of the HTTP stream, already decrypted into `early`.
     early_bytes: u32,
@@ -187,6 +194,7 @@ pub fn handshake(
     var session = tls.server(&transport.reader, &transport.writer, .{
         .rng = random_source.interface(),
         .auth = context.auth,
+        .cipher_suites = &cipher_suites,
         .alpn_protocols = options.protocols.names(),
         .now = Io.Clock.real.now(io),
     }) catch return error.HandshakeFailed;

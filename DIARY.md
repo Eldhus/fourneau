@@ -1882,3 +1882,21 @@ framings, bare LF, chunked in HTTP/1.0, folding), our limits (413, 414,
 
 The simulator's "bad version" was `HTTP/1.2`, expecting 505: now
 `HTTP/3.0`. 1,000 seeds pass.
+
+## 2026-10-10: TLS ciphers: AES-128-GCM, as Go and browsers choose
+
+The dragrace now races HTTPS (its RACING.md, TLS). tls.zig takes the
+client's first cipher the server has, and rustls clients (oha) put
+AES-256-GCM first, where Go's server and browsers choose AES-128-GCM:
+fourneau answered oha with AES-256 and Go with AES-128, which the race
+would have measured as fourneau's cost. `tls.zig` now offers AES-128-GCM
+and ChaCha20 only (every TLS 1.3 client must have AES-128-GCM, RFC 8446
+§9.1; ChaCha20 for one without AES hardware). Checked with curl offering
+oha's order: AES-128-GCM, X25519, h2. `zig build test` passes.
+
+Seen in the dragrace's local quick race (a busy laptop, not a
+measurement): a full handshake is fourneau's weak spot, about 2,000 new
+TLS connections a second against axum's 5,800 and Go's 3,300 (churn-tls),
+while kTLS keeps the requests after it close to plain (plaintext over
+HTTPS 254k against h2c's 351k, axum 105k against 121k). The handshake's
+ECDSA signing and X25519 in tls.zig are the place to look; TODO.
