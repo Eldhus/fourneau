@@ -111,7 +111,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const site = try site_module.Site.load(gpa, io, options.root.?, "", .{});
     if (site.routes.count() == 0) return error.EmptySite;
-    // The certificate, loaded once and shared read-only by every shard.
+    // The certificate, loaded once and shared read-only by every shard;
+    // ACME answers on systemd's port-80 socket when it holds one.
+    const activation: listen.Activation = .from_environ(init.environ);
+    options.https.acme_http_listener = listen.inherited(activation, "http");
     const tls_context = try https.context(gpa, io, options.https);
     var stop: Stop = .{};
     try stop.watch(); // before any shard's thread
@@ -119,7 +122,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .site = &site,
         .tls = tls_context,
         .stop = &stop.requested,
-        .activation = .from_environ(init.environ),
+        .activation = activation,
     };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
