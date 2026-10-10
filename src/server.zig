@@ -124,7 +124,14 @@ pub const Config = struct {
     /// new connection or stream never needs a fiber before the last one is
     /// free. An `Io`'s fiber pool is the sum of what runs on it.
     pub fn fibers_max(config: Config) u32 {
-        return config.connections_max + config.http2_streams() + 1;
+        return config.handlers_max() + 1;
+    }
+
+    /// The most handlers a server runs at once: one per connection (an
+    /// HTTP/1.1 connection's request) and one per HTTP/2 stream slot. For
+    /// an application's own per-request tables (roux's).
+    pub fn handlers_max(config: Config) u32 {
+        return config.connections_max + config.http2_streams();
     }
 
     /// The shard's stream slots: none without HTTP/2.
