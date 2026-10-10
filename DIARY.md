@@ -1798,3 +1798,25 @@ so the rates are noisy; the counts are not):
 |---|---|---|---|
 | woken always | 175, 175 | 126, 125 | 324k, 311k |
 | woken when one waits | 52, 51 | 2, 3 | 380k, 377k |
+
+## 2026-10-10: a stream's scratch, aligned
+
+The dragrace's local race (branch `http2` there, a workload over h2c)
+crashed roux at once: `incorrect alignment` where its host lays its
+response headers into `request.scratch`. A stream slot's bytes were
+text, scratch, then the body window of 65,535 bytes: an odd stride, so
+every other slot's scratch began on an odd address. HTTP/1.1's never
+had (its slab, a multiple of 64 KiB). Now each slot is whole pages, its
+scratch first; both slabs are page-aligned by type; `scratch_align`
+(16) says what an application may count on, asserted for every slot.
+
+The race, one quick round on the laptop (server on 2 CPUs; not a result):
+plaintext over h2c at 32 connections of 8 streams, requests/s:
+
+| | HTTP/1.1, 256 connections | h2c, 32 x 8 |
+|---|---|---|
+| fourneau-zig | 271k, 260k | 303k, 355k |
+| roux | 235k | 254k |
+| axum | 100k | 84k |
+| basic-webserver | 35k | 44k |
+| go | 49k | 27k |

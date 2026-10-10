@@ -104,6 +104,8 @@ pub const Config = struct {
         assert(config.tick_ms <= config.head_timeout_ms);
         assert(config.tick_ms <= config.drain_timeout_ms);
         config.head_limits().assert_valid();
+        // Every connection's scratch starts aligned (`scratch_align`).
+        assert(config.scratch_bytes_max % scratch_align == 0);
         if (config.tls != null) {
             // The handshake borrows the scratch (both of tls.zig's buffers)
             // and receives the client's early bytes into `recv`.
@@ -173,6 +175,12 @@ pub const Config = struct {
 };
 
 const recv_window_bytes = 4096;
+
+/// A request's scratch starts at a multiple of this, over either protocol:
+/// an application may lay a table of its own there (roux's host does).
+pub const scratch_align = 16;
+/// The slabs a scratch is cut from start on a page.
+const slab_align = std.heap.page_size_min;
 
 pub const BodyError = error{ BadRequest, ContentTooLarge, Disconnected };
 
@@ -363,7 +371,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// The slabs every connection takes its strides of.
         recv_slab: []u8 = &.{},
         heads_slab: []u8 = &.{},
-        scratch_slab: []u8 = &.{},
+        scratch_slab: []align(slab_align) u8 = &.{},
         headers_slab: []Header = &.{},
         stats: Stats = .{},
         /// The Date header, refreshed by the timekeeper each tick, not read
@@ -382,7 +390,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         stream_free: []u32 = &.{},
         stream_free_count: u32 = 0,
         stream_deadlines: []u32 = &.{},
-        stream_slab: []u8 = &.{},
+        stream_slab: []align(slab_align) u8 = &.{},
         stream_headers_slab: []Header = &.{},
 
         /// An HTTP/2 connection's state, beside its slot's `Connection`
@@ -946,7 +954,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.ticks_max = server.ticks_for(timeout_ms_max);
             const recv = try gpa.alloc(u8, count * config.recv_bytes());
             const heads = try gpa.alloc(u8, count * config.send_bytes_max);
-            const scratch = try gpa.alloc(u8, count * config.scratch_bytes_max);
+            const scratch = try gpa.alignedAlloc(
+                u8,
+                .fromByteUnits(slab_align),
+                count * config.scratch_bytes_max,
+            );
             const headers = try gpa.alloc(Header, count * config.headers_max);
             for (server.connections, 0..) |*connection, index_usize| {
                 const index: u32 = @intCast(index_usize);
@@ -955,6 +967,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 connection.recv = stride(u8, recv, config.recv_bytes(), index);
                 connection.send = stride(u8, heads, config.send_bytes_max, index);
                 connection.scratch = stride(u8, scratch, config.scratch_bytes_max, index);
+                assert(std.mem.isAligned(@intFromPtr(connection.scratch.ptr), scratch_align));
                 const table = stride(Header, headers, config.headers_max, index);
                 connection.parser = http1_head.Parser.init(config.head_limits(), table);
                 server.deadlines[index] = 0;
@@ -983,24 +996,31 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 };
             }
             const count = config.http2_streams();
-            const bytes = stream_text_bytes(config) + config.scratch_bytes_max +
+            // Each slot's bytes a whole number of pages, the scratch first:
+            // an application lays tables into its scratch, as into an
+            // HTTP/1.1 connection's (roux's host panicked on an odd
+            // address: the body window is 65,535 bytes).
+            const used = config.scratch_bytes_max + stream_text_bytes(config) +
                 http2.stream_window_bytes;
+            const bytes: u32 = @intCast(std.mem.alignForward(usize, used, slab_align));
             server.streams = try gpa.alloc(StreamSlot, count);
             server.stream_free = try gpa.alloc(u32, count);
             server.stream_deadlines = try gpa.alloc(u32, count);
-            server.stream_slab = try gpa.alloc(u8, @as(usize, count) * bytes);
+            const slab_bytes = @as(usize, count) * bytes;
+            server.stream_slab = try gpa.alignedAlloc(u8, .fromByteUnits(slab_align), slab_bytes);
             server.stream_headers_slab = try gpa.alloc(Header, count * config.headers_max);
             for (server.streams, 0..) |*stream, index_usize| {
                 const index: u32 = @intCast(index_usize);
                 const own = stride(u8, server.stream_slab, bytes, index);
-                const text_end = stream_text_bytes(config);
-                const scratch_end = text_end + config.scratch_bytes_max;
+                const scratch_end = config.scratch_bytes_max;
+                const text_end = scratch_end + stream_text_bytes(config);
                 stream.* = undefined;
                 stream.slot = index;
                 stream.in_use = false;
-                stream.text = own[0..text_end];
-                stream.scratch = own[text_end..scratch_end];
-                stream.body = own[scratch_end..];
+                stream.scratch = own[0..scratch_end];
+                stream.text = own[scratch_end..text_end];
+                stream.body = own[text_end..][0..http2.stream_window_bytes];
+                assert(std.mem.isAligned(@intFromPtr(stream.scratch.ptr), scratch_align));
                 const headers_slab = server.stream_headers_slab;
                 stream.headers = stride(Header, headers_slab, config.headers_max, index);
                 stream.signal = .{};
