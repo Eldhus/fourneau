@@ -100,14 +100,23 @@ Layers, each tested alone before the server sees it, as HTTP/1.1's are:
   (`tls.Protocols`, the server's choice, not the certificate's).
 - **Fibers**: the connection's reads frames; each stream's handler runs
   on a fiber of its own (`Config.fibers_max` counts the stream slots).
-- **Stream slots** per shard (`Config.http2.streams_max`), each: a copy
+- **Stream slots** per shard (`Config.http2.streams_max`, as many as
+  connections unless said), each: a copy
   of the head in HTTP/1.1's shape (`Version.http_2`; at most
   `headers_max` fields, else 431), the scratch, a body buffer of the
   stream's window, a wait word, a deadline. None free: REFUSED_STREAM.
 - **One `Request`** for both protocols, its calls choosing by a switch.
 - **Sending**: any fiber appends frames; the first to find them waiting
-  sends, the others wait for it on their own word (`Signal`, a futex):
-  one write at a time on a socket.
+  sends, until none waits: one write at a time on a socket. The others
+  leave theirs to it, or, when they need room or a handler asked for a
+  flush, wait for it on the connection's word (`Signal`, a futex). A
+  finished stream never waits: it gives its slot back at once. (Both
+  ways were found under load: a finished stream waiting on its own word
+  was never woken once its index was another's, and finished streams
+  waiting their turn held the shard's slots, 1,018 of 1,024.)
+- **A connection's slot outlives its streams**: it counts its stream
+  fibers and is given back only when the last has ended, since each
+  refers to it to its end.
 - **Deadlines**: a stream waiting on its client (a body, a window) has
   its own, scanned by the timekeeper as the connections' are; the
   connection's deadline is a sender's while one sends, else the idle

@@ -190,6 +190,22 @@ fn print_counts(runtime: *Evented, server: *Server) void {
             (counts.completions - counts_last.completions) * 100 / delta,
             (counts.linked - counts_last.linked) * 100 / delta,
         });
+        const stats = server.stats;
+        std.debug.print("  http2: connections={d} streams={d} refused={d} slots_free={d}/{d} " ++
+            "resets={d}/{d} failed={d} ({?t}) timeouts={d} fiberless={d} open={d}\n", .{
+            stats.http2_connections,
+            stats.http2_streams,
+            stats.http2_refused,
+            server.stream_free_count,
+            server.streams.len,
+            stats.http2_resets_received,
+            stats.http2_resets_sent,
+            stats.http2_failed,
+            stats.http2_failed_last,
+            stats.timeouts,
+            stats.fiberless,
+            stats.accepted - stats.closed,
+        });
         counts_last = counts;
         requests_last = requests;
     } else unreachable;
@@ -417,6 +433,104 @@ const Http2Client = struct {
         } else unreachable;
     }
 };
+
+/// One connection keeping `parallel` requests in flight, a new one sent as
+/// each answer ends, as a load generator does: the pattern that once held
+/// finished streams' slots behind the fiber sending (DIARY 2026-10-10).
+const Http2Load = struct {
+    port: u16,
+    parallel: u32,
+    requests: u32,
+    answered: u32 = 0,
+    failed: bool = false,
+
+    const linux = std.os.linux;
+    const frame = Http2Client.frame;
+
+    fn run(load: *Http2Load) void {
+        load.run_or_fail() catch {
+            load.failed = true;
+        };
+    }
+
+    fn run_or_fail(load: *Http2Load) !void {
+        const fd = try DrainClient.connect(load.port);
+        defer _ = linux.close(fd);
+        var out: [64]u8 = undefined;
+        @memcpy(out[0..24], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        const settings = Http2Client.put(out[24..], .settings, 0, 0, "");
+        try DrainClient.send(fd, out[0 .. 24 + settings]);
+        var next: u31 = 1;
+        for (0..load.parallel) |_| next = try request(fd, next);
+        for (0..load.requests * 4) |_| {
+            if (load.answered == load.requests) return;
+            var payload: [16_384]u8 = undefined;
+            const header = try Http2Client.read_frame(fd, &payload);
+            if (header.type == .rst_stream or header.type == .goaway) return error.Refused;
+            const ended = header.flags & frame.flag_end_stream != 0;
+            if (header.type != .data or !ended) continue;
+            load.answered += 1;
+            const sent = (next - 1) / 2;
+            if (sent < load.requests) next = try request(fd, next);
+        } else return error.TooManyFrames;
+    }
+
+    fn request(fd: linux.fd_t, stream: u31) !u31 {
+        var block: [128]u8 = undefined;
+        const length = Http2Client.encode(&block, &.{ "GET", "/" }, &.{});
+        var out: [160]u8 = undefined;
+        const flags = frame.flag_end_headers | frame.flag_end_stream;
+        const used = Http2Client.put(&out, .headers, flags, stream, block[0..length]);
+        try DrainClient.send(fd, out[0..used]);
+        return stream + 2;
+    }
+};
+
+test "HTTP/2 under load: streams kept in flight, every slot given back" {
+    const gpa = std.testing.allocator;
+    var stop: std.atomic.Value(bool) = .init(false);
+    const clients = 4;
+    const parallel = 16;
+    const config: server_module.Config = .{
+        .connections_max = clients,
+        .tick_ms = 10,
+        .stop = &stop,
+        // Twice what the clients use: a refusal is a slot held too long.
+        .http2 = .{ .streams_max = 2 * clients * parallel },
+    };
+    var runtime: Evented = undefined;
+    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = config.fibers_max() });
+    defer runtime.deinit();
+    const io = runtime.io();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try address.listen(io, .{ .reuse_address = false });
+    var app: App = .{};
+    var server = try Server.init(gpa, io, &app, listener, config);
+    defer server.deinit(gpa);
+
+    const port = listener.socket.address.getPort();
+    const each: Http2Load = .{ .port = port, .parallel = parallel, .requests = 400 };
+    var loads: [clients]Http2Load = @splat(each);
+    var threads: [clients]std.Thread = undefined;
+    for (&threads, &loads) |*thread, *load| {
+        thread.* = try std.Thread.spawn(.{}, Http2Load.run, .{load});
+    }
+    const stopper = try std.Thread.spawn(.{}, stop_after, .{ &threads, &stop });
+    try server.run(); // asserts every stream slot came back
+    stopper.join();
+    for (loads) |load| {
+        try std.testing.expect(!load.failed);
+        try std.testing.expectEqual(400, load.answered);
+    }
+    try std.testing.expectEqual(0, server.stats.http2_refused);
+    try std.testing.expectEqual(clients * 400, server.stats.http2_streams);
+}
+
+/// Once the clients are done, stop the server (it drains and returns).
+fn stop_after(threads: []std.Thread, stop: *std.atomic.Value(bool)) void {
+    for (threads) |thread| thread.join();
+    stop.store(true, .release);
+}
 
 test "HTTP/2 by prior knowledge: two streams on one connection, then a drain" {
     const gpa = std.testing.allocator;

@@ -1734,3 +1734,51 @@ gets the page; `--http1.1` still gets HTTP/1.1; a 270 KB file comes back
 brotli-compressed (204,039 bytes) and identical once decoded. h2spec
 strict over TLS: 147 of 147, in 0.1 s (no fallback to HTTP/1.1 on an
 ALPN-chosen connection, so the invalid preface case passes too).
+
+## 2026-10-10: HTTP/2 under load: a leak, a convoy, a drain that hung
+
+oha 1.16 (the dragrace's) on `fourneau-hello`, h2c, the server on CPUs
+0-1, oha on 2-7, the desktop busy (VS Code, Brave: correctness here,
+not speed). At one stream per connection, 32 connections: 100%, 164k
+requests/s. At eight: 6% succeeded.
+
+Measured before guessing: `--counts` now prints the HTTP/2 state each
+2 s (connections, streams, refused, slots free, resets, failures, from
+each machine as its connection closes). After the load, every
+connection closed and 255 of 256 stream slots still taken. A dump of
+them (temporary): released by the machine, unmapped, not ended, their
+fibers alive. Each had answered, released its stream, then waited to
+send behind another fiber, on its own stream's word; the machine gave
+its index to a new stream meanwhile, so the sender, waking the
+streams it knew, never woke it. Leaked for good, with its fiber. And
+the drain then never ended: with every connection closed, the
+timekeeper thought it done, never cut, and `run` waited on the stuck
+fibers forever (`kill` left four servers sharing the port).
+
+Fixed in three parts: waits for a send are on the connection's word;
+a stream is unmapped as it is released; a connection counts its stream
+fibers and gives its slot back only after the last (it referred to a
+connection a new client could have by then). `run` asserts every stream
+slot is back.
+
+Then 7% refused, all from the shard's pool: 1,018 of 1,024 slots held by
+finished streams waiting their turn to send, a convoy (each send's end
+woke them all, one went on). A finished stream need not wait: its
+frames are in the buffer, and the sender sends until none waits. So
+two kinds of flush: wait (room, a handler's `stream_flush`) or leave it
+to the sender. Then 100% at 1, 8 and 32 streams per connection:
+152k, 232k and 320k requests/s (HTTP/1.1, same run: 269k at 64
+connections), 96 connections kept, none refused. The pool is now as
+many slots as connections unless said: a stream costs what an HTTP/1.1
+connection does, and at exactly as many streams as slots a client's
+next stream can arrive a moment before the last one's slot is back.
+
+A test now does what oha did (`hello.zig`: four connections keeping 16
+streams in flight, 400 requests each, twice the slots needed): it fails
+every time with the convoy put back, and passes. h2spec: against a
+handler that answers before reading the body, two cases race with TCP's
+segments (TESTING.md); against `/echo` it is 146 of 147 every run.
+
+Resident memory after the load: 278 MB, all of one mapping, since oha's
+reconnects (45,901) had cycled through all 1,024 connection slots, and
+each slot's HTTP/2 machine is ~110 KB (TODO: smaller).

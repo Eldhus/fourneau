@@ -83,9 +83,14 @@ pub const Config = struct {
 
     pub const Http2 = struct {
         /// Streams a shard serves at once, over all its connections: each a
-        /// slot (its head, scratch and body window) and a fiber. A stream
-        /// past it is refused (REFUSED_STREAM, which a client retries).
-        streams_max: u32 = 256,
+        /// slot (its head, scratch and body window) and a fiber, as an
+        /// HTTP/1.1 connection has. A stream past it is refused
+        /// (REFUSED_STREAM, which a client retries). Null: as many as
+        /// connections. A slot is held until its fiber ends, a moment
+        /// after its client saw the stream end: at exactly as many streams
+        /// as slots, a client's next stream may come first and be refused
+        /// (measured: 27% of them, at 32 connections of 8 streams on 256).
+        streams_max: ?u32 = null,
         /// SETTINGS_MAX_CONCURRENT_STREAMS, per connection.
         streams_per_connection: u16 = 100,
     };
@@ -105,7 +110,7 @@ pub const Config = struct {
             assert(config.scratch_bytes_max >= tls.input_bytes_min + tls.output_bytes_min);
         }
         if (config.http2) |options| {
-            assert(options.streams_max > 0);
+            assert(config.http2_streams() > 0);
             assert(options.streams_per_connection > 0);
             config.http2_limits().assert_valid();
             // A whole frame fits in `recv` after what is left of the last.
@@ -119,8 +124,13 @@ pub const Config = struct {
     /// new connection or stream never needs a fiber before the last one is
     /// free. An `Io`'s fiber pool is the sum of what runs on it.
     pub fn fibers_max(config: Config) u32 {
-        const streams = if (config.http2) |options| options.streams_max else 0;
-        return config.connections_max + streams + 1;
+        return config.connections_max + config.http2_streams() + 1;
+    }
+
+    /// The shard's stream slots: none without HTTP/2.
+    fn http2_streams(config: Config) u32 {
+        const options = config.http2 orelse return 0;
+        return options.streams_max orelse config.connections_max;
     }
 
     fn http2_limits(config: Config) http2.Limits {
@@ -274,6 +284,14 @@ pub const Stats = struct {
     http2_connections: u64 = 0,
     http2_streams: u64 = 0,
     http2_refused: u64 = 0,
+    /// From each connection's machine as it closes: requests malformed,
+    /// resets each way, and connections it ended for an error of the
+    /// client's (with the last such error).
+    http2_malformed: u64 = 0,
+    http2_resets_received: u64 = 0,
+    http2_resets_sent: u64 = 0,
+    http2_failed: u64 = 0,
+    http2_failed_last: ?http2.ErrorCode = null,
 };
 
 /// The address of this, per thread, names the thread a shard runs on.
@@ -362,7 +380,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             broken: bool = false,
             /// The stream slot of each of the machine's streams.
             slots: []u32,
-            /// What the reader waits on: a flush ending, a stream ending.
+            /// Stream fibers not yet ended: the connection's slot is given
+            /// back only once none is, since each refers to it to its end.
+            fibers: u32 = 0,
+            /// What every fiber of the connection waits on for the
+            /// connection's sake: a send ending, a stream fiber ending.
             signal: Signal = .{},
         };
 
@@ -447,7 +469,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
             fn stream_flush(stream: *StreamSlot) StreamError!void {
                 assert(stream.stream_state == .streaming);
-                if (!stream.server.h2_flush(stream.connection, &stream.signal)) {
+                if (!stream.server.h2_flush(stream.connection, .until_sent)) {
                     return error.Disconnected;
                 }
             }
@@ -941,7 +963,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     .slots = stride(u32, server.h2_slots_slab, per_connection, @intCast(index)),
                 };
             }
-            const count = options.streams_max;
+            const count = config.http2_streams();
             const bytes = stream_text_bytes(config) + config.scratch_bytes_max +
                 http2.stream_window_bytes;
             server.streams = try gpa.alloc(StreamSlot, count);
@@ -1016,6 +1038,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.timekeeper(&acceptor);
             assert(server.draining);
             assert(server.free_count == server.config.connections_max);
+            // An HTTP/2 connection is given back after its stream fibers.
+            assert(server.stream_free_count == server.streams.len);
             // Every connection is closed: its fiber ends with that.
             try server.group.await(server.io);
         }
@@ -1222,6 +1246,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             h2.flushing = false;
             h2.reading = false;
             h2.broken = false;
+            assert(h2.fibers == 0);
             @memset(h2.slots, slot_none);
             connection.http2 = true;
             server.stats.http2_connections += 1;
@@ -1240,7 +1265,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                         at = 0;
                         if (!server.h2_read(connection, h2)) return;
                     },
-                    .flush => if (!server.h2_flush(connection, &h2.signal)) return,
+                    .flush => if (!server.h2_flush(connection, .until_sent)) return,
                     .request => |request| server.h2_open(connection, h2, request),
                     .data => |data| server.h2_data(h2, data),
                     .reset => |index| server.h2_end(h2, index),
@@ -1255,7 +1280,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// streams are held (each waits with its own) or while a fiber
         /// sends (the socket's deadline is then the sender's).
         fn h2_read(server: *Server, connection: *Connection, h2: *Http2Connection) bool {
-            if (!server.h2_flush(connection, &h2.signal)) return false;
+            if (!server.h2_flush(connection, .leave_to_sender)) return false;
             const idle = h2.machine.streams_held() == 0;
             if (idle and server.draining) return false;
             if (h2.broken) return false;
@@ -1275,17 +1300,32 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             return true;
         }
 
-        /// Send the machine's frames: one fiber at a time, the others
-        /// appending theirs meanwhile and waiting (on `waiter`, their own
-        /// signal) for it to end. False: the connection is gone.
-        fn h2_flush(server: *Server, connection: *Connection, waiter: *Signal) bool {
+        const Flush = enum {
+            /// Send, or leave it to the fiber sending: it sends until
+            /// nothing waits, ours too.
+            leave_to_sender,
+            /// Return once what waits is sent: for room in the buffer, or a
+            /// handler's `stream_flush`.
+            until_sent,
+        };
+
+        /// Send the machine's frames: one fiber at a time. The others
+        /// append theirs meanwhile and leave them to it, or wait for it on
+        /// the connection's signal (not their stream's: a stream given back
+        /// still sends its last frames, and its index may be another's by
+        /// then). A finished stream must not wait: under load, every
+        /// finished stream queued behind the sender and held its slot, and
+        /// the shard ran out (1,018 of 1,024 slots so held, 2026-10-10).
+        /// False: the connection is gone.
+        fn h2_flush(server: *Server, connection: *Connection, flush: Flush) bool {
             const h2 = &server.h2[connection.index];
             // Bounded only to say so: each pass sends, or waits for the
             // sender, whose writes have a deadline.
             for (0..std.math.maxInt(u64)) |_| {
                 if (h2.broken) return false;
                 if (h2.flushing) {
-                    waiter.wait(server.io, waiter.word) catch return false;
+                    if (flush == .leave_to_sender) return true;
+                    h2.signal.wait(server.io, h2.signal.word) catch return false;
                     continue;
                 }
                 if (!h2.machine.wants_flush()) return true;
@@ -1296,7 +1336,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 h2.flushing = false;
                 h2.machine.sent(@intCast(bytes.len));
                 if (!sent) server.h2_break(h2);
-                server.h2_notify_all(h2);
+                h2.signal.notify(server.io);
             } else unreachable;
         }
 
@@ -1319,19 +1359,30 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         }
 
         /// The last frames (a GOAWAY), then the socket shut, so a fiber
-        /// still sending fails; then wait for every handler to return:
+        /// still sending fails; then wait for every stream fiber to end:
         /// only then is the slot free for another connection.
         fn h2_close(server: *Server, connection: *Connection, h2: *Http2Connection) void {
-            _ = server.h2_flush(connection, &h2.signal);
+            _ = server.h2_flush(connection, .until_sent);
             server.h2_break(h2);
             connection.stream.shutdown(server.io, .both) catch {};
             server.h2_notify_all(h2);
-            // Bounded only to say so: each pass sees a handler return.
+            // Bounded only to say so: each pass sees a stream fiber end.
             for (0..std.math.maxInt(u64)) |_| {
-                if (h2.machine.streams_held() == 0) break;
+                if (h2.fibers == 0) break;
                 server.io.futexWaitUncancelable(u32, &h2.signal.word, h2.signal.word);
             } else unreachable;
+            assert(h2.machine.streams_held() == 0);
             connection.http2 = false;
+            const counters = h2.machine.counters;
+            const stats = &server.stats;
+            stats.http2_refused += counters.refused;
+            stats.http2_malformed += counters.malformed;
+            stats.http2_resets_received += counters.resets_received;
+            stats.http2_resets_sent += counters.resets_sent;
+            if (counters.failed) |code| {
+                stats.http2_failed += 1;
+                stats.http2_failed_last = code;
+            }
         }
 
         /// A new stream's request: a slot and a fiber for it, or refused.
@@ -1342,8 +1393,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             request: http2.Event.Request,
         ) void {
             if (server.stream_free_count == 0) {
-                h2.machine.refuse(request.index);
-                server.stats.http2_refused += 1;
+                h2.machine.refuse(request.index); // counted by the machine
                 return;
             }
             const slot = server.take_stream();
@@ -1362,9 +1412,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             stream.refusal = server.h2_copy_head(stream, request.head);
             h2.slots[request.index] = slot;
             server.stats.http2_streams += 1;
+            // Counted first: the fiber may run, and end, before this returns.
+            h2.fibers += 1;
             server.group.concurrent(server.io, serve_stream, .{ server, slot }) catch {
+                h2.fibers -= 1;
                 server.stats.fiberless += 1;
-                server.stats.http2_refused += 1;
                 h2.slots[request.index] = slot_none;
                 h2.machine.refuse(request.index);
                 server.give_stream(slot);
@@ -1521,7 +1573,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                             return error.HeadRefused;
                         },
                         error.NoRoom => {
-                            if (!server.h2_flush(stream.connection, &stream.signal)) {
+                            if (!server.h2_flush(stream.connection, .until_sent)) {
                                 return error.Disconnected;
                             }
                             continue;
@@ -1554,7 +1606,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     switch (err) {
                         error.Reset => return error.Disconnected,
                         error.NoRoom => {
-                            if (!server.h2_flush(stream.connection, &stream.signal)) {
+                            if (!server.h2_flush(stream.connection, .until_sent)) {
                                 return error.Disconnected;
                             }
                             continue;
@@ -1566,12 +1618,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 if (sent == bytes.len and (count > 0 or rest.len == 0)) return;
                 if (count > 0) continue;
                 // A window is closed. What waits must reach the client
-                // before it can open one; sending waits, so look again after.
-                if (h2.machine.wants_flush()) {
-                    if (!server.h2_flush(stream.connection, &stream.signal)) {
-                        return error.Disconnected;
-                    }
-                    continue;
+                // before it can open one: sent now, or by the fiber sending.
+                // Then the wait, which a window opened since `seen` ends at
+                // once.
+                if (!server.h2_flush(stream.connection, .leave_to_sender)) {
+                    return error.Disconnected;
                 }
                 if (!server.h2_wait(stream, seen, server.config.send_timeout_ms)) {
                     return error.Disconnected;
@@ -1597,7 +1648,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             if (!h2.broken) {
                 h2.machine.body_read(stream.index, count);
                 // The window given back now: the client may be waiting on it.
-                _ = server.h2_flush(stream.connection, &stream.signal);
+                _ = server.h2_flush(stream.connection, .leave_to_sender);
             }
             return count;
         }
@@ -1614,16 +1665,19 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         }
 
         /// The stream fiber's last act: the stream given back to the
-        /// machine (which resets one cut short), what waits sent, the slot
-        /// freed, and the reader told.
+        /// machine (which resets one cut short) and unmapped at once, for
+        /// the machine may give its index to a new stream from then; what
+        /// waits sent; the slot freed; and the reader told.
         fn h2_finish(server: *Server, stream: *StreamSlot) void {
             const connection = stream.connection;
             const h2 = &server.h2[connection.index];
             assert(h2.slots[stream.index] == stream.slot);
             h2.machine.release(stream.index);
-            _ = server.h2_flush(connection, &stream.signal);
             h2.slots[stream.index] = slot_none;
+            _ = server.h2_flush(connection, .leave_to_sender);
             server.give_stream(stream.slot);
+            assert(h2.fibers > 0);
+            h2.fibers -= 1;
             h2.signal.notify(server.io);
             if (h2.machine.streams_held() > 0 or !h2.reading) return;
             // The connection is idle now: its reader waits without a

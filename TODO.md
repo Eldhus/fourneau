@@ -78,9 +78,15 @@
      docs/http2.md (layers: HPACK, frames, the connection's state
      machine, the server; stream slots held until handlers return).
      HPACK (`eb43c46`), frames (`ced6ca7`), the connection's state
-     machine (`3cf2f76`), the server over h2c (`137553a`) and HTTPS by
-     ALPN done (h2spec strict over TLS 147/147); next, a load test
-     against Go and axum, then the dragrace workload.
+     machine (`3cf2f76`), the server over h2c (`137553a`), HTTPS by
+     ALPN (`fef889c`), and its load bugs fixed (a leak, a convoy, a
+     drain that hung: DIARY) done; next, against Go and axum, then the
+     dragrace workload (on a dragrace branch, not main: main may be
+     pushed for tonight's race).
+     Left for later: the simulator speaking HTTP/2 (the load bugs were
+     found by oha and a real-kernel test, not deterministically); each
+     connection slot's machine is ~110 KB (its head and block buffers
+     could shrink, or machines come from a pool smaller than the slots).
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
@@ -94,6 +100,11 @@
      (now `76a41bb`; `b9ffad1` gives fourneau-zig `fibers_max`, built and
      served, checked). The race then runs the pool, the drain and
      brotli (the dragrace site's static files get brotli copies).
+     Since this note, fourneau main has HTTP/2 too (HPACK to ALPN):
+     pushing it puts HTTP/2 on the site at its next deploy
+     (`fourneau-static` speaks it); fourneau-zig and roux leave
+     `Config.http2` unset, so the race's HTTP/1.1 path is the same code
+     but for the protocol switch in `Request` (roux builds, checked).
 
 ## Plan
 
