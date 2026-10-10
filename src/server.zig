@@ -1122,10 +1122,12 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn serve_connection(server: *Server, index: u32) void {
             const connection = &server.connections[index];
             defer server.close_connection(connection);
-            if (server.config.tls) |context| {
-                if (!server.handshake(connection, context)) return;
-            }
-            if (server.config.http2 != null and server.sniff_http2(connection)) {
+            // HTTP/2 by ALPN on HTTPS, by its preface on plain HTTP.
+            const http2_chosen = if (server.config.tls) |context|
+                server.handshake(connection, context) orelse return
+            else
+                server.config.http2 != null and server.sniff_http2(connection);
+            if (http2_chosen) {
                 server.serve_http2(connection);
                 return;
             }
@@ -1137,8 +1139,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
         /// TLS 1.3 before the first request: tls.zig's handshake in the
         /// connection's scratch, then kTLS; the client's first bytes after
-        /// it (decrypted) start `recv`. False: close the connection.
-        fn handshake(server: *Server, connection: *Connection, context: *const tls.Context) bool {
+        /// it (decrypted) start `recv`. Whether ALPN chose HTTP/2; null:
+        /// close the connection.
+        fn handshake(server: *Server, connection: *Connection, context: *const tls.Context) ?bool {
             assert(connection.recv_used == 0);
             assert(connection.requests == 0);
             const Transport = tls.TransportType(Connection);
@@ -1151,8 +1154,14 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 connection.scratch[half..],
             );
             const socket = connection.stream.socket.handle;
-            const recv = connection.recv;
-            const early = tls.handshake(server.io, &transport, socket, context, recv) catch |err| {
+            const protocols: tls.Protocols = if (server.config.http2 == null)
+                .http1
+            else
+                .http2_and_http1;
+            const established = tls.handshake(server.io, &transport, socket, context, .{
+                .early = connection.recv,
+                .protocols = protocols,
+            }) catch |err| {
                 server.stats.handshakes_failed += 1;
                 log.debug("handshake: {t}", .{err});
                 switch (err) {
@@ -1163,13 +1172,13 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     error.EarlyDataTooLarge,
                     => {},
                 }
-                return false;
+                return null;
             };
-            assert(early <= connection.recv.len);
-            connection.recv_used = early;
+            assert(established.early_bytes <= connection.recv.len);
+            connection.recv_used = established.early_bytes;
             connection.kernel_tls = true;
             server.stats.handshakes += 1;
-            return true;
+            return established.http2;
         }
 
         /// Plain HTTP sent to the HTTPS port: a plain 400 that says so (as

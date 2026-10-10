@@ -20,7 +20,7 @@ project, so the suite is built to be fast and to be cut:
 | `zig build test -Dfilter=fuzz -Dtest-optimize=safe --fuzz=N` | Zig's coverage-guided fuzzer on the parsers, N runs (LLVM builds only: Debug has no coverage instrumentation) | minutes |
 | `zig build brotli-check -Doptimize=ReleaseSafe -- 2000` | brotli: inputs from 2,000 seeds (random, runs, dictionary words, copies of themselves, up to 400 KB), encoded by us, decoded by our decoder and the reference `brotli` (on PATH) | minutes |
 
-| `h2spec -h 127.0.0.1 -p PORT --strict` against `fourneau-hello` | HTTP/2 conformance, 147 cases; h2spec v2.6.0 built from its tag (`go build ./cmd/h2spec`, its module cache kept out of `~`). All pass but "invalid connection preface" (twice): h2c and HTTP/1.1 share a port, so bytes that are not the preface get HTTP/1.1's 400, which h2spec reads as a frame | seconds |
+| `h2spec -h 127.0.0.1 -p PORT -t -k --strict` against `fourneau-static --cert --key` | HTTP/2 conformance over TLS (ALPN h2), 147 cases, all pass; h2spec v2.6.0 built from its tag (`go build ./cmd/h2spec`, its module cache kept out of `~`). Over h2c (`fourneau-hello`, no `-t -k`) all pass but "invalid connection preface" (listed twice): h2c and HTTP/1.1 share the port, so bytes that are not the preface get HTTP/1.1's 400, which h2spec reads as a frame | a second |
 
 Tests compile Debug by default, fast to build, every assertion on;
 `-Dtest-optimize=safe` for an optimised run. Test

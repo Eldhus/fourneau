@@ -78,9 +78,9 @@
      docs/http2.md (layers: HPACK, frames, the connection's state
      machine, the server; stream slots held until handlers return).
      HPACK (`eb43c46`), frames (`ced6ca7`), the connection's state
-     machine (`3cf2f76`) and the server over h2c done (h2spec strict
-     145/147, the two an invalid preface on a shared port); next, ALPN
-     on HTTPS, then a load test against Go and axum.
+     machine (`3cf2f76`), the server over h2c (`137553a`) and HTTPS by
+     ALPN done (h2spec strict over TLS 147/147); next, a load test
+     against Go and axum, then the dragrace workload.
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does

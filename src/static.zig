@@ -166,6 +166,8 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
         .connections_max = @max(64, 1024 / options.shards),
         .tls = shared.tls,
         .stop = shared.stop,
+        // Browsers: one connection, every request and event stream on it.
+        .http2 = .{},
     };
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{

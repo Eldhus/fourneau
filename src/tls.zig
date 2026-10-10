@@ -31,8 +31,28 @@ pub const output_bytes_min = tls.output_buffer_len;
 /// A server's TLS: its certificate and key, loaded at startup.
 pub const Context = struct {
     auth: *CertKeyPair,
-    /// ALPN: HTTP/1.1 only, until HTTP/2 (M9).
-    alpn: []const []const u8 = &.{"http/1.1"},
+};
+
+/// What the server speaks, offered by ALPN (RFC 7301) in its order of
+/// preference: HTTP/2 first when it speaks it. A client offering neither
+/// is refused; one offering nothing gets HTTP/1.1.
+pub const Protocols = enum {
+    http1,
+    http2_and_http1,
+
+    fn names(protocols: Protocols) []const []const u8 {
+        return switch (protocols) {
+            .http1 => &.{"http/1.1"},
+            .http2_and_http1 => &.{ "h2", "http/1.1" },
+        };
+    }
+};
+
+pub const Established = struct {
+    /// The first bytes of the HTTP stream, already decrypted into `early`.
+    early_bytes: u32,
+    /// ALPN chose HTTP/2.
+    http2: bool,
 };
 
 pub const HandshakeError = error{
@@ -152,28 +172,31 @@ pub fn TransportType(comptime Connection: type) type {
 }
 
 /// The handshake, then kTLS. Writes into `early` whatever the client sent
-/// after its Finished that the input buffer already holds, decrypted, and
-/// returns its length: the first bytes of the HTTP stream.
+/// after its Finished that the input buffer already holds, decrypted:
+/// the first bytes of the HTTP stream.
 pub fn handshake(
     io: Io,
     transport: anytype,
     socket: std.posix.socket_t,
     context: *const Context,
-    early: []u8,
-) HandshakeError!u32 {
+    options: struct { early: []u8, protocols: Protocols },
+) HandshakeError!Established {
     transport.reader.fill(1) catch return error.HandshakeFailed;
     if (transport.reader.buffered()[0] != record_type_handshake) return error.NotTls;
     const random_source: std.Random.IoSource = .{ .io = io };
     var session = tls.server(&transport.reader, &transport.writer, .{
         .rng = random_source.interface(),
         .auth = context.auth,
-        .alpn_protocols = context.alpn,
+        .alpn_protocols = options.protocols.names(),
         .now = Io.Clock.real.now(io),
     }) catch return error.HandshakeFailed;
-    const early_bytes = try take_buffered(&session, &transport.reader, early);
+    const early_bytes = try take_buffered(&session, &transport.reader, options.early);
     var keys = tls.Ktls.init(session.cipher);
     try kernel_tls(socket, &keys);
-    return early_bytes;
+    const chosen = session.alpn_protocol orelse "http/1.1";
+    const http2 = std.mem.eql(u8, chosen, "h2");
+    assert(!http2 or options.protocols == .http2_and_http1);
+    return .{ .early_bytes = early_bytes, .http2 = http2 };
 }
 
 /// Decrypts the records the input buffer already holds (and the rest of a

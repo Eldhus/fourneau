@@ -1719,3 +1719,18 @@ Measured and checked:
 - The simulator's 200 seeds (HTTP/1.1) still pass; roux builds.
 
 Not yet: ALPN on HTTPS, the simulator speaking HTTP/2, a load test.
+
+## 2026-10-10: HTTP/2 on HTTPS, by ALPN
+
+tls.zig already chose a protocol from the client's list in the server's
+order and kept it on the session; the handshake now takes the server's
+offer (`tls.Protocols`: `h2` then `http/1.1` when `Config.http2` is set)
+and says what was chosen. The certificate's context no longer carries
+an ALPN list: what the server speaks is the server's to say.
+`fourneau-static` (the site) speaks HTTP/2 now, live at the next deploy.
+
+Checked with a self-signed P-256 certificate: curl negotiates h2 and
+gets the page; `--http1.1` still gets HTTP/1.1; a 270 KB file comes back
+brotli-compressed (204,039 bytes) and identical once decoded. h2spec
+strict over TLS: 147 of 147, in 0.1 s (no fallback to HTTP/1.1 on an
+ALPN-chosen connection, so the invalid preface case passes too).

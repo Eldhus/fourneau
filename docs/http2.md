@@ -95,8 +95,9 @@ Layers, each tested alone before the server sees it, as HTTP/1.1's are:
 
 - **Which protocol**: on plain HTTP, `sniff_http2` reads until the first
   bytes are the preface or cannot be (an HTTP/1.1 client costs nothing:
-  the first byte differs, and its bytes stay in `recv`). On HTTPS, ALPN
-  (next).
+  the first byte differs, and its bytes stay in `recv`). On HTTPS, ALPN:
+  the server offers `h2` then `http/1.1` when it speaks HTTP/2
+  (`tls.Protocols`, the server's choice, not the certificate's).
 - **Fibers**: the connection's reads frames; each stream's handler runs
   on a fiber of its own (`Config.fibers_max` counts the stream slots).
 - **Stream slots** per shard (`Config.http2.streams_max`), each: a copy
