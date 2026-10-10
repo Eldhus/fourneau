@@ -12,6 +12,7 @@ test {
     _ = @import("brotli_tool.zig");
     _ = @import("brotli_words.zig");
     _ = @import("http1_chunked.zig");
+    _ = @import("http2_frame.zig");
     _ = @import("hello.zig");
     _ = @import("hpack.zig");
     _ = @import("hybrid.zig");
