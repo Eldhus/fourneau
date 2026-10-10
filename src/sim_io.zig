@@ -84,6 +84,11 @@ const Fiber = struct {
     not_before_tick: u64,
     start: Start,
     cancel_protection: Io.CancelProtection,
+    /// A cancelation was requested and not yet delivered: the fiber's next
+    /// cancelation point returns `error.Canceled` (`Future.cancel`).
+    cancel_requested: bool,
+    /// Blocked at a cancelation point: a cancel request wakes it.
+    wait_cancelable: bool,
     context_bytes: [context_bytes_max]u8 align(16),
     result_bytes: [result_bytes_max]u8 align(16),
 };
@@ -291,17 +296,58 @@ pub const Sim = struct {
     }
 
     /// From a fiber: wait for `wait`, then return to the caller (which
-    /// re-checks its condition).
+    /// re-checks its condition). Not a cancelation point.
     fn block(sim: *Sim, wait: Wait) void {
         const index = sim.current.?; // the simulator's own loop never blocks
         const fiber = &sim.fibers[index];
         fiber.state = .blocked;
         fiber.wait = wait;
+        fiber.wait_cancelable = false;
         const latency = sim.prng.int_at_most(u64, 0, sim.options.latency_ticks_max);
         fiber.not_before_tick = sim.tick_now + latency;
         context_switch(&fiber.context, &sim.main_context);
         assert(sim.current == index);
         assert(fiber.state == .ready);
+    }
+
+    /// `block` at a cancelation point: a request made before the wait is
+    /// delivered here; one made during it wakes the fiber, whose caller
+    /// re-checks and blocks again, and so is delivered then.
+    fn block_cancelable(sim: *Sim, wait: Wait) Io.Cancelable!void {
+        try sim.check_cancel();
+        const index = sim.current.?;
+        const fiber = &sim.fibers[index];
+        fiber.state = .blocked;
+        fiber.wait = wait;
+        fiber.wait_cancelable = true;
+        const latency = sim.prng.int_at_most(u64, 0, sim.options.latency_ticks_max);
+        fiber.not_before_tick = sim.tick_now + latency;
+        context_switch(&fiber.context, &sim.main_context);
+        assert(sim.current == index);
+        assert(fiber.state == .ready);
+        fiber.wait_cancelable = false;
+    }
+
+    /// A cancelation point that does not wait: delivers a pending request.
+    fn check_cancel(sim: *Sim) Io.Cancelable!void {
+        const fiber = &sim.fibers[sim.current orelse return];
+        if (!fiber.cancel_requested or fiber.cancel_protection == .blocked) return;
+        fiber.cancel_requested = false;
+        return error.Canceled;
+    }
+
+    /// Ask a fiber to stop: its next cancelation point returns
+    /// `error.Canceled`, and one it is blocked at returns it now.
+    fn request_cancel(sim: *Sim, index: u32) void {
+        const fiber = &sim.fibers[index];
+        assert(fiber.state != .free);
+        if (fiber.state == .done) return;
+        fiber.cancel_requested = true;
+        if (fiber.state == .blocked and fiber.wait_cancelable and
+            fiber.cancel_protection == .unblocked)
+        {
+            fiber.state = .ready;
+        }
     }
 
     fn spawn(sim: *Sim, context: []const u8, start: Start) ?u32 {
@@ -313,6 +359,8 @@ pub const Sim = struct {
         @memcpy(fiber.context_bytes[0..context.len], context);
         fiber.start = start;
         fiber.cancel_protection = .unblocked;
+        fiber.cancel_requested = false;
+        fiber.wait_cancelable = false;
         fiber.state = .ready;
         // The closure sits at the top of the stack, 16-aligned; the stub
         // finds it 8 bytes above the stack pointer it starts with.
@@ -387,7 +435,7 @@ pub const Sim = struct {
         return index;
     }
 
-    fn accept(sim: *Sim) net.Socket {
+    fn accept(sim: *Sim) Io.Cancelable!net.Socket {
         for (0..std.math.maxInt(u32)) |_| {
             if (sim.backlog_count > 0) {
                 const index = sim.backlog[0];
@@ -401,11 +449,13 @@ pub const Sim = struct {
                     .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 1 } },
                 };
             }
-            sim.block(.accept);
+            try sim.block_cancelable(.accept);
         } else unreachable; // bounded by the simulation's own end
     }
 
-    fn read(sim: *Sim, fd: i32, buffers: [][]u8) Io.Operation.NetRead.Error!usize {
+    const ReadError = Io.Cancelable || Io.Operation.NetRead.Error;
+
+    fn read(sim: *Sim, fd: i32, buffers: [][]u8) ReadError!usize {
         const index = sim.connection_of(fd);
         const buffer = for (buffers) |buffer| {
             if (buffer.len > 0) break buffer;
@@ -420,16 +470,18 @@ pub const Sim = struct {
                 return connection.to_server.pop(buffer[0..wanted]);
             }
             if (connection.client_closed) return 0;
-            sim.block(.{ .read = index });
+            try sim.block_cancelable(.{ .read = index });
         } else unreachable;
     }
+
+    const WriteError = Io.Cancelable || Io.Operation.NetWrite.Error;
 
     fn write(
         sim: *Sim,
         fd: i32,
         header: []const u8,
         data: []const []const u8,
-    ) Io.Operation.NetWrite.Error!usize {
+    ) WriteError!usize {
         const index = sim.connection_of(fd);
         var total: usize = header.len;
         for (data) |part| total += part.len;
@@ -449,7 +501,7 @@ pub const Sim = struct {
                 assert(left == 0);
                 return sent;
             }
-            sim.block(.{ .write = index });
+            try sim.block_cancelable(.{ .write = index });
         } else unreachable;
     }
 
@@ -551,7 +603,7 @@ pub const Sim = struct {
         table.async = vtable_async;
         table.concurrent = vtable_concurrent;
         table.await = vtable_await;
-        table.cancel = vtable_await; // no cancellation simulated yet: cancel awaits
+        table.cancel = vtable_cancel;
         table.groupAsync = vtable_group_async;
         table.groupConcurrent = vtable_group_concurrent;
         table.groupAwait = vtable_group_await;
@@ -678,12 +730,40 @@ pub const Sim = struct {
         group.token.store(null, .release);
     }
 
-    fn vtable_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
-        vtable_group_await(userdata, group, token) catch unreachable; // no cancellation simulated
+    fn vtable_cancel(
+        userdata: ?*anyopaque,
+        any_future: *Io.AnyFuture,
+        result: []u8,
+        result_alignment: std.mem.Alignment,
+    ) void {
+        const sim = from(userdata);
+        sim.request_cancel(sim.fiber_index(any_future));
+        vtable_await(userdata, any_future, result, result_alignment);
     }
 
+    fn vtable_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
+        const sim = from(userdata);
+        for (sim.fibers, 0..) |*fiber, index| {
+            if (fiber.state == .free or fiber.state == .done) continue;
+            switch (fiber.start) {
+                .group => |member| if (member.group == group) sim.request_cancel(@intCast(index)),
+                .future => {},
+            }
+        }
+        // The canceler itself is not a member: its own request, if any,
+        // waits for its next cancelation point.
+        const protection = vtable_swap_cancel_protection(userdata, .blocked);
+        defer _ = vtable_swap_cancel_protection(userdata, protection);
+        vtable_group_await(userdata, group, token) catch unreachable; // protected
+    }
+
+    /// Re-arm a delivered request: the next cancelation point returns
+    /// `error.Canceled` again.
     fn vtable_recancel(userdata: ?*anyopaque) void {
-        _ = userdata;
+        const sim = from(userdata);
+        const fiber = &sim.fibers[sim.current.?];
+        assert(!fiber.cancel_requested);
+        fiber.cancel_requested = true;
     }
 
     fn vtable_swap_cancel_protection(
@@ -698,7 +778,7 @@ pub const Sim = struct {
     }
 
     fn vtable_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
-        _ = userdata;
+        return from(userdata).check_cancel();
     }
 
     fn vtable_futex_wait(
@@ -708,7 +788,10 @@ pub const Sim = struct {
         timeout: Io.Timeout,
     ) Io.Cancelable!void {
         assert(timeout == .none); // the server waits without timeouts
-        vtable_futex_wait_uncancelable(userdata, ptr, expected);
+        const sim = from(userdata);
+        try sim.check_cancel();
+        if (@atomicLoad(u32, ptr, .acquire) != expected) return;
+        try sim.block_cancelable(.{ .futex = ptr });
     }
 
     fn vtable_futex_wait_uncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
@@ -737,12 +820,28 @@ pub const Sim = struct {
     ) Io.Cancelable!Io.Operation.Result {
         const sim = from(userdata);
         return switch (operation) {
-            .net_read => |o| .{ .net_read = if (sim.read(o.socket_handle, o.data)) |got|
-                .{ .data_len = got }
-            else |err|
-                err },
-            .net_write => |o| .{ .net_write = sim.write(o.socket_handle, o.header, o.data) },
+            .net_read => |o| .{ .net_read = try sim.operate_read(o) },
+            .net_write => |o| .{ .net_write = try sim.operate_write(o) },
             else => unreachable, // the server uses no other operation
+        };
+    }
+
+    const NetRead = Io.Operation.NetRead;
+    const NetWrite = Io.Operation.NetWrite;
+
+    /// A cancelation is the operation's outer error, as the port's is.
+    fn operate_read(sim: *Sim, o: NetRead) Io.Cancelable!NetRead.Result {
+        const got = sim.read(o.socket_handle, o.data) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => |other| return @as(NetRead.Result, other),
+        };
+        return .{ .data_len = got };
+    }
+
+    fn operate_write(sim: *Sim, o: NetWrite) Io.Cancelable!NetWrite.Result {
+        return sim.write(o.socket_handle, o.header, o.data) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => |other| return @as(NetWrite.Result, other),
         };
     }
 
@@ -789,7 +888,89 @@ pub const Sim = struct {
         const until = sim.now_ns() + @as(u64, @intCast(duration));
         for (0..std.math.maxInt(u32)) |_| {
             if (sim.now_ns() >= until) return;
-            sim.block(.{ .sleep = until });
+            try sim.block_cancelable(.{ .sleep = until });
         } else unreachable;
     }
 };
+
+/// Tasks for the cancelation test: each says whether it saw what it must.
+const CancelTasks = struct {
+    const hour: Io.Duration = .fromSeconds(3600);
+
+    fn sleeps(io: Io) bool {
+        io.sleep(hour, .awake) catch |err| switch (err) {
+            error.Canceled => return true,
+        };
+        return false;
+    }
+
+    fn accepts(io: Io) bool {
+        var listener: net.Server = .{
+            .socket = .{
+                .handle = listener_fd,
+                .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
+            },
+            .options = {},
+        };
+        _ = listener.accept(io) catch |err| switch (err) {
+            error.Canceled => return true,
+            else => return false,
+        };
+        return false;
+    }
+
+    /// Protected while it sleeps, so the request waits; delivered at the
+    /// next cancelation point after, once; re-armed by `recancel`.
+    fn protected(io: Io) bool {
+        const old = io.swapCancelProtection(.blocked);
+        io.sleep(.fromNanoseconds(3 * tick_ns_test), .awake) catch return false;
+        _ = io.swapCancelProtection(old);
+        io.checkCancel() catch |err| switch (err) {
+            error.Canceled => {
+                io.checkCancel() catch return false; // delivered once
+                io.recancel();
+                io.checkCancel() catch return true;
+                return false;
+            },
+        };
+        return false;
+    }
+
+    fn drive(io: Io, seen: *[3]bool) void {
+        var sleeping = io.concurrent(sleeps, .{io}) catch unreachable;
+        var accepting = io.concurrent(accepts, .{io}) catch unreachable;
+        var protecting = io.concurrent(protected, .{io}) catch unreachable;
+        io.sleep(.fromNanoseconds(tick_ns_test), .awake) catch unreachable; // all blocked
+        seen[0] = sleeping.cancel(io);
+        seen[1] = accepting.cancel(io);
+        seen[2] = protecting.cancel(io);
+    }
+};
+
+const tick_ns_test = 1_000_000;
+
+test "sim_io: a cancel reaches a sleep, an accept and a protected task" {
+    const gpa = std.testing.allocator;
+    for (0..20) |seed| {
+        var sim = try Sim.init(gpa, seed, .{
+            .fibers_max = 4,
+            .stack_bytes = 64 * 1024,
+            .connections_max = 1,
+            .window_bytes = 16,
+            .latency_ticks_max = 2,
+            .backlog_max = 1,
+            .tick_ns = tick_ns_test,
+            .realtime_seconds_start = 0,
+        });
+        defer sim.deinit(gpa);
+        const io = sim.io();
+        var seen: [3]bool = @splat(false);
+        var driver = try io.concurrent(CancelTasks.drive, .{ io, &seen });
+        for (0..100) |tick| {
+            sim.tick_now = tick;
+            _ = sim.run_ready(1000);
+        }
+        driver.await(io); // done by now: awaiting from outside a fiber would block
+        try std.testing.expectEqual([3]bool{ true, true, true }, seen);
+    }
+}
