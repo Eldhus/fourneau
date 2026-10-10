@@ -61,9 +61,6 @@ pub fn setup(prng: *Prng) Setup {
     const transfer_ms = (@max(head_bytes_max, body_bytes_max) / window_bytes + 4) *
         (latency_ticks_max + 1) * 4;
     const tick_ms = 10;
-    // After a stream cut short: the server's last writes and its close,
-    // each a network turn late at most, with room for the scheduler.
-    const cut_short_silence_ticks_max = (latency_ticks_max + 1) * 4 + 2;
     const server: server_module.Config = .{
         .connections_max = connections_max,
         .head_bytes_max = head_bytes_max,
@@ -82,9 +79,6 @@ pub fn setup(prng: *Prng) Setup {
         .tick_ms = tick_ms,
         .tcp_nodelay = false,
     };
-    // A server that waits for the client after a stream cut short is
-    // closed by its idle timeout at the soonest: the silence must be less.
-    assert(cut_short_silence_ticks_max < server.idle_timeout_ms);
     var plan: Setup = .{
         .server = server,
         .network = .{
@@ -99,16 +93,7 @@ pub fn setup(prng: *Prng) Setup {
             .tick_ns = tick_ns,
             .realtime_seconds_start = 1_791_072_000 + prng.int_less_than(u64, 1_000_000),
         },
-        .limits = .{
-            .head_bytes_max = server.head_bytes_max,
-            .target_bytes_max = server.target_bytes_max,
-            .headers_max = server.headers_max,
-            .body_bytes_max = server.body_bytes_max,
-            .big_bytes_max = prng.int_at_most(u32, 0, 16 * 1024),
-            .idle_ticks_max = server.idle_timeout_ms * 2,
-            .pause_ticks_max = server.head_timeout_ms * 2,
-            .cut_short_silence_ticks_max = cut_short_silence_ticks_max,
-        },
+        .limits = client_limits(prng, server, latency_ticks_max),
         .clients_count = prng.int_at_most(u32, 1, 32),
         .linked = prng.boolean(),
         .start_ticks_max = prng.int_at_most(u32, 0, 2000),
@@ -118,6 +103,32 @@ pub fn setup(prng: *Prng) Setup {
     };
     if (prng.boolean()) plan_stop(prng, &plan, latency_ticks_max); // last: see there
     return plan;
+}
+
+/// What the clients may send and how long they may wait, from the server's
+/// configuration and the network's latency.
+fn client_limits(
+    prng: *Prng,
+    server: server_module.Config,
+    latency_ticks_max: u32,
+) sim_client.Limits {
+    // After a stream cut short: the server's last writes and its close,
+    // each a network turn late at most, with room for the scheduler.
+    const cut_short_silence_ticks_max = (latency_ticks_max + 1) * 4 + 2;
+    // A server that waits for the client after a stream cut short is
+    // closed by its idle timeout at the soonest: the silence must be less.
+    assert(cut_short_silence_ticks_max < server.idle_timeout_ms);
+    return .{
+        .head_bytes_max = server.head_bytes_max,
+        .target_bytes_max = server.target_bytes_max,
+        .headers_max = server.headers_max,
+        .body_bytes_max = server.body_bytes_max,
+        .big_bytes_max = prng.int_at_most(u32, 0, 16 * 1024),
+        .idle_ticks_max = server.idle_timeout_ms * 2,
+        .pause_ticks_max = server.head_timeout_ms * 2,
+        .cut_short_silence_ticks_max = cut_short_silence_ticks_max,
+        .drain_event_stream_ticks_max = 2 * server.tick_ms + cut_short_silence_ticks_max,
+    };
 }
 
 /// When the server is told to stop, and how long its drain may take. Drawn
@@ -157,6 +168,9 @@ const App = struct {
 
     const headers: []const http1_response.Header = &.{
         .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    const event_headers: []const http1_response.Header = &.{
+        .{ .name = "content-type", .value = "Text/Event-Stream; charset=utf-8" },
     };
 
     /// `request` is either server type's (`ServerPlain`, `ServerLinked`).
@@ -213,14 +227,17 @@ const App = struct {
         const path = request.head.path_and_query;
         const whole = sim_client.answer("GET", path, 0, 0, request.scratch).body;
         assert(whole.len == target.stream.bytes);
-        request.stream_start(200, headers) catch |err| switch (err) {
+        const events = target.kind == .events;
+        request.stream_start(200, if (events) event_headers else headers) catch |err| switch (err) {
             // Nothing was started: an ordinary answer, which a peer that
             // is gone never gets.
             error.Disconnected => return .{ .status = 500, .headers = &.{}, .body = "" },
             error.HeadRefused => unreachable, // a 200 with plain headers
         };
+        if (events) return app.send_events(request, target.stream, whole);
         const pieces = target.stream.pieces;
-        const sent = if (target.aborted) sim_client.abort_pieces(pieces) else pieces;
+        const aborted = target.kind == .abort;
+        const sent = if (aborted) sim_client.abort_pieces(pieces) else pieces;
         for (0..sent) |index| {
             const piece = sim_client.stream_piece(target.stream.bytes, pieces, @intCast(index));
             request.stream_send(whole[piece.start..piece.end]) catch return streamed;
@@ -229,8 +246,34 @@ const App = struct {
                 app.io.sleep(.fromMilliseconds(1), .awake) catch return streamed;
             }
         }
-        if (!target.aborted) request.stream_end() catch return streamed;
+        if (!aborted) request.stream_end() catch return streamed;
         return streamed;
+    }
+
+    /// `/events/`: an event per piece, each sent as it is made, round after
+    /// round, until a send fails (the client hung up, or a drain ended it).
+    /// A HEAD has no events to send, and so nothing to notice a hang-up by:
+    /// it ends at once.
+    fn send_events(
+        app: *App,
+        request: anytype,
+        round: sim_client.Stream,
+        whole: []const u8,
+    ) Response {
+        if (request.head.method == .head) {
+            request.stream_end() catch {};
+            return streamed;
+        }
+        // Bounded only to say so: a send fails once the client is gone.
+        for (0..std.math.maxInt(u32)) |_| {
+            for (0..round.pieces) |index| {
+                const piece = sim_client.stream_piece(round.bytes, round.pieces, @intCast(index));
+                assert(piece.end > piece.start); // an event is never empty
+                request.stream_send(whole[piece.start..piece.end]) catch return streamed;
+                request.stream_flush() catch return streamed;
+                app.io.sleep(.fromMilliseconds(10), .awake) catch return streamed;
+            }
+        } else unreachable;
     }
 
     pub fn release(app: *App, response: *Response) void {
@@ -257,6 +300,7 @@ pub const Outcome = struct {
     /// and at its deadline, and new ones closed unserved.
     stopped: u64,
     drain_idle: u64,
+    drain_streams: u64,
     drain_cut: u64,
     shut_out: u64,
 };
@@ -324,6 +368,10 @@ fn run_server(
                 stop_tick + plan.drain_ticks_max, stop_tick,
             });
             result.exit_code = exit_liveness;
+        } else if (sim.backlog_count != 0) {
+            // Refused at once, or answered: never left queued.
+            std.debug.print("server: drained, {d} clients left queued\n", .{sim.backlog_count});
+            result.exit_code = exit_correctness;
         }
     }
     return result;
@@ -345,7 +393,7 @@ fn loop(
         sim.tick_now = tick;
         if (plan.stop_tick == tick) {
             stop.store(true, .release);
-            for (clients) |*client| client.server_draining = true;
+            for (clients) |*client| client.drain_started(tick);
         }
         for (clients) |*client| client.step(sim, tick);
         const runs = sim.run_ready(runs_per_tick_max);
@@ -399,6 +447,7 @@ fn outcome(
         .cut_short = 0,
         .stopped = @intFromBool(server.draining),
         .drain_idle = server.stats.drain_idle,
+        .drain_streams = server.stats.drain_streams,
         .drain_cut = server.stats.drain_cut,
         .shut_out = 0,
     };
@@ -431,9 +480,10 @@ pub fn print(seed: u64, result: Outcome) void {
     std.debug.print("retries={d} timeouts={d}/{d} cut_short={d} ", .{
         result.retries, result.timed_out, result.timeouts, result.cut_short,
     });
-    std.debug.print("stopped={d} drain_idle={d} drain_cut={d} shut_out={d}\n", .{
-        result.stopped, result.drain_idle, result.drain_cut, result.shut_out,
+    std.debug.print("stopped={d} drain_idle={d} drain_streams={d} drain_cut={d} ", .{
+        result.stopped, result.drain_idle, result.drain_streams, result.drain_cut,
     });
+    std.debug.print("shut_out={d}\n", .{result.shut_out});
 }
 
 fn add(total: *Outcome, result: Outcome) void {

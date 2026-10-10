@@ -192,9 +192,10 @@ pub const Stats = struct {
     /// Connections closed because the `Io` had no fiber for them: its pool
     /// is smaller than `Config.fibers_max` says. Always 0 when it is not.
     fiberless: u64 = 0,
-    /// Connections a drain closed: idle ones at its start, and those left
-    /// at its deadline.
+    /// Connections a drain closed: idle ones at its start, event streams,
+    /// and those left at its deadline.
     drain_idle: u64 = 0,
+    drain_streams: u64 = 0,
     drain_cut: u64 = 0,
 };
 
@@ -347,6 +348,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             request_end: u32,
             body: BodyState,
             stream_state: StreamState,
+            /// The stream is server-sent events (`text/event-stream`): it
+            /// has no end of its own, so a drain ends it at once, and its
+            /// client reconnects (EventSource's contract).
+            endless: bool,
             continue_sent: bool,
             keep_alive: bool,
             requests: u32,
@@ -464,6 +469,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     },
                 }
                 connection.stream_state = .streaming;
+                connection.endless = for (headers) |header| {
+                    if (!std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+                    break std.ascii.startsWithIgnoreCase(header.value, "text/event-stream");
+                } else false;
             }
 
             fn stream_send(connection: *Connection, bytes: []const u8) StreamError!void {
@@ -508,6 +517,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     connection.append(last);
                 }
                 connection.stream_state = .ended;
+                connection.endless = false; // only a stream in progress is
             }
 
             /// A response head into the send buffer, after what waits
@@ -806,6 +816,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.send_used = 0;
             connection.requests = 0;
             connection.kernel_tls = false;
+            connection.stream_state = .none;
+            connection.endless = false;
         }
 
         fn close_connection(server: *Server, connection: *Connection) void {
@@ -951,6 +963,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.request_end = head_bytes;
             connection.keep_alive = head.keep_alive;
             connection.stream_state = .none;
+            connection.endless = false;
             connection.continue_sent = false;
             connection.body = switch (head.body) {
                 .none => .none,
@@ -1100,6 +1113,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 }
                 if (server.draining) {
                     if (server.free_count == server.config.connections_max) return;
+                    server.drain_endless();
                     if (server.drain_deadline != 0 and server.tick >= server.drain_deadline) {
                         server.drain_cut();
                     }
@@ -1112,17 +1126,20 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             return stop.load(.acquire);
         }
 
-        /// Stop accepting (the accept loop is canceled: the listening
-        /// socket itself is untouched, for a successor that shares it),
-        /// then close every connection idle between requests, by shutting
-        /// it for reading as eviction does. Those in flight close after
-        /// their response (`read_head`, `write_head`).
+        /// Stop accepting: the accept loop is canceled, then the listening
+        /// socket closed, so new clients are refused at once rather than
+        /// queued until the process exits (a successor sharing the socket
+        /// holds its own descriptor, and keeps it). Then close every
+        /// connection idle between requests, by shutting it for reading as
+        /// eviction does. Those in flight close after their response
+        /// (`read_head`, `write_head`); event streams, at the next tick.
         fn drain_start(server: *Server, acceptor: *Io.Future(void)) void {
             assert(!server.draining);
             server.draining = true;
             const ticks = server.ticks_for(server.config.drain_timeout_ms);
             server.drain_deadline = server.tick + ticks;
             acceptor.cancel(server.io);
+            server.listener.deinit(server.io);
             for (server.idle_since, 0..) |since, index| {
                 if (since == 0) continue;
                 assert(server.connections[index].open);
@@ -1132,8 +1149,25 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             }
         }
 
+        /// Each tick of a drain: end the event streams, which have no end
+        /// of their own to wait for (one started since is ended too). Shut,
+        /// as a timeout does: the handler's next send fails, and it returns.
+        fn drain_endless(server: *Server) void {
+            assert(server.draining);
+            for (server.connections) |*connection| {
+                if (!connection.open or !connection.endless) continue;
+                assert(connection.stream_state == .streaming);
+                connection.endless = false; // shut once
+                connection.stream.shutdown(server.io, .both) catch {};
+                server.stats.drain_streams += 1;
+            }
+        }
+
         /// The drain's deadline: shut every connection still open, as a
-        /// timeout does; its fiber reads 0, or fails to write, and closes.
+        /// timeout does (its fiber reads 0, or fails to write, and closes),
+        /// then cancel every connection's fiber, for a handler that waits
+        /// on something else than its connection; this returns when all
+        /// have ended.
         fn drain_cut(server: *Server) void {
             assert(server.draining);
             server.drain_deadline = 0;
@@ -1143,6 +1177,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 connection.stream.shutdown(server.io, .both) catch {};
                 server.stats.drain_cut += 1;
             }
+            server.group.cancel(server.io);
         }
 
         /// Shut the socket down: the fiber waiting on it reads 0 and closes.

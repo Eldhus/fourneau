@@ -164,7 +164,6 @@ fn run_shard_or_fail(options: Options, stop: *const std.atomic.Value(bool)) !voi
     var app: App = .{};
     var server = try Server.init(gpa, io, &app, listener, config);
     defer server.deinit(gpa);
-    defer server.listener.deinit(io);
     var group: std.Io.Group = .init;
     defer group.cancel(io); // `print_counts`
     if (options.counts) try group.concurrent(io, print_counts, .{ &runtime, &server });
@@ -285,8 +284,7 @@ test "a stopped server drains: the request in flight is answered and closed" {
     const listener = try address.listen(io, .{ .reuse_address = false });
     var app: App = .{};
     var server = try Server.init(gpa, io, &app, listener, config);
-    defer server.deinit(gpa);
-    defer server.listener.deinit(io);
+    defer server.deinit(gpa); // its listener closed by the drain
 
     var client: DrainClient = .{ .port = listener.socket.address.getPort(), .stop = &stop };
     const thread = try std.Thread.spawn(.{}, DrainClient.run, .{&client});
