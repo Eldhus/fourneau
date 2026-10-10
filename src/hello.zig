@@ -13,6 +13,7 @@ const Evented = @import("zig_io_evented");
 const server_module = @import("server.zig");
 const http1_response = @import("http1_response.zig");
 const Stop = @import("stop.zig").Stop;
+const listen = @import("listen.zig");
 
 const App = struct {
     pub const Response = struct {
@@ -75,6 +76,8 @@ const Options = struct {
     /// Print each shard's ring activity per 100 requests every 2 s
     /// (experiment 18): what the kernel is asked, request by request.
     counts: bool = false,
+    /// systemd's socket `http`, when it holds one across restarts.
+    activation: listen.Activation = .{ .pid = null, .fds = null, .names = null },
 };
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -101,6 +104,7 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
 pub fn main(init: std.process.Init.Minimal) !void {
     var options = try parse_options(init);
     if (options.shards == 0) options.shards = cpu_count();
+    options.activation = .from_environ(init.environ);
     var stop: Stop = .{};
     try stop.watch(); // before any shard's thread
     try run_shards(options, &stop.requested);
@@ -150,7 +154,7 @@ fn run_shard_or_fail(options: Options, stop: *const std.atomic.Value(bool)) !voi
         .http2 = .{},
     };
     var runtime: Evented = undefined;
-    try runtime.init(gpa, .{
+    try listen.runtime_init(Evented, &runtime, gpa, .{
         .thread_limit = 0, // this thread only
         // Not the default 8: with hundreds of connections the queues overflowed,
         // costing ~3,000 kernel cycles a request (experiment 23).
@@ -161,7 +165,10 @@ fn run_shard_or_fail(options: Options, stop: *const std.atomic.Value(bool)) !voi
 
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse(options.address, options.port);
-    const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
+    const listener = if (listen.inherited(options.activation, "http")) |fd|
+        try listen.server_from(fd)
+    else
+        try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
     var app: App = .{};
     var server = try Server.init(gpa, io, &app, listener, config);
     defer server.deinit(gpa);

@@ -23,6 +23,7 @@ const site_module = @import("site.zig");
 const tls = @import("tls.zig");
 const https = @import("https.zig");
 const Stop = @import("stop.zig").Stop;
+const listen = @import("listen.zig");
 
 const shards_max = 256;
 
@@ -114,7 +115,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const tls_context = try https.context(gpa, io, options.https);
     var stop: Stop = .{};
     try stop.watch(); // before any shard's thread
-    const shared: Shared = .{ .site = &site, .tls = tls_context, .stop = &stop.requested };
+    const shared: Shared = .{
+        .site = &site,
+        .tls = tls_context,
+        .stop = &stop.requested,
+        .activation = .from_environ(init.environ),
+    };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
     var threads: [shards_max]std.Thread = undefined;
@@ -139,7 +145,21 @@ const Shared = struct {
     tls: ?*const tls.Context,
     /// Set by a signal: every shard drains and returns.
     stop: *const std.atomic.Value(bool),
+    /// Sockets systemd holds across a restart (listen.zig): `https` for
+    /// the site over TLS, `http` for it plain or for the redirect.
+    activation: listen.Activation,
 };
+
+/// systemd's socket of that name, the shard's own copy; else one bound now.
+fn listen_on(
+    io: std.Io,
+    shared: *const Shared,
+    name: []const u8,
+    address: std.Io.net.IpAddress,
+) !std.Io.net.Server {
+    if (listen.inherited(shared.activation, name)) |fd| return listen.server_from(fd);
+    return address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
+}
 
 fn cpu_count() u32 {
     const linux = std.os.linux;
@@ -170,7 +190,7 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
         .http2 = .{},
     };
     var runtime: Evented = undefined;
-    try runtime.init(gpa, .{
+    try listen.runtime_init(Evented, &runtime, gpa, .{
         .thread_limit = 0, // this thread only
         .log2_ring_entries = 12, // not the default 8 (experiment 23)
         .fibers_max = config.fibers_max() +
@@ -179,7 +199,8 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     defer runtime.deinit();
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse(options.address, options.port);
-    const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
+    const name = if (shared.tls != null) "https" else "http";
+    const listener = try listen_on(io, shared, name, address);
     var app: App = .{ .site = shared.site };
     var server = try Server.init(gpa, io, &app, listener, config);
     defer server.deinit(gpa); // its listener closed by the drain
@@ -189,7 +210,9 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     if (options.https.redirect_port) |port| {
         assert(shared.tls != null); // redirecting to an HTTPS site
         redirect = .{ .host = options.https.https_host.? };
-        redirect_server = try redirect.listen(gpa, io, options.address, port, shared.stop);
+        const plain = try std.Io.net.IpAddress.parse(options.address, port);
+        const redirect_listener = try listen_on(io, shared, "http", plain);
+        redirect_server = try redirect.server_on(gpa, io, redirect_listener, shared.stop);
         try group.concurrent(io, run_redirect, .{&redirect_server});
     }
     try server.run();

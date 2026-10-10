@@ -148,6 +148,18 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
                 .kernel_backlog = 1024,
             };
             const listener = try plain.listen(io, listen_options);
+            return redirect.server_on(gpa, io, listener, stop);
+        }
+
+        /// As `listen`, on a socket already listening: one systemd passed
+        /// (listen.zig), kept across a restart.
+        pub fn server_on(
+            redirect: *Redirect,
+            gpa: Allocator,
+            io: Io,
+            listener: Io.net.Server,
+            stop: *const std.atomic.Value(bool),
+        ) !Server {
             var stopped = config;
             stopped.stop = stop;
             return Server.init(gpa, io, redirect, listener, stopped);

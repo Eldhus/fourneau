@@ -22,6 +22,7 @@ test {
     _ = @import("http_date.zig");
     _ = @import("floor.zig");
     _ = @import("fourneau.zig");
+    _ = @import("listen.zig");
     _ = @import("load.zig");
     _ = @import("prng.zig");
     _ = @import("server.zig");

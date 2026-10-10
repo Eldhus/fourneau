@@ -11,6 +11,8 @@ pub const https = @import("https.zig");
 pub const site = @import("site.zig");
 /// Stopping on SIGTERM and SIGINT: every shard drains.
 pub const stop = @import("stop.zig");
+/// Sockets systemd holds across a restart; a shard's ring, waited for.
+pub const listen = @import("listen.zig");
 /// Our random numbers, for importers' seeded tests (roux's host): tidy
 /// refuses the standard library's, whose sequences may change.
 pub const prng = @import("prng.zig");

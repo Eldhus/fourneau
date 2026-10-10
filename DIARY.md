@@ -1820,3 +1820,36 @@ plaintext over h2c at 32 connections of 8 streams, requests/s:
 | axum | 100k | 84k |
 | basic-webserver | 35k | 44k |
 | go | 49k | 27k |
+
+## 2026-10-10: graceful restart: systemd holds the socket
+
+The site restarts with `systemctl restart` (a deploy, and daily for its
+certificate): stop, then start, and in between the port is closed. The
+plan's graceful restart (M10), for the owner's setup: systemd's socket
+activation. systemd holds the listening socket across the restart, so a
+client connecting while the old process drains and the new one starts
+waits in its queue. The drain already closed only its own listener,
+"a successor sharing the socket keeps it".
+
+`listen.zig`: `inherited` finds the socket systemd passed by name
+(`LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES`; the caller reads them, so
+a host on libc can too), `server_from` gives each shard its own copy
+(close-on-exec, checked to be listening), and `runtime_init` is roux's
+wait for io_uring's locked memory, moved here (a start right after a
+stop finds the old rings not yet freed). `fourneau-static` takes `https`
+(and `http` for its redirect, `Redirect.server_on`), `fourneau-hello`
+takes `http`; without systemd both bind as before.
+
+Measured with transient user units (`systemd-run --user`, nothing
+installed): `fourneau-hello`, 2 shards on CPUs 0-1, oha on 4-7 with a
+new connection per request (`--disable-keepalive`, 8 at once, 6 s),
+three `systemctl --user restart`s in the run (the journal shows four
+starts):
+
+| | success | refused | slowest |
+|---|---|---|---|
+| binds itself | 98.05%, 97.97%, 97.46% | 4,771 (one run counted) | 121 ms |
+| socket-activated | 100%, 100%, 100% | 0 | 356-370 ms |
+
+The slowest is a client that waited through a restart in the queue: the
+drain (the stop flag is read once a tick, 100 ms) and the start.
