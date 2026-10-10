@@ -10,6 +10,7 @@ test {
     _ = @import("brotli_optimal.zig");
     _ = @import("brotli_tables.zig");
     _ = @import("brotli_tool.zig");
+    _ = @import("brotli_words.zig");
     _ = @import("http1_chunked.zig");
     _ = @import("hello.zig");
     _ = @import("hybrid.zig");

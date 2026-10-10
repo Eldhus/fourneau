@@ -151,6 +151,7 @@ pub fn parse_lazy(
             .insert = @intCast(position - literals_start),
             .copy = here.length,
             .distance = here.distance,
+            .out = here.length,
         });
         position += here.length;
         literals_start = position;
@@ -160,6 +161,7 @@ pub fn parse_lazy(
             .insert = @intCast(input.len - literals_start),
             .copy = 0,
             .distance = 0,
+            .out = 0,
         });
     }
 }

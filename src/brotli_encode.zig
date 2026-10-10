@@ -39,7 +39,7 @@ pub fn encode(gpa: Allocator, input: []const u8) ![]u8 {
     } else {
         try match.parse_lazy(gpa, input, window, &commands);
     }
-    const histograms = command_module.Histograms.count(input, commands.items);
+    const histograms = command_module.Histograms.count(input, commands.items, window);
     // The smallest of: the bytes stored, the literals' contexts clustered,
     // one literal code (a small file's contexts may not pay for codes).
     // Written, not estimated: writing is quick beside parsing.
@@ -155,8 +155,8 @@ fn write_compressed(
     var distances: command_module.DistanceCache = .{};
     var position: usize = 0;
     for (commands) |command| {
-        assert(command.distance <= window or command.copy == 0);
-        const entry = command_module.code(command, &distances);
+        const reach = command_module.distance_max(window, position + command.insert);
+        const entry = command_module.code(command, &distances, reach);
         try insert_copy_code.write(writer, gpa, entry.insert_copy);
         try writer.write(gpa, entry.insert_extra, entry.insert_extra_bits);
         try writer.write(gpa, entry.copy_extra, entry.copy_extra_bits);
@@ -164,7 +164,7 @@ fn write_compressed(
             const code = &literal_codes[clusters.map[context.at(input, at)]];
             try code.write(writer, gpa, input[at]);
         }
-        position += command.insert + command.copy;
+        position += command.insert + command.out;
         if (command.copy == 0) continue; // the last: the decoder stops here
         if (entry.distance) |symbol| {
             try distance_code.write(writer, gpa, symbol);
