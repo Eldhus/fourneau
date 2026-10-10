@@ -1611,3 +1611,34 @@ Not a public benchmark tonight: a race of compression compares defaults
 so a static-file workload needs the owner's choices; proposed in the
 dragrace's TODO. Nothing to teach in the tutor: brotli is invisible to a
 roux app.
+
+## 2026-10-10: HTTP/2 planned; HPACK
+
+The plan is docs/http2.md, with the attack record read first: Rapid
+Reset (CVE-2023-44487), the CONTINUATION flood (2024), and MadeYouReset
+(CVE-2025-8671, August 2025), which makes the server reset streams so
+that limits counting only the client's resets miss them. The answer is
+in the data: a stream's slot, and its fiber, count against the limit
+until its handler returns, whatever the protocol says.
+
+`hpack.zig`, sans-IO. Found while reading RFC 7541: its Huffman code is
+canonical (checked against all 257 of its codes), so the table is the
+257 lengths and the codes are derived at comptime, nothing transcribed
+as hex. The dynamic table is a ring of entries over a byte buffer twice
+its size, its live bytes always one run, moved to the start when the end
+is reached. The decoder copies every name and value into the caller's
+buffer, which is also where the header list's bound lives (an HPACK
+bomb's repeated large entry fills it and is refused). The encoder never
+indexes: no table to keep in step, nothing for a peer to probe (RFC 7541
+§7.1).
+
+Tests: Appendix C's six worked examples (requests with and without
+Huffman, responses with a 256-byte table and its evictions) decode to
+the RFC's lists and table sizes, first run (one expectation broken by
+hand fails, so they run); every byte through Huffman and back, and the
+RFC's own coding of "www.example.com"; the table through 4,000 random
+additions and resizes against a plain model of what it must hold;
+20,000 random and damaged blocks refused or decoded within bounds;
+eight malformed blocks refused (index 0, an empty table's index, a size
+update after a field or past the limit, bad padding, EOS inside a
+string, a string past the block, an integer too long); the bomb.
