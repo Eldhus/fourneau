@@ -56,7 +56,9 @@
       nothing a visitor would see, and nothing to teach).
    2. ~~Graceful shutdown~~ (done 2026-10-09, DIARY; roux's host too.
       No public benchmark, nothing to teach: it is invisible when right).
-   3. Zero-copy static sends (M6).
+   3. ~~Zero-copy static sends~~ (M6): measured, not built (2026-10-09,
+      DIARY, DESIGN): no use in the owner's setup (HTTPS, small files);
+      the owner may overrule.
    4. Brotli, our encoder (M6); a compression benchmark?
    5. HTTP/2 (M9); a dragrace workload.
    6. Graceful restart (M10). Old and new processes overlap, so it
@@ -67,7 +69,7 @@
       limit.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). 1 and 2 done; starting 3.
+     release (checked). 1, 2 and 3 done; starting 4.
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
@@ -109,11 +111,12 @@ roux (its TODO): M4 and M5 are roux's; M6 and M10 have a half in each.
 ### M6. Static files and compression
 
 - Static files (ETag; gzip copies made at load and single byte ranges,
-  done 2026-10-06; zero-copy), and
-  `fourneau-static`, the pure-Zig static file server.
+  done 2026-10-06; kernel zero-copy measured and not built, 2026-10-09:
+  DESIGN), and `fourneau-static`, the pure-Zig static file server.
 - Compression: gzip from the standard library; then our own brotli
   encoder (RFC 7932).
-- Graceful shutdown; idle eviction under pressure (done 2026-10-06).
+- Graceful shutdown (done 2026-10-09); idle eviction under pressure
+  (done 2026-10-06).
 - Streamed responses (server-sent events): a chunked head, a chunk per
   send, coalesced in the send buffer, the last chunk at the end; a
   stream the handler abandons closes without it (done 2026-10-06, for

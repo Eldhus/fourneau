@@ -1391,3 +1391,30 @@ ring.
 A note on tools: `git apply` of a patch into a scratch worktree was
 refused by the no-shell-edits hook, though the scratchpad is allowed;
 the variant was built by editing the real tree and editing it back.
+
+## 2026-10-09: zero-copy sends, measured and not built
+
+What zero-copy could still remove: a body too large for the send buffer
+already goes out from the file's memory behind its head (`write_all`),
+so the copy left is the kernel's, into socket buffers. Upper bound,
+measured: fourneau-static (ReleaseFast, one shard on CPUs 0-1) serving a
+48 KiB file to `fourneau-load` (32 connections, CPUs 2-7), 119-125k
+requests/s, `perf record -g`: `rep_movs_alternative` (the copy) 22.2%
+of the server's samples, `clear_highpages_kasan_tagged` 19.4% (this
+Arch kernel zeroes every page it allocates, `init_on_alloc`: the socket
+buffers' fresh pages). `SEND_ZC` would hand the file's pages to the
+socket and skip both, on a real NIC; on loopback the kernel copies at
+delivery anyway, so the laptop cannot measure the gain. (64 KiB failed:
+fourneau-load holds a response in 64 KiB, head included.)
+
+Then the doubt: who would use it? kTLS's `tls_sw_sendmsg` refuses every
+flag but MORE, DONTWAIT, NOSIGNAL, CMSG_COMPAT, SPLICE_PAGES, EOR and
+SENDPAGE_NOPOLICY with `EOPNOTSUPP` (net/tls/tls_sw.c, master), and
+io_uring's `SEND_ZC` always adds `MSG_ZEROCOPY` (io_uring/net.c): over
+HTTPS it cannot work, and the only zero-copy path, spliced pages, ends
+in the kernel's encryption, a pass over the bytes anyway. The owner's
+sites are HTTPS with files of 2-4 KB gzipped; the dragrace's races have
+no static workload. So it is not built (bespoke, not a product), and
+DESIGN's promise of "zero-copy sends, which kTLS keeps working over
+HTTPS" was wrong: corrected. Revisit when a site serves large files, or
+for a static-file race.

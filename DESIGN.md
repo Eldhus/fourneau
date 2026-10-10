@@ -184,9 +184,17 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   (experiment 18's +15%); a client's KeyUpdate closes the connection (the
   kernel will not decode it for us); no ML-KEM hybrid until tls.zig's
   server has one.
-- **static files and compression** (M6; ETag today): answered in fourneau, never entering
-  the application: ETag and Last-Modified, Range, precompressed variants,
-  zero-copy sends (which kTLS keeps working over HTTPS). Responses are
+- **static files and compression** (M6): answered in fourneau, never entering
+  the application: ETag, Range, precompressed variants, all made at load
+  from memory. A body too large for the send buffer goes out straight
+  from the file's memory, behind its head: no copy in user space. No
+  kernel zero-copy (io_uring `SEND_ZC`), decided 2026-10-09 on numbers
+  (DIARY): it would pay only for large files over plain HTTP (at 48 KiB
+  on loopback, the kernel's copy and the zeroing of fresh socket pages
+  were ~40% of the server's cycles), and the sites are HTTPS, where kTLS
+  refuses `MSG_ZEROCOPY` (`EOPNOTSUPP`; only spliced pages pass, and the
+  kernel encrypts from them anyway), with files of a few KB gzipped.
+  Revisited if a site serves large files. Responses are
   compressed with gzip (`std.compress.flate`) and brotli, whose encoder
   is ours (RFC 7932; the standard library has none). `fourneau-static` is
   a pure-Zig static file server on the same code: an example, and the
