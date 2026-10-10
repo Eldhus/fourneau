@@ -67,8 +67,7 @@
       last ~1-3%).
    5. ~~HTTP/2 (M9); a dragrace workload~~ (done 2026-10-10, DIARY;
       the workload waits on the dragrace's branch `after-race`, with
-      roux's branch `after-race`, for the owner to merge after tonight's
-      race).
+      roux's branch `after-race`, for the owner to merge).
    6. ~~Graceful restart (M10)~~ (done 2026-10-10, DIARY): systemd's
       socket activation, stop then start, none refused (`listen.zig`);
       roux's wait for locked memory moved here; ACME's responder on the
@@ -82,8 +81,8 @@
       M11's other half, the static server against Go's FileServer,
       tower-http's ServeDir and Caddy, is in that doc's "Next".
    - Where it stands (2026-10-10): every item done; Zig 0.17.0 still the
-     newest release (checked again: master is 0.18.0-dev.131). After the
-     race, the owner merges the `after-race` branches of roux and
+     newest release (checked again: master is 0.18.0-dev.131). The
+     owner merges the `after-race` branches of roux and
      fourneau-dragrace (each needs fourneau main pushed first) and runs
      `site install-server` for the socket units. 1 to 4 done. 5, HTTP/2: planned in
      docs/http2.md (layers: HPACK, frames, the connection's state
@@ -99,10 +98,13 @@
      found by oha and a real-kernel test, not deterministically); each
      connection slot's machine is ~110 KB (its head and block buffers
      could shrink, or machines come from a pool smaller than the slots).
-   - **The owner's decision, before the 05:00 race:** another session's
+   - **The owner's decision, before the next race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
-     not build against fourneau main (checked). Either:
+     not build against fourneau main (checked). Nothing was pushed, and
+     the 2026-10-10 05:00 run failed as this predicted ("the build: no
+     build after 45m0s", on fourneau `643abe2`, roux `333e773`; the site
+     still shows 2026-10-09's race). Each run fails so until one of:
      (a) the race as it is: push roux's branch `race-safe` (`158cfe5`,
      on `333e773`: the two host files back; builds against fourneau
      main, checked) to roux's main; local roux main then needs a merge
