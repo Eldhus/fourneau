@@ -15,6 +15,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const tables = @import("brotli_tables.zig");
 const command_module = @import("brotli_command.zig");
+const context = @import("brotli_context.zig");
 const match = @import("brotli_match.zig");
 
 const Allocator = std.mem.Allocator;
@@ -33,18 +34,28 @@ const candidates_max = 16;
 /// bytes, 3 rounds 7,126, 6 rounds 7,125.
 pub const rounds = 3;
 
-/// Bits per symbol, from the counts of the last parse.
+/// Bits per symbol, from the counts of the last parse: literals by the
+/// code their context's cluster uses, as they will be written.
 const Model = struct {
-    literal: [256]f32,
+    literal: [context.contexts][256]f32,
+    map: [context.contexts]u8,
     insert_copy: [704]f32,
     distance: [command_module.distance_alphabet]f32,
 
     fn from(histograms: *const Histograms) Model {
         var model: Model = undefined;
-        bits(&histograms.literals, &model.literal);
+        const clusters = context.cluster(&histograms.literals);
+        model.map = clusters.map;
+        for (clusters.histograms[0..clusters.trees], 0..) |*counts, tree| {
+            bits(counts, &model.literal[tree]);
+        }
         bits(&histograms.insert_copy, &model.insert_copy);
         bits(&histograms.distances, &model.distance);
         return model;
+    }
+
+    fn literal_bits(model: *const Model, input: []const u8, position: usize) f32 {
+        return model.literal[model.map[context.at(input, position)]][input[position]];
     }
 
     /// -log2 of each symbol's share, smoothed so an unseen symbol costs
@@ -158,7 +169,7 @@ fn shortest_path(
         const node = nodes[position];
         assert(node.cost < std.math.inf(f32)); // a literal reaches every node
         relax(nodes, position + 1, .{
-            .cost = node.cost + model.literal[input[position]],
+            .cost = node.cost + model.literal_bits(input, position),
             .length = 0,
             .distance = 0,
             .insert = node.run() + 1,

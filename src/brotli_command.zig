@@ -6,6 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const tables = @import("brotli_tables.zig");
+const context = @import("brotli_context.zig");
 
 /// `insert` literals, then `copy` bytes from `distance` back; the last
 /// command may copy nothing.
@@ -164,8 +165,9 @@ pub fn code_distance(distance: u32, coded: *Coded) void {
 }
 
 /// How often each symbol occurs in a parse: what its codes are made from.
+/// Literals by their context (`brotli_context.zig`).
 pub const Histograms = struct {
-    literals: [256]u32 = @splat(0),
+    literals: [context.contexts]context.Histogram = @splat(@splat(0)),
     insert_copy: [704]u32 = @splat(0),
     distances: [distance_alphabet]u32 = @splat(0),
 
@@ -174,7 +176,9 @@ pub const Histograms = struct {
         var distances: DistanceCache = .{};
         var position: usize = 0;
         for (commands) |command| {
-            for (input[position..][0..command.insert]) |byte| histograms.literals[byte] += 1;
+            for (position..position + command.insert) |at| {
+                histograms.literals[context.at(input, at)][input[at]] += 1;
+            }
             const coded = code(command, &distances);
             histograms.insert_copy[coded.insert_copy] += 1;
             if (coded.distance) |symbol| histograms.distances[symbol] += 1;

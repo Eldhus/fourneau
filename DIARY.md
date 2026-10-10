@@ -1514,3 +1514,26 @@ of zeros: 5 ms; 2 MB: 53 ms; index.html 39 ms. Sizes unchanged.
 
 Still 13% over the reference's q10 on index.html: its next edge is
 context modeling.
+
+## 2026-10-10: brotli encoder, pass 3: literal contexts
+
+Each literal's code chosen by its context (UTF8 mode: the two bytes
+before it), 64 contexts clustered greedily (merge the pair whose union
+costs least over its parts, while that saves bits; at most 16 codes), a
+context map without run-lengths. Contexts depend only on the input, so
+the parser prices each literal by its own context's code.
+
+index.html 7,126 to 6,648 (-6.7%), DESIGN.md -3.5%, style.css -3.0%,
+datastar -2.7%, server.zig -1.4%. But small files got worse (latest.json
+857 to 878, favicon.svg 211 to 214): my estimate of a code's description
+(four bits a symbol, twenty for the header) is optimistic, and small
+files were split into codes they cannot pay for. Rather than tune an
+estimate, the encoder now writes the meta-block both ways (clustered, one
+code; and stored) and keeps the smallest: writing is quick beside
+parsing. Small files back to 859 and 211. Clustering recomputed every
+pair after each merge (random.bin 577 ms): now a table of pair savings,
+recomputed for the merged cluster only (85 ms).
+
+Against the reference q10: datastar +2.8%, index.html +5.5%, style.css
++7%, but demo.js +14%, README.md +18%, latest.json +35%: the small files
+lack what they cannot find in themselves, the static dictionary.
