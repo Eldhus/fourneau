@@ -163,6 +163,8 @@ pub const Sim = struct {
     connections: []Connection,
     backlog: []u32,
     backlog_count: u32 = 0,
+    /// The server closed its listening socket (a drain).
+    listener_closed: bool = false,
     /// Fiber indices to choose among, reused each pick.
     runnable: []u32,
 
@@ -442,6 +444,7 @@ pub const Sim = struct {
     }
 
     fn accept(sim: *Sim) Io.Cancelable!net.Socket {
+        assert(!sim.listener_closed);
         for (0..std.math.maxInt(u32)) |_| {
             if (sim.backlog_count > 0) {
                 const index = sim.backlog[0];
@@ -512,9 +515,25 @@ pub const Sim = struct {
     }
 
     fn close(sim: *Sim, fd: i32) void {
+        if (fd == listener_fd) return sim.close_listener();
         const index = sim.connection_of(fd);
         sim.connections[index].server_closed = true;
         sim.release_if_done(index);
+    }
+
+    /// As the kernel does: connections waiting in the backlog are reset
+    /// (each client sees its connection end, never answered), and every
+    /// later connect is refused.
+    fn close_listener(sim: *Sim) void {
+        assert(!sim.listener_closed);
+        sim.listener_closed = true;
+        for (sim.backlog[0..sim.backlog_count]) |index| {
+            const connection = &sim.connections[index];
+            assert(connection.state == .backlog);
+            connection.state = .open;
+            connection.server_closed = true;
+        }
+        sim.backlog_count = 0;
     }
 
     fn shutdown(sim: *Sim, fd: i32, how: net.ShutdownHow) void {
@@ -539,6 +558,7 @@ pub const Sim = struct {
     // --- the network: the client's side (for sim_client) --------
 
     pub fn client_connect(sim: *Sim) ?u32 {
+        if (sim.listener_closed) return null; // refused
         if (sim.backlog_count == sim.backlog.len) return null;
         for (sim.connections, 0..) |*connection, index| {
             if (connection.state != .free) continue;

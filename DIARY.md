@@ -1333,3 +1333,61 @@ silent in release). kTLS fails a read with EIO when the next record is
 not data and no control buffer asks for its type: curl's close_notify.
 It is TLS's end of stream, now read as one; verified by curl, a test is
 in the Todo.
+
+## 2026-10-09: the drain, second pass: event streams, the listener, a race
+
+Wiring the drain into roux showed what the first pass missed. `roux dev`
+restarts the app with SIGTERM, and the dragrace site's pages keep an
+event stream open per tab: a drain waits for requests in flight, and an
+event stream never finishes, so every restart would have waited out the
+10 s deadline. Changed:
+
+- Event streams end at once. A stream whose head says `Content-Type:
+  text/event-stream` is marked `endless`; each tick of a drain shuts
+  those (one started during the drain, too), and EventSource reconnects
+  by design. Other chunked streams are requests in flight and keep the
+  deadline.
+- The listener closes at the drain's start, as Go and nginx do: left
+  open, new clients queued unanswered until exit, then were reset.
+  Closing our descriptor does not close a socket a successor shares.
+- At the deadline, `group.cancel` too, for a handler waiting on
+  something other than its connection (roux's event streams wait on a
+  futex).
+- roux's host drains only in production: `roux dev` wants its restart.
+
+The simulator could not see the first: its "streams" end by themselves.
+A first check ("an event stream still arriving after the drain") failed
+seed 287 wrongly, on a stream the server had ended whose last bytes were
+crossing a 16-byte window. So the simulator now has event streams as
+they are: `/events/n/k` sends its pieces round after round until a send
+fails; the client checks one round against the model and hangs up with
+a reset (a page left); during a drain it accepts the stream ended
+anywhere, and fails if it outlives two server ticks and a few network
+turns. A closed listener refuses connects and resets its backlog, and a
+stopped run fails if any client is left queued. 3,000 seeds pass (1,473
+stopped: 952 idle closed, 156 event streams ended, 25 cut at deadlines,
+900 refused or reset). Injected: no event-stream drain (caught, seed
+97); listener left open (caught by the queue check, seed 2; not before
+it). The `endless` flag first outlived its stream, which an assertion
+caught at once: `stream_end` clears it.
+
+Then, under load, fourneau-hello crashed in one SIGTERM of eleven: EBADF
+from shutting an idle connection, after a stall of seconds. The port's
+`netShutdown` went through the ring: the timekeeper submitted a
+shutdown and yielded until it completed; meanwhile the connection's own
+fiber could close the socket, and io_uring does not order unlinked
+operations, so the shutdown, punted to a worker, ran after the close.
+The race was always there for timeouts and eviction; the drain, shutting
+many sockets at once, made it show. A shutdown never blocks, so it is
+now the system call (as bind already was): no fiber runs between the
+look at a socket and its shutdown, and the timekeeper's scans no longer
+yield. Measured, interleaved, 40 SIGTERMs each under 400 connections of
+`fourneau-load`: the previous commit crashed 3 times (EBADF, after 2.4-5
+s), this one none, stopping in 107-220 ms. The simulator could not have
+found it: its shutdown is immediate. A lesson for the port: an
+operation used to wake another fiber must not itself go through the
+ring.
+
+A note on tools: `git apply` of a patch into a scratch worktree was
+refused by the no-shell-edits hook, though the scratchpad is allowed;
+the variant was built by editing the real tree and editing it back.

@@ -36,6 +36,11 @@ pub const Limits = struct {
     /// the server closes: a few network turns, always shorter than its idle
     /// timeout, so a server that waits for the client instead is caught.
     cut_short_silence_ticks_max: u32,
+    /// How long an event stream may go on once the server is told to stop
+    /// (or, started since, once it starts): a drain ends them at once.
+    /// Noticed at the server's next tick, ended by the one after, then the
+    /// end crosses the network.
+    drain_event_stream_ticks_max: u32,
 };
 
 pub const requests_max = 16;
@@ -88,6 +93,11 @@ pub const Target = union(enum) {
     /// `/abort/<n>/<k>`: the stream's first k/2 pieces, then the handler
     /// gives up: the response is cut short and the connection closed.
     abort: Stream,
+    /// `/events/<n>/<k>`: server-sent events (`text/event-stream`), the
+    /// stream's pieces over and over, with no end of its own: the client
+    /// checks one whole round and hangs up, as a page does when left. A
+    /// draining server ends it wherever it is. Never an empty piece.
+    events: Stream,
 };
 
 pub const Stream = struct {
@@ -155,6 +165,8 @@ pub const Failure = enum {
     closed_without_response,
     /// A stream cut short, and the connection left open.
     cut_short_not_closed,
+    /// An event stream a drain did not end.
+    event_stream_not_drained,
 };
 
 // --- generation ----------------------------------------------------------------
@@ -208,12 +220,14 @@ fn generate_target(prng: *Prng, limits: Limits) Target {
         .bytes = prng.int_at_most(u32, 0, limits.big_bytes_max),
         .pieces = prng.int_at_most(u8, 1, stream_pieces_max),
     };
-    return switch (prng.int_less_than(u32, 11)) {
+    const events: Stream = .{ .bytes = @max(stream.bytes, stream.pieces), .pieces = stream.pieces };
+    return switch (prng.int_less_than(u32, 12)) {
         0 => .root,
         1, 2 => .{ .status = statuses[prng.int_less_than(usize, statuses.len)] },
         3 => .{ .big = prng.int_at_most(u32, 0, limits.big_bytes_max) },
         4, 5 => .{ .stream = stream },
         6 => .{ .abort = stream },
+        7 => .{ .events = events },
         else => .{ .echo = prng.int_less_than(u32, 1_000_000) },
     };
 }
@@ -241,6 +255,8 @@ fn target_text(spec: *const Spec, out: []u8) []const u8 {
         .stream => |s| std.fmt.bufPrint(out, "/stream/{d}/{d}", .{ s.bytes, s.pieces }) catch
             unreachable,
         .abort => |s| std.fmt.bufPrint(out, "/abort/{d}/{d}", .{ s.bytes, s.pieces }) catch
+            unreachable,
+        .events => |s| std.fmt.bufPrint(out, "/events/{d}/{d}", .{ s.bytes, s.pieces }) catch
             unreachable,
     };
 }
@@ -393,19 +409,26 @@ fn big_body(length: u32, out: []u8) []const u8 {
     return out[0..length];
 }
 
-pub const StreamTarget = struct { stream: Stream, aborted: bool };
+pub const StreamTarget = struct {
+    stream: Stream,
+    kind: enum { stream, abort, events },
+};
 
-/// `/stream/<n>/<k>` or `/abort/<n>/<k>`, read back; null for any other
-/// path, and for one the clients never send.
+/// `/stream/<n>/<k>`, `/abort/<n>/<k>` or `/events/<n>/<k>`, read back;
+/// null for any other path, and for one the clients never send.
 pub fn stream_target(path: []const u8) ?StreamTarget {
-    const aborted = std.mem.startsWith(u8, path, "/abort/");
-    if (!aborted and !std.mem.startsWith(u8, path, "/stream/")) return null;
-    const rest = path[if (aborted) "/abort/".len else "/stream/".len..];
+    const prefixes = [_][]const u8{ "/stream/", "/abort/", "/events/" };
+    const kinds = [_]@FieldType(StreamTarget, "kind"){ .stream, .abort, .events };
+    const which = for (prefixes, 0..) |prefix, index| {
+        if (std.mem.startsWith(u8, path, prefix)) break index;
+    } else return null;
+    const rest = path[prefixes[which].len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
     const bytes = std.fmt.parseInt(u32, rest[0..slash], 10) catch return null;
     const pieces = std.fmt.parseInt(u8, rest[slash + 1 ..], 10) catch return null;
     if (pieces < 1 or pieces > stream_pieces_max) return null;
-    return .{ .stream = .{ .bytes = bytes, .pieces = pieces }, .aborted = aborted };
+    if (kinds[which] == .events and bytes < pieces) return null;
+    return .{ .stream = .{ .bytes = bytes, .pieces = pieces }, .kind = kinds[which] };
 }
 
 pub const Expectation = struct {
@@ -449,10 +472,12 @@ pub fn expect(spec: *const Spec, out: []u8) Expectation {
     expectation.head = spec.method == .HEAD;
     expectation.closes = spec.close;
     expectation.may_be_unavailable = spec.has_body();
+    // An event stream's expectation is its first round.
     const target = stream_target(path) orelse return expectation;
+    const aborted = target.kind == .abort;
     expectation.chunked = true;
-    expectation.cut_short = target.aborted;
-    const pieces = if (target.aborted) abort_pieces(target.stream.pieces) else target.stream.pieces;
+    expectation.cut_short = aborted;
+    const pieces = if (aborted) abort_pieces(target.stream.pieces) else target.stream.pieces;
     for (0..pieces) |index| {
         const piece = stream_piece(target.stream.bytes, target.stream.pieces, @intCast(index));
         if (piece.end == piece.start) continue;
@@ -585,7 +610,7 @@ pub fn parse_response(bytes: []const u8, head: bool, decoded: []u8) ParseResult 
         return .{ .response = response };
     }
     if (response.chunked) {
-        const chunks = switch (decode_chunks(bytes[parsed.body_start..], decoded)) {
+        const chunks = switch (decode_chunks(bytes[parsed.body_start..], decoded, null)) {
             .malformed => return .malformed,
             .chunks => |chunks| chunks,
         };
@@ -609,7 +634,7 @@ pub fn parse_cut_short(bytes: []const u8, decoded: []u8) ?Response {
     };
     if (!parsed.response.chunked) return null;
     const rest = bytes[parsed.body_start..];
-    const chunks = switch (decode_chunks(rest, decoded)) {
+    const chunks = switch (decode_chunks(rest, decoded, null)) {
         .malformed => return null,
         .chunks => |chunks| chunks,
     };
@@ -617,6 +642,31 @@ pub fn parse_cut_short(bytes: []const u8, decoded: []u8) ?Response {
     var response = with_chunks(parsed.response, chunks, parsed.body_start, decoded);
     response.cut_short = true;
     return response;
+}
+
+/// An event stream's first round: a chunked head, then `round` whole
+/// chunks; what follows is more events, not read. It never ends: a last
+/// chunk is malformed. A head that is not chunked is no stream (a 503
+/// refusing the request's body), to be read as an ordinary response.
+pub fn parse_events_round(
+    bytes: []const u8,
+    decoded: []u8,
+    round: u8,
+) union(enum) { incomplete, malformed, not_streamed, response: Response } {
+    const parsed = switch (parse_head(bytes)) {
+        .incomplete => return .incomplete,
+        .malformed => return .malformed,
+        .head => |parsed| parsed,
+    };
+    if (!parsed.response.chunked) return .not_streamed;
+    const rest = bytes[parsed.body_start..];
+    const chunks = switch (decode_chunks(rest, decoded, round)) {
+        .malformed => return .malformed,
+        .chunks => |chunks| chunks,
+    };
+    if (chunks.last) return .malformed;
+    if (chunks.count < round) return .incomplete;
+    return .{ .response = with_chunks(parsed.response, chunks, parsed.body_start, decoded) };
 }
 
 fn with_chunks(response: Response, chunks: Chunks, body_start: usize, decoded: []u8) Response {
@@ -640,8 +690,14 @@ const Chunks = struct {
 /// The whole chunks at the start of a chunked body, as fourneau writes
 /// them: lowercase hex sizes with no leading zero, no extensions, data,
 /// CRLF; the last chunk `0` with no trailers. More chunks than a stream
-/// has pieces is malformed too.
-fn decode_chunks(bytes: []const u8, decoded: []u8) union(enum) { malformed, chunks: Chunks } {
+/// has pieces is malformed too, except for an event stream, read only
+/// as far as `stop_after` chunks (its first round).
+fn decode_chunks(
+    bytes: []const u8,
+    decoded: []u8,
+    stop_after: ?u8,
+) union(enum) { malformed, chunks: Chunks } {
+    if (stop_after) |count| assert(count >= 1 and count <= stream_pieces_max);
     var chunks: Chunks = .{
         .sizes = @splat(0),
         .count = 0,
@@ -650,6 +706,7 @@ fn decode_chunks(bytes: []const u8, decoded: []u8) union(enum) { malformed, chun
         .last = false,
     };
     for (0..stream_pieces_max + 2) |_| {
+        if (stop_after == chunks.count) return .{ .chunks = chunks };
         const rest = bytes[chunks.consumed..];
         const line_end = std.mem.indexOf(u8, rest, "\r\n") orelse {
             // Up to 16 digits may still be on their way; more cannot be.
@@ -729,6 +786,7 @@ test "sim_client: requests are well-formed and answers agree with the model" {
         .idle_ticks_max = 10,
         .pause_ticks_max = 10,
         .cut_short_silence_ticks_max = 10,
+        .drain_event_stream_ticks_max = 30,
     };
     var prng = Prng.init(1);
     var request_buffer: [request_bytes_max]u8 = undefined;
@@ -808,6 +866,9 @@ pub const Client = struct {
     /// It may then close after any response, and say so, and close a
     /// connection it accepted but could not serve.
     server_draining: bool = false,
+    drain_tick: u64 = 0,
+    /// When the response being received began to arrive.
+    first_byte_tick: u64 = 0,
     stats: Stats = .{},
 
     pub const Stats = struct {
@@ -820,6 +881,10 @@ pub const Client = struct {
         cut_short: u32 = 0,
         /// Connections a draining server closed before any response.
         shut_out: u32 = 0,
+        /// Event streams a draining server ended.
+        streams_drained: u32 = 0,
+        /// Event streams heard for a whole round, then left.
+        event_rounds: u32 = 0,
     };
 
     pub fn init(client: *Client, seed: u64, limits: Limits, start_tick: u64) void {
@@ -842,13 +907,20 @@ pub const Client = struct {
         client.state = .running;
         // A pause holds back writing only: a client always reads what
         // arrives, so a pause never stalls the server's sends.
-        if (client.connection) |connection| {
+        if (client.connection != null) {
             const before = client.response_bytes;
             client.receive(io);
-            if (client.response_bytes != before) client.last_byte_tick = tick;
+            if (client.response_bytes != before) {
+                if (before == 0) client.first_byte_tick = tick;
+                client.last_byte_tick = tick;
+            }
             if (client.failure != .none) return;
+        }
+        // Still connected: an event stream heard whole has hung up.
+        if (client.connection) |connection| {
             if (io.client_sees_end(connection)) return client.on_end(io);
             client.check_cut_short_closes(tick);
+            client.check_event_stream_drained(tick);
         }
         if (tick < client.wake_tick) return;
         if (client.connection == null) {
@@ -895,6 +967,25 @@ pub const Client = struct {
         }
     }
 
+    /// The server is told to stop, from this tick: it may close after any
+    /// response, and must end event streams promptly.
+    pub fn drain_started(client: *Client, tick: u64) void {
+        assert(!client.server_draining);
+        client.server_draining = true;
+        client.drain_tick = tick;
+    }
+
+    /// A draining server ends an event stream promptly: one still arriving
+    /// well after the drain began (or after it began, if later) was missed.
+    fn check_event_stream_drained(client: *Client, tick: u64) void {
+        if (client.response_bytes == 0 or !client.drained_event_stream()) return;
+        const since = @max(client.drain_tick, client.first_byte_tick);
+        assert(tick >= since);
+        if (tick - since > client.limits.drain_event_stream_ticks_max) {
+            client.fail(.event_stream_not_drained);
+        }
+    }
+
     fn fail(client: *Client, failure: Failure) void {
         assert(failure != .none);
         if (client.failure != .none) return;
@@ -913,8 +1004,51 @@ pub const Client = struct {
         }
         for (0..requests_max * 2 + 1) |_| {
             if (client.response_bytes == 0 or client.failure != .none) return;
+            if (client.receiving_events()) |stream| {
+                if (client.take_events(io, stream)) return;
+            }
             if (!client.take_response()) return;
         }
+    }
+
+    /// The response being received is an event stream's (a HEAD's is a
+    /// plain head, and taken as one).
+    fn receiving_events(client: *const Client) ?Stream {
+        if (client.receive_index == client.specs_count) return null;
+        const spec = &client.specs[client.receive_index];
+        if (spec.kind != .valid or spec.method == .HEAD) return null;
+        return switch (spec.target) {
+            .events => |stream| stream,
+            else => null,
+        };
+    }
+
+    /// An event stream: once its first round is here, check it against the
+    /// model and hang up, with a reset, as a page that is left does: the
+    /// server's next send fails. False: not a stream after all, but an
+    /// ordinary response for `take_response`.
+    fn take_events(client: *Client, io: anytype, stream: Stream) bool {
+        const bytes = client.response[0..client.response_bytes];
+        const response = switch (parse_events_round(bytes, &client.decoded, stream.pieces)) {
+            .incomplete => return true,
+            .malformed => {
+                client.fail(.response_malformed);
+                return true;
+            },
+            .not_streamed => return false,
+            .response => |response| response,
+        };
+        client.check(&client.specs[client.receive_index], response);
+        if (client.failure != .none) return true;
+        client.receive_index += 1;
+        client.connection_responses += 1;
+        client.stats.responses += 1;
+        client.stats.event_rounds += 1;
+        client.response_bytes = 0;
+        io.client_reset(client.connection.?);
+        client.connection = null;
+        client.send_offset = 0;
+        return true;
     }
 
     /// Parse and check one response; false when it is not all here yet.
@@ -998,6 +1132,15 @@ pub const Client = struct {
         if (!std.mem.eql(u8, response.body, expected.body)) return client.fail(.response_wrong);
     }
 
+    /// The response being received is an event stream, and the server is
+    /// draining: it may end anywhere.
+    fn drained_event_stream(client: *const Client) bool {
+        if (!client.server_draining) return false;
+        if (client.receive_index == client.specs_count) return false;
+        const spec = &client.specs[client.receive_index];
+        return spec.kind == .valid and spec.target == .events;
+    }
+
     /// What is left, taken as a stream cut short, when the request was for
     /// one; false when it was not, or the bytes are not one.
     fn take_cut_short(client: *Client) bool {
@@ -1019,6 +1162,12 @@ pub const Client = struct {
 
     /// The server closed the connection and everything it sent is read.
     fn on_end(client: *Client, io: anytype) void {
+        if (client.response_bytes > 0 and client.drained_event_stream()) {
+            // Ended by the drain, wherever it was, as EventSource allows.
+            client.receive_index += 1;
+            client.stats.streams_drained += 1;
+            client.response_bytes = 0;
+        }
         if (client.response_bytes > 0) {
             // A stream the application gave up on: what it sent, then the
             // end, is its response. Anything else left over is truncation.
@@ -1081,10 +1230,12 @@ pub const Client = struct {
         if (client.send_index == client.receive_index) return true;
         if (client.send_offset > 0) return true; // finish what was begun
         // Pipeline only after a request that leaves the connection open
-        // and needs no interim answer.
+        // and needs no interim answer (an event stream is left by
+        // hanging up).
         const previous = &client.specs[client.send_index - 1];
         const keeps_open = previous.kind == .valid and !previous.close and
-            !previous.expect_continue and previous.target != .abort;
+            !previous.expect_continue and previous.target != .abort and
+            previous.target != .events;
         return client.behavior.pipeline and keeps_open;
     }
 

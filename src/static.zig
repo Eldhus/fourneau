@@ -180,8 +180,7 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
     var app: App = .{ .site = shared.site };
     var server = try Server.init(gpa, io, &app, listener, config);
-    defer server.deinit(gpa);
-    defer server.listener.deinit(io);
+    defer server.deinit(gpa); // its listener closed by the drain
     var group: std.Io.Group = .init;
     var redirect: Redirect = undefined;
     var redirect_server: Redirect.Server = undefined;
@@ -193,8 +192,5 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     }
     try server.run();
     try group.await(io); // the redirect drains too
-    if (options.https.redirect_port != null) {
-        redirect_server.listener.deinit(io);
-        redirect_server.deinit(gpa);
-    }
+    if (options.https.redirect_port != null) redirect_server.deinit(gpa);
 }

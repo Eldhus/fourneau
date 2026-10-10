@@ -9,6 +9,8 @@ pub const tls = @import("tls.zig");
 pub const acme = @import("acme.zig");
 pub const https = @import("https.zig");
 pub const site = @import("site.zig");
+/// Stopping on SIGTERM and SIGINT: every shard drains.
+pub const stop = @import("stop.zig");
 /// Our random numbers, for importers' seeded tests (roux's host): tidy
 /// refuses the standard library's, whose sequences may change.
 pub const prng = @import("prng.zig");

@@ -124,7 +124,9 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   head, response scratch). Deadlines are one array of `u32` ticks, set
   without reading the clock; a single timekeeper fiber scans it each tick
   and shuts expired sockets down, so the fiber waiting on one reads 0 and
-  closes. Response heads are written without `std.fmt` (status lines
+  closes. The shutdown is a plain system call, not a ring operation: it
+  never blocks, so a scan never yields, and no fiber can close a socket
+  between the scan's look at it and its shutdown. Response heads are written without `std.fmt` (status lines
   built at comptime, a digit loop, table-driven header checks, the Date
   refreshed per tick; experiment 7). Pipelined responses are coalesced:
   the send buffer is flushed only before a read that may block
@@ -139,13 +141,18 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   by one thread (blocked in all others) and sets a flag each shard's
   timekeeper reads once a tick; nothing crosses threads but that. The
   shard drains, as Go's `Shutdown` and nginx's quit do: it cancels its
-  accept loop (the listening socket stays untouched, so a successor
-  that shares it loses nothing: M10), closes connections idle between
-  requests (shut for reading, as eviction does), answers what is in
-  flight with `Connection: close`, and at the drain's deadline (10 s)
-  shuts what is left; `run` returns when the last connection has
+  accept loop and closes its listening socket, so new clients are
+  refused at once rather than queued until exit (a successor that
+  shares the socket holds its own descriptor: M10); closes connections
+  idle between requests (shut for reading, as eviction does); answers
+  what is in flight with `Connection: close`; ends event streams
+  (`text/event-stream`) at once, since they have no end to wait for and
+  their clients reconnect; and at the drain's deadline (10 s) shuts what
+  is left and cancels its fibers, for a handler waiting on something
+  other than its connection. `run` returns when the last connection has
   closed, and the process when every shard has. A second signal exits
-  at once. Measured: 200 busy connections drain in ~210 ms (two ticks).
+  at once. Measured: 400 busy connections drain in 110-220 ms (one or
+  two ticks).
 - **http1**: request line, headers, `Content-Length` and chunked bodies,
   keep-alive. It is strict where looseness is how smuggling happens
   (RFC 9112 §6.3, §11.2): both `Content-Length` and `Transfer-Encoding`,
