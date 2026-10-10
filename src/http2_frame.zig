@@ -115,6 +115,9 @@ pub const Frame = union(enum) {
         fragment: []const u8,
         end_stream: bool,
         end_headers: bool,
+        /// Its priority names itself: a stream error (section 5.3.1), but
+        /// only once its block is decoded, or the table falls out of step.
+        depends_on_itself: bool,
     };
 
     pub const WindowUpdate = struct { stream: u31, increment: u31 };
@@ -218,11 +221,10 @@ fn parse_data(header: Header, payload: []const u8) Parsed {
 fn parse_headers(header: Header, payload: []const u8) Parsed {
     if (header.stream == 0) return connection_error(.protocol_error);
     var fragment = unpad(header.flags, payload) orelse return connection_error(.protocol_error);
+    var depends_on_itself = false;
     if (header.flags & flag_priority != 0) {
         if (fragment.len < 5) return connection_error(.frame_size_error);
-        if (dependency(fragment) == header.stream) {
-            return stream_error(.protocol_error, header.stream);
-        }
+        depends_on_itself = dependency(fragment) == header.stream;
         fragment = fragment[5..];
     }
     return .{ .frame = .{ .headers = .{
@@ -230,6 +232,7 @@ fn parse_headers(header: Header, payload: []const u8) Parsed {
         .fragment = fragment,
         .end_stream = header.flags & flag_end_stream != 0,
         .end_headers = header.flags & flag_end_headers != 0,
+        .depends_on_itself = depends_on_itself,
     } } };
 }
 
@@ -385,7 +388,6 @@ test "http2_frame: each type's refusals, as section 6 names them" {
     try expect_refusal(frame_header(.data, flag_padded, 1, 2), &.{ 2, 0 }, p, true);
     try expect_refusal(frame_header(.data, flag_padded, 1, 0), "", p, true);
     try expect_refusal(frame_header(.headers, 0, 0, 1), "x", p, true);
-    try expect_refusal(frame_header(.headers, flag_priority, 3, 5), &.{ 0, 0, 0, 3, 16 }, p, false);
     try expect_refusal(frame_header(.headers, flag_priority, 3, 4), &.{ 0, 0, 0, 1 }, size, true);
     try expect_refusal(frame_header(.priority, 0, 0, 5), &.{ 0, 0, 0, 1, 16 }, p, true);
     try expect_refusal(frame_header(.priority, 0, 1, 4), &.{ 0, 0, 0, 3 }, size, false);
@@ -423,6 +425,10 @@ test "http2_frame: padding, priority and unknown types are taken apart" {
     const fields = parse(headers, &.{ 1, 0, 0, 0, 3, 16, 0x82, 0x84, 0 }).frame.headers;
     try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x84 }, fields.fragment);
     try std.testing.expect(fields.end_headers and !fields.end_stream);
+    try std.testing.expect(!fields.depends_on_itself);
+    const itself = parse(frame_header(.headers, flag_priority, 3, 6), &.{ 0, 0, 0, 3, 16, 0x82 });
+    try std.testing.expect(itself.frame.headers.depends_on_itself);
+    try std.testing.expectEqualSlices(u8, &.{0x82}, itself.frame.headers.fragment);
     const unknown: Type = @fromBackingInt(0xfa);
     try std.testing.expect(parse(frame_header(unknown, 0, 9, 1), "?").frame == .unknown);
     // The reserved bit of an increment is ignored.
