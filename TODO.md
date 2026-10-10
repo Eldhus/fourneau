@@ -71,10 +71,15 @@
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
-     not build against fourneau main (checked). Either push roux's
-     branch `race-safe` as main (`158cfe5`: the two host files back;
-     builds against fourneau main, checked), or push fourneau `d43d791`
-     with the dragrace's fourneau-zig competitor given `fibers_max`.
+     not build against fourneau main (checked). Either:
+     (a) the race as it is: push roux's branch `race-safe` (`158cfe5`,
+     on `333e773`: the two host files back; builds against fourneau
+     main, checked) to roux's main; local roux main then needs a merge
+     of it before its own next push. Or
+     (b) everything: push fourneau main first, then roux main
+     (`dda7f80`: the pool and the drain) and fourneau-dragrace main
+     (`b9ffad1`: fourneau-zig gives `fibers_max`; built and served,
+     checked). The race then runs the pool and the drain.
 
 ## Plan
 
