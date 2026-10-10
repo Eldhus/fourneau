@@ -1853,3 +1853,13 @@ starts):
 
 The slowest is a client that waited through a restart in the queue: the
 drain (the stop flag is read once a tick, 100 ms) and the start.
+
+Then a trap, found reading acme.zig before writing the site's units: the
+http-01 responder binds port 80 itself while ACME validates, which
+fails when systemd holds 80, so the daily restart could never renew the
+certificate. It takes systemd's socket now (`acme_http_listener`,
+`http_listener`), a copy, and it no longer shuts down a socket it did
+not bind: shutting a listening socket down stops it listening for every
+copy, the redirect after it included. It polls instead, seeing its stop
+within 100 ms. A test answers a challenge on a held socket and finds it
+still listening after; with the shutdown put back, it fails.

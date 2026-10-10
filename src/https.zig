@@ -23,6 +23,9 @@ pub const Options = struct {
     acme_state: ?[]const u8 = null,
     acme_profile: ?[]const u8 = null,
     acme_http_port: u16 = 80,
+    /// systemd's socket on that port, when it holds one (listen.zig):
+    /// ACME's responder accepts on it rather than binding the port.
+    acme_http_listener: ?std.posix.socket_t = null,
     acme_ca: ?[]const u8 = null,
     /// A plain-HTTP port that redirects to HTTPS (80 in production).
     redirect_port: ?u16 = null,
@@ -66,6 +69,7 @@ pub fn context(gpa: Allocator, io: Io, options: Options) !?*const tls.Context {
             .profile = options.acme_profile,
             .state_dir = state,
             .http_port = options.acme_http_port,
+            .http_listener = options.acme_http_listener,
             .ca_bundle_path = options.acme_ca,
         });
         cert = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ state, acme.cert_file });

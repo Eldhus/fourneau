@@ -38,6 +38,10 @@ pub const Options = struct {
     state_dir: []const u8,
     /// Where the CA connects for http-01: 80, or Pebble's 5002 in tests.
     http_port: u16 = 80,
+    /// A socket already listening there (systemd's, held across restarts:
+    /// listen.zig): the responder accepts on a copy of it, never binds,
+    /// never shuts it down.
+    http_listener: ?std.posix.socket_t = null,
     /// A PEM bundle to trust instead of the system's (Pebble's test root).
     ca_bundle_path: ?[]const u8 = null,
 };
@@ -308,7 +312,7 @@ fn obtain(arena: Allocator, io: Io, dir: Io.Dir, options: Options) !void {
     // The certificate's own key, new for every certificate.
     const certificate_key = crypto.KeyPair.generate(io);
     var responder: Responder = undefined;
-    try responder.start(io, options.http_port);
+    try responder.start(io, options.http_port, options.http_listener);
     defer responder.stop();
     // One identifier per certificate: one authorization, one answer.
     if (order.authorizations.len != 1) return error.AcmeUnexpectedAuthorizations;
@@ -445,6 +449,10 @@ fn write_private(io: Io, dir: Io.Dir, name: []const u8, bytes: []const u8) !void
 const Responder = struct {
     thread: std.Thread,
     listener: std.posix.socket_t,
+    /// Bound here, so shut down to stop. A copy of systemd's socket is
+    /// never shut down (that would shut it for whoever accepts on it next):
+    /// the responder polls, and sees `stopping` within a poll's wait.
+    owned: bool,
     token: [128]u8 = undefined,
     token_len: u32 = 0,
     answer: [256]u8 = undefined,
@@ -455,10 +463,20 @@ const Responder = struct {
     const linux = std.os.linux;
     const prefix = "/.well-known/acme-challenge/";
     const connections_max = 1024;
+    const poll_wait_ms = 100;
+    /// Waits with no connection: two minutes, past ACME's own polling.
+    const waits_max = 2 * 60 * 1000 / poll_wait_ms;
 
-    fn start(responder: *Responder, io: Io, port: u16) !void {
+    fn start(responder: *Responder, io: Io, port: u16, inherited: ?std.posix.socket_t) !void {
         _ = io;
-        responder.* = .{ .thread = undefined, .listener = undefined };
+        responder.* = .{ .thread = undefined, .listener = undefined, .owned = inherited == null };
+        if (inherited) |socket| {
+            const copied = linux.fcntl(socket, linux.F.DUPFD_CLOEXEC, 3);
+            if (linux.errno(copied) != .SUCCESS) return error.AcmeResponderSocket;
+            responder.listener = @intCast(copied);
+            responder.thread = try std.Thread.spawn(.{}, serve, .{responder});
+            return;
+        }
         const fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
         if (linux.errno(fd) != .SUCCESS) return error.AcmeResponderSocket;
         responder.listener = @intCast(fd);
@@ -489,13 +507,27 @@ const Responder = struct {
 
     fn stop(responder: *Responder) void {
         responder.stopping.store(true, .release);
-        _ = linux.shutdown(responder.listener, linux.SHUT.RDWR); // wakes accept
+        // Its own socket: shut, which wakes a poll at once. A copy of
+        // systemd's: the poll's wait ends it.
+        if (responder.owned) _ = linux.shutdown(responder.listener, linux.SHUT.RDWR);
         responder.thread.join();
         _ = linux.close(responder.listener);
     }
 
     fn serve(responder: *Responder) void {
-        for (0..connections_max) |_| {
+        var accepted: u32 = 0;
+        for (0..connections_max + waits_max) |_| {
+            if (responder.stopping.load(.acquire)) return;
+            if (accepted == connections_max) return;
+            const waiting: linux.pollfd = .{
+                .fd = responder.listener,
+                .events = linux.POLL.IN,
+                .revents = 0,
+            };
+            var ready = [_]linux.pollfd{waiting};
+            const polled = linux.poll(&ready, 1, poll_wait_ms);
+            if (linux.errno(polled) != .SUCCESS or polled == 0) continue;
+            accepted += 1;
             const fd = linux.accept4(responder.listener, null, null, linux.SOCK.CLOEXEC);
             if (responder.stopping.load(.acquire)) {
                 if (linux.errno(fd) == .SUCCESS) _ = linux.close(@intCast(fd));
@@ -575,4 +607,50 @@ test "acme: a stored certificate counts only for its CA and its identifier" {
     try write_private(io, tmp.dir, directory_file, staging);
     const production = "https://acme-v02.api.letsencrypt.org/directory";
     try std.testing.expect(!try recorded(arena, io, tmp.dir, directory_file, production));
+}
+
+test "acme: the responder on systemd's socket answers, then leaves it listening" {
+    const io = std.testing.io;
+    const linux = std.os.linux;
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var held = try address.listen(io, .{ .reuse_address = false });
+    defer held.deinit(io);
+    const port = held.socket.address.getPort();
+    var responder: Responder = undefined;
+    try responder.start(io, port, held.socket.handle);
+    responder.set("token-1", "token-1.thumbprint");
+    var answer: [512]u8 = undefined;
+    const got = try challenge_get(port, "/.well-known/acme-challenge/token-1", &answer);
+    try std.testing.expect(std.mem.endsWith(u8, answer[0..got], "\r\n\r\ntoken-1.thumbprint"));
+    responder.stop();
+    // Still listening, for the server that comes after: never shut down.
+    var accepting: u32 = 0;
+    var length: linux.socklen_t = @sizeOf(u32);
+    const level = linux.SOL.SOCKET;
+    const handle = held.socket.handle;
+    _ = linux.getsockopt(handle, level, linux.SO.ACCEPTCONN, @ptrCast(&accepting), &length);
+    try std.testing.expectEqual(1, accepting);
+}
+
+/// A plain GET on loopback, its response read to the peer's close.
+fn challenge_get(port: u16, target: []const u8, buffer: []u8) !usize {
+    const linux = std.os.linux;
+    const fd: linux.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer _ = linux.close(fd);
+    const peer: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const connected = linux.connect(fd, @ptrCast(&peer), @sizeOf(linux.sockaddr.in));
+    if (linux.errno(connected) != .SUCCESS) return error.Connect;
+    var request: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(&request, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target});
+    if (linux.write(fd, text.ptr, text.len) != text.len) return error.Send;
+    var used: usize = 0;
+    for (0..buffer.len + 1) |_| {
+        const read = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+        if (linux.errno(read) != .SUCCESS) return error.Receive;
+        if (read == 0) return used;
+        used += read;
+    } else return error.TooLong;
 }
