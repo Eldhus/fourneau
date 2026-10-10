@@ -20,6 +20,8 @@ project, so the suite is built to be fast and to be cut:
 | `zig build test -Dfilter=fuzz -Dtest-optimize=safe --fuzz=N` | Zig's coverage-guided fuzzer on the parsers, N runs (LLVM builds only: Debug has no coverage instrumentation) | minutes |
 | `zig build brotli-check -Doptimize=ReleaseSafe -- 2000` | brotli: inputs from 2,000 seeds (random, runs, dictionary words, copies of themselves, up to 400 KB), encoded by us, decoded by our decoder and the reference `brotli` (on PATH) | minutes |
 
+| `h2spec -h 127.0.0.1 -p PORT --strict` against `fourneau-hello` | HTTP/2 conformance, 147 cases; h2spec v2.6.0 built from its tag (`go build ./cmd/h2spec`, its module cache kept out of `~`). All pass but "invalid connection preface" (twice): h2c and HTTP/1.1 share a port, so bytes that are not the preface get HTTP/1.1's 400, which h2spec reads as a frame | seconds |
+
 Tests compile Debug by default, fast to build, every assertion on;
 `-Dtest-optimize=safe` for an optimised run. Test
 names start with their area: `test "http1: chunked: size line overflow"`,
@@ -29,9 +31,10 @@ so `-Dfilter` selects an area or a single case.
 
 1. **Protocol cores, alone** (`src/*.zig`, next to the code).
    Each is a state machine over bytes, so it is tested without sockets:
-   - **RFC vectors**: chunked and message examples from RFC 9112; planned,
-     HPACK (RFC 7541 Appendix C, M9) and the TLS 1.3 handshake traces
-     (RFC 8448, M7) byte for byte.
+   - **RFC vectors**: chunked and message examples from RFC 9112; HPACK
+     (RFC 7541 Appendix C); HTTP/2's refusals as RFC 9113 and h2spec name
+     them (`http2.zig`); planned, the TLS 1.3 handshake traces (RFC 8448,
+     M7) byte for byte.
    - **Exhaustive over small domains**: every split of a request into two
      reads parses the same as the whole; every byte value in every
      header position is accepted or refused as the grammar says.

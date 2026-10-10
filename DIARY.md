@@ -1695,3 +1695,27 @@ reset fails the Rapid Reset test.
 The first run passed 17 of 19; the two failures were the invariant
 check catching windows over 2^31-1 left behind by the error paths
 (added, then refused); now checked before they change.
+
+## 2026-10-10: HTTP/2 in the server: h2c, stream fibers, one Request
+
+Layer 4 of docs/http2.md, its choices written there ("The server, as
+built"). `fourneau-hello` speaks it on its port beside HTTP/1.1.
+
+Measured and checked:
+- A real-kernel test (`hello.zig`): two streams on one connection, a
+  GET and a POST whose body is echoed, then a stop: the drain's GOAWAY
+  arrives. Passed first run.
+- curl 8.22 (`--http2-prior-knowledge`): a GET; three requests on one
+  connection; a 300,000-byte upload, more than four stream windows, so
+  the window updates flow; HTTP/1.1 on the same port, unchanged.
+- h2spec v2.6.0, `--strict`: 143 of 147 at first, in 6.0 s. Three were
+  one bug, a lost wake-up: a handler facing a closed window flushed and
+  then waited, and a window opened during the flush was never seen, so
+  it slept to the send timeout. Fixed by reading the wait word before
+  looking at the window, with no wait between. Then 145 of 147 in 2.0 s;
+  the two left are one case listed twice, an invalid preface, which on a
+  port shared with HTTP/1.1 gets HTTP/1.1's 400 (h2spec reads it as a
+  frame). Kept: falling back to HTTP/1.1 is the point of sharing the port.
+- The simulator's 200 seeds (HTTP/1.1) still pass; roux builds.
+
+Not yet: ALPN on HTTPS, the simulator speaking HTTP/2, a load test.

@@ -91,6 +91,39 @@ Layers, each tested alone before the server sees it, as HTTP/1.1's are:
 - A GOAWAY names the last stream taken *when it was decided*, so
   streams ignored after it are ones a client may retry.
 
+## The server, as built (2026-10-10)
+
+- **Which protocol**: on plain HTTP, `sniff_http2` reads until the first
+  bytes are the preface or cannot be (an HTTP/1.1 client costs nothing:
+  the first byte differs, and its bytes stay in `recv`). On HTTPS, ALPN
+  (next).
+- **Fibers**: the connection's reads frames; each stream's handler runs
+  on a fiber of its own (`Config.fibers_max` counts the stream slots).
+- **Stream slots** per shard (`Config.http2.streams_max`), each: a copy
+  of the head in HTTP/1.1's shape (`Version.http_2`; at most
+  `headers_max` fields, else 431), the scratch, a body buffer of the
+  stream's window, a wait word, a deadline. None free: REFUSED_STREAM.
+- **One `Request`** for both protocols, its calls choosing by a switch.
+- **Sending**: any fiber appends frames; the first to find them waiting
+  sends, the others wait for it on their own word (`Signal`, a futex):
+  one write at a time on a socket.
+- **Deadlines**: a stream waiting on its client (a body, a window) has
+  its own, scanned by the timekeeper as the connections' are; the
+  connection's deadline is a sender's while one sends, else the idle
+  timeout when no stream is held; with streams held the reader waits
+  without one, since each stream has its own.
+- **Waking without losing a wake**: read the word, look at the state,
+  wait on the word, with no wait in between. The first version flushed
+  between looking at a closed window and waiting, so a window opened
+  during the flush was missed until the send timeout: h2spec's three
+  window cases found it (the run took 6 s, then 2 s).
+- **Closing**: the last frames, the socket shut (a sender still writing
+  fails), every stream ended, then the reader waits for every handler to
+  return before the slot is given back.
+- **Draining**: GOAWAY on every HTTP/2 connection, sent with its next
+  frames; one idle is shut as HTTP/1.1's are; the last stream to end on a
+  draining connection shuts it; event streams are canceled.
+
 ## Limits, each with a counter
 
 | attack | limit |

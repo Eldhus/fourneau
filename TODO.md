@@ -77,9 +77,10 @@
      release (checked). 1 to 4 done (2026-10-10). 5, HTTP/2: planned in
      docs/http2.md (layers: HPACK, frames, the connection's state
      machine, the server; stream slots held until handlers return).
-     HPACK (`eb43c46`), frames (`ced6ca7`) and the connection's state
-     machine (`http2.zig`) done; next, the server: h2c by prior
-     knowledge, stream fibers, the Request for both protocols.
+     HPACK (`eb43c46`), frames (`ced6ca7`), the connection's state
+     machine (`3cf2f76`) and the server over h2c done (h2spec strict
+     145/147, the two an invalid preface on a shared port); next, ALPN
+     on HTTPS, then a load test against Go and axum.
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does

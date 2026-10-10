@@ -65,7 +65,8 @@ pub const Refusal = enum {
 
 pub const Method = enum { get, head, post, put, delete, options, patch, trace, other };
 
-pub const Version = enum { http_1_0, http_1_1 };
+/// HTTP/2 requests take this head's shape too (the server converts them).
+pub const Version = enum { http_1_0, http_1_1, http_2 };
 
 pub const Body = union(enum) {
     none,
@@ -292,7 +293,7 @@ fn parse_version(text: []const u8) VersionResult {
 }
 
 /// Methods are case-sensitive (RFC 9110 §9.1): `get` is not `GET`.
-fn method_of(text: []const u8) Method {
+pub fn method_of(text: []const u8) Method {
     const known = [_]struct { []const u8, Method }{
         .{ "GET", .get },     .{ "HEAD", .head },     .{ "POST", .post },
         .{ "PUT", .put },     .{ "DELETE", .delete }, .{ "OPTIONS", .options },

@@ -33,6 +33,7 @@ const http1_head = @import("http1_head.zig");
 const http1_chunked = @import("http1_chunked.zig");
 const http1_response = @import("http1_response.zig");
 const http_date = @import("http_date.zig");
+const http2 = @import("http2.zig");
 const tls = @import("tls.zig");
 
 const Io = std.Io;
@@ -76,6 +77,18 @@ pub const Config = struct {
     /// HTTPS: TLS 1.3 on every connection, the keys then given to the
     /// kernel (`tls.zig`). Real sockets only: a simulated one has no kTLS.
     tls: ?*const tls.Context = null,
+    /// HTTP/2 too: by prior knowledge on plain HTTP (h2c, a client that
+    /// opens with the preface), by ALPN on HTTPS. Null: HTTP/1.1 only.
+    http2: ?Http2 = null,
+
+    pub const Http2 = struct {
+        /// Streams a shard serves at once, over all its connections: each a
+        /// slot (its head, scratch and body window) and a fiber. A stream
+        /// past it is refused (REFUSED_STREAM, which a client retries).
+        streams_max: u32 = 256,
+        /// SETTINGS_MAX_CONCURRENT_STREAMS, per connection.
+        streams_per_connection: u16 = 100,
+    };
 
     pub fn assert_valid(config: Config) void {
         assert(config.connections_max > 0);
@@ -91,15 +104,31 @@ pub const Config = struct {
             // and receives the client's early bytes into `recv`.
             assert(config.scratch_bytes_max >= tls.input_bytes_min + tls.output_bytes_min);
         }
+        if (config.http2) |options| {
+            assert(options.streams_max > 0);
+            assert(options.streams_per_connection > 0);
+            config.http2_limits().assert_valid();
+            // A whole frame fits in `recv` after what is left of the last.
+            assert(config.recv_bytes() >= http2.input_bytes_min);
+        }
     }
 
-    /// The fibers a server runs at once, at most: one per connection slot
-    /// and the timekeeper (accepting runs on `run`'s caller). A slot is
-    /// given back as its fiber's last act, so a new connection never needs
-    /// a fiber before the last one is free. An `Io`'s fiber pool is the
-    /// sum of what runs on it.
+    /// The fibers a server runs at once, at most: one per connection slot,
+    /// one per HTTP/2 stream slot, and the timekeeper (accepting runs on
+    /// `run`'s caller). A slot is given back as its fiber's last act, so a
+    /// new connection or stream never needs a fiber before the last one is
+    /// free. An `Io`'s fiber pool is the sum of what runs on it.
     pub fn fibers_max(config: Config) u32 {
-        return config.connections_max + 1;
+        const streams = if (config.http2) |options| options.streams_max else 0;
+        return config.connections_max + streams + 1;
+    }
+
+    fn http2_limits(config: Config) http2.Limits {
+        return .{
+            .streams_max = config.http2.?.streams_per_connection,
+            .head_bytes_max = config.head_bytes_max,
+            .out_bytes = 2 * http2.input_bytes_min,
+        };
     }
 
     fn head_limits(config: Config) http1_head.Limits {
@@ -161,6 +190,49 @@ pub const SendThenReceive = fn (
     buffer: []u8,
 ) error{ ConnectionResetByPeer, Canceled, Unexpected }!usize;
 
+/// A stream of server-sent events: it has no end of its own.
+fn is_event_stream(headers: []const http1_response.Header) bool {
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+        return std.ascii.startsWithIgnoreCase(header.value, "text/event-stream");
+    }
+    return false;
+}
+
+/// Text copied into a slot's bytes, as long as they last.
+const TextCopy = struct {
+    bytes: []u8,
+    used: usize = 0,
+    overflow: bool = false,
+
+    fn copy(text: *TextCopy, source: []const u8) []const u8 {
+        if (source.len > text.bytes.len - text.used) {
+            text.overflow = true;
+            return "";
+        }
+        const at = text.bytes[text.used..][0..source.len];
+        @memcpy(at, source);
+        text.used += source.len;
+        return at;
+    }
+};
+
+/// A word fibers wait on until it changes: whoever changes what they wait
+/// for bumps it. A shard's fibers share a thread, so between a check and
+/// the wait after it nothing changes.
+const Signal = struct {
+    word: u32 = 0,
+
+    fn wait(signal: *Signal, io: Io, seen: u32) Io.Cancelable!void {
+        return io.futexWait(u32, &signal.word, seen);
+    }
+
+    fn notify(signal: *Signal, io: Io) void {
+        signal.word +%= 1;
+        io.futexWake(u32, &signal.word, std.math.maxInt(u32));
+    }
+};
+
 /// Responses go out whole, so Nagle's algorithm only delays them: with
 /// pipelined requests it held each response after the first for the
 /// client's delayed ACK, 40 ms (DIARY 2026-10-05: 50k requests/s at
@@ -197,6 +269,11 @@ pub const Stats = struct {
     drain_idle: u64 = 0,
     drain_streams: u64 = 0,
     drain_cut: u64 = 0,
+    /// HTTP/2: connections, and streams served and refused (the shard's
+    /// stream slots all taken, or no fiber to run one on).
+    http2_connections: u64 = 0,
+    http2_streams: u64 = 0,
+    http2_refused: u64 = 0,
 };
 
 /// The address of this, per thread, names the thread a shard runs on.
@@ -258,18 +335,150 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// waits, so the timekeeper never runs in the middle of one.
         date_text: [http_date.length]u8 = undefined,
         date_second: u64 = 0,
+        /// HTTP/2 (`Config.http2`): beside each connection slot, what it
+        /// needs when its client speaks HTTP/2; and the shard's stream
+        /// slots, their free list, and their deadlines (as `deadlines`, for
+        /// a handler waiting on its client: a body, a window).
+        h2: []Http2Connection = &.{},
+        h2_slots_slab: []u32 = &.{},
+        streams: []StreamSlot = &.{},
+        stream_free: []u32 = &.{},
+        stream_free_count: u32 = 0,
+        stream_deadlines: []u32 = &.{},
+        stream_slab: []u8 = &.{},
+        stream_headers_slab: []Header = &.{},
 
+        /// An HTTP/2 connection's state, beside its slot's `Connection`
+        /// (whose `recv` it reads into).
+        const Http2Connection = struct {
+            machine: http2.Connection,
+            /// A fiber is sending the machine's frames: the others append
+            /// theirs and wait for it (one write at a time on a socket).
+            flushing: bool = false,
+            /// The reader waits for the client.
+            reading: bool = false,
+            /// The socket failed, or the connection is closing: nothing more
+            /// is sent.
+            broken: bool = false,
+            /// The stream slot of each of the machine's streams.
+            slots: []u32,
+            /// What the reader waits on: a flush ending, a stream ending.
+            signal: Signal = .{},
+        };
+
+        const slot_none = std.math.maxInt(u32);
+
+        /// An HTTP/2 stream's slot: its request, its handler's fiber, and
+        /// the body waiting for that handler, as much as the stream's
+        /// window lets the client send (`http2.stream_window_bytes`).
+        const StreamSlot = struct {
+            server: *Server,
+            /// Its place in `streams`.
+            slot: u32,
+            in_use: bool,
+            connection: *Connection,
+            /// Its place in the machine's table.
+            index: u16,
+            head: http1_head.Head,
+            headers: []Header,
+            /// The head's names and values, copied from the machine's.
+            text: []u8,
+            scratch: []u8,
+            body: []u8,
+            body_start: u32,
+            body_end: u32,
+            body_read: u64,
+            /// The client's END_STREAM: the body is whole once read.
+            body_done: bool,
+            /// Reset by either side, out of time, or its connection gone:
+            /// nothing more is read or sent.
+            ended: bool,
+            /// A request answered without its handler (431, 413).
+            refusal: ?u16,
+            stream_state: StreamState,
+            endless: bool,
+            /// What its handler waits on: body bytes, a window, a flush.
+            signal: Signal,
+
+            fn h2(stream: *StreamSlot) *Http2Connection {
+                return &stream.server.h2[stream.connection.index];
+            }
+
+            fn read_body(stream: *StreamSlot, buffer: []u8) BodyError!usize {
+                assert(buffer.len > 0);
+                assert(stream.stream_state == .none);
+                const server = stream.server;
+                // Bounded only to say so: it ends with bytes, the body's
+                // end, the stream's, or the body's deadline.
+                for (0..std.math.maxInt(u64)) |_| {
+                    const seen = stream.signal.word;
+                    const ready = stream.body_end - stream.body_start;
+                    if (ready > 0) return server.h2_take_body(stream, buffer);
+                    if (stream.body_done) return 0;
+                    if (stream.ended) return error.Disconnected;
+                    if (!server.h2_wait(stream, seen, server.config.body_timeout_ms)) {
+                        return error.Disconnected;
+                    }
+                } else unreachable;
+            }
+
+            fn stream_start(
+                stream: *StreamSlot,
+                status: u16,
+                headers: []const http1_response.Header,
+            ) StreamError!void {
+                assert(stream.stream_state == .none);
+                try stream.server.h2_send_head(stream, .{
+                    .status = status,
+                    .headers = headers,
+                    .framing = .chunked,
+                    .end_stream = false,
+                });
+                stream.stream_state = .streaming;
+                stream.endless = is_event_stream(headers);
+            }
+
+            fn stream_send(stream: *StreamSlot, bytes: []const u8) StreamError!void {
+                assert(stream.stream_state == .streaming);
+                if (bytes.len == 0) return;
+                if (stream.head.method == .head) return;
+                try stream.server.h2_send_body(stream, bytes, false);
+            }
+
+            fn stream_flush(stream: *StreamSlot) StreamError!void {
+                assert(stream.stream_state == .streaming);
+                if (!stream.server.h2_flush(stream.connection, &stream.signal)) {
+                    return error.Disconnected;
+                }
+            }
+
+            fn stream_end(stream: *StreamSlot) StreamError!void {
+                assert(stream.stream_state == .streaming);
+                try stream.server.h2_send_body(stream, "", true);
+                stream.stream_state = .ended;
+                stream.endless = false;
+            }
+        };
+
+        /// A request, over HTTP/1.1 or HTTP/2: the same head (an HTTP/2
+        /// one converted to its shape), the same calls, each choosing its
+        /// protocol by a switch.
         pub const Request = struct {
             head: *const http1_head.Head,
-            /// This connection's memory for the response body: valid
-            /// until the response has been sent.
+            /// This connection's (or stream's) memory for the response
+            /// body: valid until the response has been sent.
             scratch: []u8,
-            connection: *Connection,
+            transport: Transport,
+
+            const Transport = union(enum) { http1: *Connection, http2: *StreamSlot };
 
             /// Read up to `buffer.len` body bytes; 0 at the end of the
             /// body. Sends `100 Continue` first if the client waits for it.
             pub fn read_body(request: *Request, buffer: []u8) BodyError!usize {
-                return request.connection.read_body(buffer);
+                return switch (request.transport) {
+                    .http1 => |connection| connection.read_body(buffer),
+                    .http2 => |stream| stream.read_body(buffer),
+                };
             }
 
             /// A streamed response (server-sent events), chunked: this
@@ -290,23 +499,35 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 status: u16,
                 headers: []const http1_response.Header,
             ) StreamError!void {
-                return request.connection.stream_start(status, headers);
+                return switch (request.transport) {
+                    .http1 => |connection| connection.stream_start(status, headers),
+                    .http2 => |stream| stream.stream_start(status, headers),
+                };
             }
 
             /// One chunk: these bytes, which may be reused once it returns.
             /// No bytes, no chunk (an empty one would end the stream).
             pub fn stream_send(request: *Request, bytes: []const u8) StreamError!void {
-                return request.connection.stream_send(bytes);
+                return switch (request.transport) {
+                    .http1 => |connection| connection.stream_send(bytes),
+                    .http2 => |stream| stream.stream_send(bytes),
+                };
             }
 
             /// Send what waits: every chunk so far reaches the client.
             pub fn stream_flush(request: *Request) StreamError!void {
-                return request.connection.stream_flush();
+                return switch (request.transport) {
+                    .http1 => |connection| connection.stream_flush(),
+                    .http2 => |stream| stream.stream_flush(),
+                };
             }
 
             /// The last chunk: the response is whole.
             pub fn stream_end(request: *Request) StreamError!void {
-                return request.connection.stream_end();
+                return switch (request.transport) {
+                    .http1 => |connection| connection.stream_end(),
+                    .http2 => |stream| stream.stream_end(),
+                };
             }
 
             /// Where this request's stream is: for a host whose application
@@ -314,7 +535,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             /// Roc app), so it refuses what would trip an assertion, and
             /// returns `streamed_status` exactly when it must.
             pub fn stream_state(request: *const Request) StreamState {
-                return request.connection.stream_state;
+                return switch (request.transport) {
+                    .http1 => |connection| connection.stream_state,
+                    .http2 => |stream| stream.stream_state,
+                };
             }
         };
 
@@ -359,6 +583,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             /// sends refuse `MSG_WAITALL`, which the linked send-then-
             /// receive needs, so such a connection flushes, then reads.
             kernel_tls: bool,
+            /// The client speaks HTTP/2: `Server.h2` holds the rest.
+            http2: bool,
 
             fn read_body(connection: *Connection, buffer: []u8) BodyError!usize {
                 assert(buffer.len > 0);
@@ -469,10 +695,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     },
                 }
                 connection.stream_state = .streaming;
-                connection.endless = for (headers) |header| {
-                    if (!std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
-                    break std.ascii.startsWithIgnoreCase(header.value, "text/event-stream");
-                } else false;
+                connection.endless = is_event_stream(headers);
             }
 
             fn stream_send(connection: *Connection, bytes: []const u8) StreamError!void {
@@ -588,11 +811,16 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 assert(connection.send_used == 0);
                 server.arm(connection.index, timeout_ms);
                 defer server.disarm(connection.index);
+                return connection.receive(buffer);
+            }
 
-                // The operation itself: in 0.17, `net.Stream.read` does not
-                // compile (it destructures a struct as a tuple; DIARY).
+            /// The read itself, no deadline of its own: in 0.17,
+            /// `net.Stream.read` does not compile (it destructures a struct
+            /// as a tuple; DIARY).
+            fn receive(connection: *Connection, buffer: []u8) !u32 {
+                assert(buffer.len > 0);
                 var parts = [_][]u8{buffer};
-                const result = try server.io.operate(.{ .net_read = .{
+                const result = try connection.server.io.operate(.{ .net_read = .{
                     .socket_handle = connection.stream.socket.handle,
                     .data = &parts,
                 } });
@@ -696,7 +924,56 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.heads_slab = heads;
             server.scratch_slab = scratch;
             server.headers_slab = headers;
+            if (config.http2) |options| try server.init_http2(gpa, options);
             return server;
+        }
+
+        /// A machine beside every connection slot, and the stream slots:
+        /// allocated now, their pages touched only when used.
+        fn init_http2(server: *Server, gpa: std.mem.Allocator, options: Config.Http2) !void {
+            const config = server.config;
+            const per_connection = options.streams_per_connection;
+            server.h2 = try gpa.alloc(Http2Connection, config.connections_max);
+            server.h2_slots_slab = try gpa.alloc(u32, config.connections_max * per_connection);
+            for (server.h2, 0..) |*h2, index| {
+                h2.* = .{
+                    .machine = try .init(gpa, config.http2_limits()),
+                    .slots = stride(u32, server.h2_slots_slab, per_connection, @intCast(index)),
+                };
+            }
+            const count = options.streams_max;
+            const bytes = stream_text_bytes(config) + config.scratch_bytes_max +
+                http2.stream_window_bytes;
+            server.streams = try gpa.alloc(StreamSlot, count);
+            server.stream_free = try gpa.alloc(u32, count);
+            server.stream_deadlines = try gpa.alloc(u32, count);
+            server.stream_slab = try gpa.alloc(u8, @as(usize, count) * bytes);
+            server.stream_headers_slab = try gpa.alloc(Header, count * config.headers_max);
+            for (server.streams, 0..) |*stream, index_usize| {
+                const index: u32 = @intCast(index_usize);
+                const own = stride(u8, server.stream_slab, bytes, index);
+                const text_end = stream_text_bytes(config);
+                const scratch_end = text_end + config.scratch_bytes_max;
+                stream.* = undefined;
+                stream.slot = index;
+                stream.in_use = false;
+                stream.text = own[0..text_end];
+                stream.scratch = own[text_end..scratch_end];
+                stream.body = own[scratch_end..];
+                const headers_slab = server.stream_headers_slab;
+                stream.headers = stride(Header, headers_slab, config.headers_max, index);
+                stream.signal = .{};
+                server.stream_free[index] = count - 1 - index;
+                server.stream_deadlines[index] = 0;
+            }
+            server.stream_free_count = count;
+            assert(server.streams[0].body.len == http2.stream_window_bytes);
+        }
+
+        /// A stream's copy of its head's text: room for HTTP/1.1's largest
+        /// head, and the cookie crumbs HTTP/2 joins.
+        fn stream_text_bytes(config: Config) u32 {
+            return 2 * config.head_bytes_max;
         }
 
         pub fn deinit(server: *Server, gpa: std.mem.Allocator) void {
@@ -708,6 +985,16 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             gpa.free(server.heads_slab);
             gpa.free(server.scratch_slab);
             gpa.free(server.headers_slab);
+            if (server.h2.len > 0) {
+                for (server.h2) |*h2| h2.machine.deinit(gpa);
+                gpa.free(server.h2);
+                gpa.free(server.h2_slots_slab);
+                gpa.free(server.streams);
+                gpa.free(server.stream_free);
+                gpa.free(server.stream_deadlines);
+                gpa.free(server.stream_slab);
+                gpa.free(server.stream_headers_slab);
+            }
             server.* = undefined;
         }
 
@@ -816,6 +1103,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.send_used = 0;
             connection.requests = 0;
             connection.kernel_tls = false;
+            connection.http2 = false;
             connection.stream_state = .none;
             connection.endless = false;
         }
@@ -836,6 +1124,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             defer server.close_connection(connection);
             if (server.config.tls) |context| {
                 if (!server.handshake(connection, context)) return;
+            }
+            if (server.config.http2 != null and server.sniff_http2(connection)) {
+                server.serve_http2(connection);
+                return;
             }
 
             for (0..server.config.requests_per_connection_max) |_| {
@@ -889,6 +1181,487 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             _ = server.write_response(connection, .{ .status = 400, .body = body });
         }
 
+        // --- HTTP/2 (docs/http2.md) ------------------------------------------
+
+        /// A client that opens with HTTP/2's preface (prior knowledge):
+        /// read until it can tell. What was read stays in `recv` for
+        /// whichever protocol follows.
+        fn sniff_http2(server: *Server, connection: *Connection) bool {
+            const preface = http2.preface;
+            // Each pass reads a byte at least, or decides.
+            for (0..preface.len + 1) |_| {
+                const length = @min(connection.recv_used, preface.len);
+                const prefix = connection.recv[0..length];
+                if (!std.mem.eql(u8, prefix, preface[0..length])) return false;
+                if (length == preface.len) return true;
+                server.arm(connection.index, server.config.head_timeout_ms);
+                defer server.disarm(connection.index);
+                const window = connection.recv[connection.recv_used..];
+                const got = connection.receive(window) catch return false;
+                if (got == 0) return false;
+                connection.recv_used += got;
+            } else unreachable;
+        }
+
+        /// The connection's fiber reads frames and hands each stream's
+        /// request to a fiber of its own; every fiber sends what it makes
+        /// (`h2_flush`). It ends when the client or the server does, after
+        /// every stream's handler has returned.
+        fn serve_http2(server: *Server, connection: *Connection) void {
+            const h2 = &server.h2[connection.index];
+            h2.machine.start();
+            h2.flushing = false;
+            h2.reading = false;
+            h2.broken = false;
+            @memset(h2.slots, slot_none);
+            connection.http2 = true;
+            server.stats.http2_connections += 1;
+            defer server.h2_close(connection, h2);
+            var at: u32 = 0;
+            // Bounded only to say so: it ends when the client or the server does.
+            for (0..std.math.maxInt(u64)) |_| {
+                const step = h2.machine.receive(connection.recv[at..connection.recv_used]);
+                at += step.consumed;
+                assert(at <= connection.recv_used);
+                switch (step.event) {
+                    .incomplete => {
+                        const rest = connection.recv[at..connection.recv_used];
+                        std.mem.copyForwards(u8, connection.recv[0..rest.len], rest);
+                        connection.recv_used = @intCast(rest.len);
+                        at = 0;
+                        if (!server.h2_read(connection, h2)) return;
+                    },
+                    .flush => if (!server.h2_flush(connection, &h2.signal)) return,
+                    .request => |request| server.h2_open(connection, h2, request),
+                    .data => |data| server.h2_data(h2, data),
+                    .reset => |index| server.h2_end(h2, index),
+                    .window => server.h2_notify_all(h2),
+                    .close => return,
+                }
+            } else unreachable;
+        }
+
+        /// Send what waits, then wait for the client. Its deadline is an
+        /// idle connection's, as HTTP/1.1's between requests: none while
+        /// streams are held (each waits with its own) or while a fiber
+        /// sends (the socket's deadline is then the sender's).
+        fn h2_read(server: *Server, connection: *Connection, h2: *Http2Connection) bool {
+            if (!server.h2_flush(connection, &h2.signal)) return false;
+            const idle = h2.machine.streams_held() == 0;
+            if (idle and server.draining) return false;
+            if (h2.broken) return false;
+            const index = connection.index;
+            if (idle and !h2.flushing) {
+                server.arm(index, server.config.idle_timeout_ms);
+                server.idle_since[index] = server.tick;
+            }
+            h2.reading = true;
+            const window = connection.recv[connection.recv_used..];
+            const got = connection.receive(window) catch 0;
+            h2.reading = false;
+            server.idle_since[index] = 0;
+            if (!h2.flushing) server.disarm(index);
+            if (got == 0) return false;
+            connection.recv_used += got;
+            return true;
+        }
+
+        /// Send the machine's frames: one fiber at a time, the others
+        /// appending theirs meanwhile and waiting (on `waiter`, their own
+        /// signal) for it to end. False: the connection is gone.
+        fn h2_flush(server: *Server, connection: *Connection, waiter: *Signal) bool {
+            const h2 = &server.h2[connection.index];
+            // Bounded only to say so: each pass sends, or waits for the
+            // sender, whose writes have a deadline.
+            for (0..std.math.maxInt(u64)) |_| {
+                if (h2.broken) return false;
+                if (h2.flushing) {
+                    waiter.wait(server.io, waiter.word) catch return false;
+                    continue;
+                }
+                if (!h2.machine.wants_flush()) return true;
+                const bytes = h2.machine.pending();
+                if (bytes.len == 0) return true;
+                h2.flushing = true;
+                const sent = connection.write_all(bytes, "");
+                h2.flushing = false;
+                h2.machine.sent(@intCast(bytes.len));
+                if (!sent) server.h2_break(h2);
+                server.h2_notify_all(h2);
+            } else unreachable;
+        }
+
+        /// The socket failed: nothing more is sent, and every stream ends.
+        fn h2_break(server: *Server, h2: *Http2Connection) void {
+            h2.broken = true;
+            h2.machine.abandon();
+            for (h2.slots) |slot| {
+                if (slot != slot_none) server.streams[slot].ended = true;
+            }
+        }
+
+        /// Wake every fiber of the connection: each looks again at what it
+        /// waits for (a window, a flush, its end).
+        fn h2_notify_all(server: *Server, h2: *Http2Connection) void {
+            for (h2.slots) |slot| {
+                if (slot != slot_none) server.streams[slot].signal.notify(server.io);
+            }
+            h2.signal.notify(server.io);
+        }
+
+        /// The last frames (a GOAWAY), then the socket shut, so a fiber
+        /// still sending fails; then wait for every handler to return:
+        /// only then is the slot free for another connection.
+        fn h2_close(server: *Server, connection: *Connection, h2: *Http2Connection) void {
+            _ = server.h2_flush(connection, &h2.signal);
+            server.h2_break(h2);
+            connection.stream.shutdown(server.io, .both) catch {};
+            server.h2_notify_all(h2);
+            // Bounded only to say so: each pass sees a handler return.
+            for (0..std.math.maxInt(u64)) |_| {
+                if (h2.machine.streams_held() == 0) break;
+                server.io.futexWaitUncancelable(u32, &h2.signal.word, h2.signal.word);
+            } else unreachable;
+            connection.http2 = false;
+        }
+
+        /// A new stream's request: a slot and a fiber for it, or refused.
+        fn h2_open(
+            server: *Server,
+            connection: *Connection,
+            h2: *Http2Connection,
+            request: http2.Event.Request,
+        ) void {
+            if (server.stream_free_count == 0) {
+                h2.machine.refuse(request.index);
+                server.stats.http2_refused += 1;
+                return;
+            }
+            const slot = server.take_stream();
+            const stream = &server.streams[slot];
+            stream.in_use = true;
+            stream.server = server; // `init` returned the server by value
+            stream.connection = connection;
+            stream.index = request.index;
+            stream.body_start = 0;
+            stream.body_end = 0;
+            stream.body_read = 0;
+            stream.body_done = request.head.end_stream;
+            stream.ended = false;
+            stream.stream_state = .none;
+            stream.endless = false;
+            stream.refusal = server.h2_copy_head(stream, request.head);
+            h2.slots[request.index] = slot;
+            server.stats.http2_streams += 1;
+            server.group.concurrent(server.io, serve_stream, .{ server, slot }) catch {
+                server.stats.fiberless += 1;
+                server.stats.http2_refused += 1;
+                h2.slots[request.index] = slot_none;
+                h2.machine.refuse(request.index);
+                server.give_stream(slot);
+            };
+        }
+
+        /// The machine's head, copied into the stream's slot in HTTP/1.1's
+        /// shape. Null, or the status that answers it in the handler's
+        /// place: 431 for more fields than HTTP/1.1 takes, 413 for a body
+        /// announced larger than the server takes.
+        fn h2_copy_head(server: *Server, stream: *StreamSlot, head: http2.Head) ?u16 {
+            var text: TextCopy = .{ .bytes = stream.text };
+            const method = text.copy(head.method);
+            const path = text.copy(head.path);
+            const authority = text.copy(head.authority);
+            const count = @min(head.headers.len, stream.headers.len);
+            for (head.headers[0..count], stream.headers[0..count]) |field, *header| {
+                header.* = .{ .name = text.copy(field.name), .value = text.copy(field.value) };
+            }
+            stream.head = .{
+                .method = http1_head.method_of(method),
+                .method_text = method,
+                .target = path,
+                .path_and_query = path,
+                .version = .http_2,
+                .host = authority,
+                .headers = stream.headers[0..count],
+                .body = if (head.end_stream) .none else if (head.content_length) |length|
+                    .{ .length = length }
+                else
+                    .chunked,
+                .keep_alive = true,
+                .expect_continue = false,
+            };
+            if (text.overflow or count < head.headers.len) return 431;
+            const length = head.content_length orelse 0;
+            if (length > server.config.body_bytes_max) return 413;
+            return null;
+        }
+
+        /// Body bytes for a stream's handler: they fit, since the stream's
+        /// window is its buffer.
+        fn h2_data(server: *Server, h2: *Http2Connection, data: http2.Event.Data) void {
+            const slot = h2.slots[data.index];
+            assert(slot != slot_none);
+            const stream = &server.streams[slot];
+            const bytes = data.bytes;
+            if (stream.body_end + bytes.len > stream.body.len) {
+                const waiting = stream.body[stream.body_start..stream.body_end];
+                std.mem.copyForwards(u8, stream.body[0..waiting.len], waiting);
+                stream.body_start = 0;
+                stream.body_end = @intCast(waiting.len);
+            }
+            assert(stream.body_end + bytes.len <= stream.body.len);
+            @memcpy(stream.body[stream.body_end..][0..bytes.len], bytes);
+            stream.body_end += @intCast(bytes.len);
+            if (data.end_stream) stream.body_done = true;
+            stream.signal.notify(server.io);
+        }
+
+        /// A stream reset, by the client or by the machine: its handler's
+        /// next read or send fails, and it returns.
+        fn h2_end(server: *Server, h2: *Http2Connection, index: u16) void {
+            const slot = h2.slots[index];
+            assert(slot != slot_none);
+            server.streams[slot].ended = true;
+            server.streams[slot].signal.notify(server.io);
+        }
+
+        /// A stream's fiber: its handler, its response, then the slot given
+        /// back. As an HTTP/1.1 connection's request, with a stream for a
+        /// connection.
+        fn serve_stream(server: *Server, slot: u32) void {
+            const stream = &server.streams[slot];
+            defer server.h2_finish(stream);
+            server.assert_on_shard_thread();
+            server.stats.requests += 1;
+            if (stream.refusal) |status| {
+                server.stats.refused += 1;
+                server.h2_respond(stream, .{ .status = status });
+                return;
+            }
+            var request: Request = .{
+                .head = &stream.head,
+                .scratch = stream.scratch,
+                .transport = .{ .http2 = stream },
+            };
+            var response = server.app.handle(&request);
+            defer server.app.release(&response);
+            const streamed = stream.stream_state != .none;
+            assert(streamed == (response.status == streamed_status));
+            if (streamed) return; // ended, or cut short (`release` resets it)
+            server.h2_respond(stream, .{
+                .status = response.status,
+                .headers = response.headers,
+                .body = response.body,
+            });
+        }
+
+        fn h2_respond(server: *Server, stream: *StreamSlot, options: ResponseOptions) void {
+            const forbids_body = http1_response.status_forbids_body(options.status);
+            const framing: http1_response.Framing = if (forbids_body and options.body.len == 0)
+                .none
+            else
+                .{ .length = options.body.len };
+            const omit = stream.head.method == .head or forbids_body;
+            const body = if (omit) "" else options.body;
+            server.h2_send_head(stream, .{
+                .status = options.status,
+                .headers = options.headers,
+                .framing = framing,
+                .end_stream = body.len == 0,
+            }) catch |err| switch (err) {
+                error.Disconnected => return,
+                error.HeadRefused => {
+                    // The application answered what cannot be sent: its bug.
+                    if (options.status == 500) return;
+                    server.h2_send_head(stream, .{
+                        .status = 500,
+                        .framing = .{ .length = 0 },
+                        .end_stream = true,
+                    }) catch {};
+                    return;
+                },
+            };
+            if (body.len > 0) server.h2_send_body(stream, body, true) catch return;
+        }
+
+        const SendHead = struct {
+            status: u16,
+            headers: []const http1_response.Header = &.{},
+            framing: http1_response.Framing,
+            end_stream: bool,
+        };
+
+        fn h2_send_head(server: *Server, stream: *StreamSlot, options: SendHead) StreamError!void {
+            const head: http1_response.Head = .{
+                .status = options.status,
+                .headers = options.headers,
+                .framing = options.framing,
+                .keep_alive = true,
+                .date = server.date(),
+                .secure = stream.connection.kernel_tls,
+            };
+            // Bounded only to say so: each pass sends, or makes room.
+            for (0..std.math.maxInt(u64)) |_| {
+                if (stream.ended) return error.Disconnected;
+                const h2 = stream.h2();
+                h2.machine.send_head(stream.index, head, options.end_stream) catch |err| {
+                    switch (err) {
+                        error.Reset => return error.Disconnected,
+                        error.HeadRefused => {
+                            log.err("response refused (status {d})", .{options.status});
+                            return error.HeadRefused;
+                        },
+                        error.NoRoom => {
+                            if (!server.h2_flush(stream.connection, &stream.signal)) {
+                                return error.Disconnected;
+                            }
+                            continue;
+                        },
+                    }
+                };
+                return;
+            } else unreachable;
+        }
+
+        /// All of `bytes`, as the windows and the send buffer let them go,
+        /// waiting for the client to open a window (with the send timeout).
+        fn h2_send_body(
+            server: *Server,
+            stream: *StreamSlot,
+            bytes: []const u8,
+            end_stream: bool,
+        ) StreamError!void {
+            var sent: usize = 0;
+            // Bounded only to say so: each pass sends, makes room, or waits
+            // with a deadline.
+            for (0..std.math.maxInt(u64)) |_| {
+                if (stream.ended) return error.Disconnected;
+                const h2 = stream.h2();
+                // Read before the window is looked at, with no wait between:
+                // a window opened after this wakes the wait below.
+                const seen = stream.signal.word;
+                const rest = bytes[sent..];
+                const count = h2.machine.send_data(stream.index, rest, end_stream) catch |err| {
+                    switch (err) {
+                        error.Reset => return error.Disconnected,
+                        error.NoRoom => {
+                            if (!server.h2_flush(stream.connection, &stream.signal)) {
+                                return error.Disconnected;
+                            }
+                            continue;
+                        },
+                        error.HeadRefused => unreachable,
+                    }
+                };
+                sent += count;
+                if (sent == bytes.len and (count > 0 or rest.len == 0)) return;
+                if (count > 0) continue;
+                // A window is closed. What waits must reach the client
+                // before it can open one; sending waits, so look again after.
+                if (h2.machine.wants_flush()) {
+                    if (!server.h2_flush(stream.connection, &stream.signal)) {
+                        return error.Disconnected;
+                    }
+                    continue;
+                }
+                if (!server.h2_wait(stream, seen, server.config.send_timeout_ms)) {
+                    return error.Disconnected;
+                }
+            } else unreachable;
+        }
+
+        fn h2_take_body(server: *Server, stream: *StreamSlot, buffer: []u8) BodyError!usize {
+            const ready = stream.body_end - stream.body_start;
+            assert(ready > 0);
+            const count: u32 = @intCast(@min(ready, buffer.len));
+            if (stream.body_read + count > server.config.body_bytes_max) {
+                return error.ContentTooLarge;
+            }
+            @memcpy(buffer[0..count], stream.body[stream.body_start..][0..count]);
+            stream.body_start += count;
+            if (stream.body_start == stream.body_end) {
+                stream.body_start = 0;
+                stream.body_end = 0;
+            }
+            stream.body_read += count;
+            const h2 = stream.h2();
+            if (!h2.broken) {
+                h2.machine.body_read(stream.index, count);
+                // The window given back now: the client may be waiting on it.
+                _ = server.h2_flush(stream.connection, &stream.signal);
+            }
+            return count;
+        }
+
+        /// Wait for the stream's signal to move past `seen` (read before
+        /// what was waited for was found missing, with no wait between), at
+        /// most `timeout_ms` (the timekeeper ends the stream then). False:
+        /// the stream has ended.
+        fn h2_wait(server: *Server, stream: *StreamSlot, seen: u32, timeout_ms: u32) bool {
+            server.stream_deadlines[stream.slot] = server.tick + server.ticks_for(timeout_ms);
+            defer server.stream_deadlines[stream.slot] = 0;
+            stream.signal.wait(server.io, seen) catch return false; // a drain's end
+            return !stream.ended;
+        }
+
+        /// The stream fiber's last act: the stream given back to the
+        /// machine (which resets one cut short), what waits sent, the slot
+        /// freed, and the reader told.
+        fn h2_finish(server: *Server, stream: *StreamSlot) void {
+            const connection = stream.connection;
+            const h2 = &server.h2[connection.index];
+            assert(h2.slots[stream.index] == stream.slot);
+            h2.machine.release(stream.index);
+            _ = server.h2_flush(connection, &stream.signal);
+            h2.slots[stream.index] = slot_none;
+            server.give_stream(stream.slot);
+            h2.signal.notify(server.io);
+            if (h2.machine.streams_held() > 0 or !h2.reading) return;
+            // The connection is idle now: its reader waits without a
+            // deadline, so it gets the idle one (or, draining, its end).
+            const index = connection.index;
+            if (server.draining) {
+                connection.stream.shutdown(server.io, .recv) catch {};
+            } else if (!h2.flushing) {
+                server.arm(index, server.config.idle_timeout_ms);
+                server.idle_since[index] = server.tick;
+            }
+        }
+
+        fn take_stream(server: *Server) u32 {
+            assert(server.stream_free_count > 0);
+            server.stream_free_count -= 1;
+            const slot = server.stream_free[server.stream_free_count];
+            assert(!server.streams[slot].in_use);
+            return slot;
+        }
+
+        fn give_stream(server: *Server, slot: u32) void {
+            const stream = &server.streams[slot];
+            assert(stream.in_use);
+            assert(server.stream_deadlines[slot] == 0);
+            stream.in_use = false;
+            server.stream_free[server.stream_free_count] = slot;
+            server.stream_free_count += 1;
+        }
+
+        /// A stream's deadline: it ends (CANCEL to the client), and its
+        /// handler's wait fails.
+        fn expire_stream(server: *Server, slot: u32) void {
+            const stream = &server.streams[slot];
+            assert(stream.in_use);
+            server.stream_deadlines[slot] = 0;
+            server.h2_cancel(stream);
+            server.stats.timeouts += 1;
+        }
+
+        fn h2_cancel(server: *Server, stream: *StreamSlot) void {
+            const h2 = stream.h2();
+            stream.ended = true;
+            if (!h2.machine.closed()) h2.machine.cancel(stream.index);
+            stream.signal.notify(server.io);
+        }
+
         /// One request, start to finish. False: close the connection.
         fn serve_request(server: *Server, connection: *Connection) bool {
             if (!server.read_head(connection)) return false;
@@ -897,7 +1670,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             var request: Request = .{
                 .head = &connection.head,
                 .scratch = connection.scratch,
-                .connection = connection,
+                .transport = .{ .http1 = connection },
             };
             var response = server.app.handle(&request);
             defer server.app.release(&response);
@@ -1074,6 +1847,16 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             if (server.draining) {
                 for (server.idle_since) |since| assert(since == 0);
             }
+            var streams_in_use: u32 = 0;
+            for (server.streams, server.stream_deadlines) |*stream, deadline| {
+                if (stream.in_use) {
+                    streams_in_use += 1;
+                    assert(stream.connection.open and stream.connection.http2);
+                } else {
+                    assert(deadline == 0);
+                }
+            }
+            assert(streams_in_use + server.stream_free_count == server.streams.len);
         }
 
         /// The longest wait in ticks: deadlines stay within it of the clock.
@@ -1107,6 +1890,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 server.refresh_date();
                 for (server.deadlines, 0..) |due, index| {
                     if (due != 0 and due <= server.tick) server.expire(@intCast(index));
+                }
+                for (server.stream_deadlines, 0..) |due, slot| {
+                    if (due != 0 and due <= server.tick) server.expire_stream(@intCast(slot));
                 }
                 if (!server.draining and (canceled or server.stop_requested())) {
                     server.drain_start(acceptor);
@@ -1147,6 +1933,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 server.connections[index].stream.shutdown(server.io, .recv) catch {};
                 server.stats.drain_idle += 1;
             }
+            // HTTP/2 connections with streams in flight: GOAWAY, sent with
+            // their next frames; each closes when its last stream ends.
+            for (server.connections, 0..) |*connection, index| {
+                if (connection.open and connection.http2) server.h2[index].machine.goaway();
+            }
         }
 
         /// Each tick of a drain: end the event streams, which have no end
@@ -1159,6 +1950,12 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 assert(connection.stream_state == .streaming);
                 connection.endless = false; // shut once
                 connection.stream.shutdown(server.io, .both) catch {};
+                server.stats.drain_streams += 1;
+            }
+            for (server.streams) |*stream| {
+                if (!stream.in_use or !stream.endless) continue;
+                stream.endless = false;
+                server.h2_cancel(stream);
                 server.stats.drain_streams += 1;
             }
         }

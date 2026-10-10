@@ -698,6 +698,26 @@ pub const Connection = struct {
         if (stream.recv_credit >= stream_window_bytes / 2) connection.deferred = true;
     }
 
+    /// A held stream ended by the server (a drain ending an event stream):
+    /// CANCEL, and its handler's sends refused.
+    pub fn cancel(connection: *Connection, index: u16) void {
+        assert(connection.streams[index].held);
+        _ = connection.reset_stream(index, .cancel);
+    }
+
+    /// The socket is gone: nothing more is sent, and no GOAWAY.
+    pub fn abandon(connection: *Connection) void {
+        if (connection.phase == .closed) return;
+        connection.phase = .closed;
+        connection.goaway_pending = null;
+        connection.goaway_sent = true;
+        connection.goaway_last = connection.last_stream;
+    }
+
+    pub fn closed(connection: *const Connection) bool {
+        return connection.phase == .closed;
+    }
+
     /// Draining: GOAWAY, no new streams; those open finish.
     pub fn goaway(connection: *Connection) void {
         if (connection.goaway_sent) return;
