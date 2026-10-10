@@ -9,12 +9,21 @@ const tables = @import("brotli_tables.zig");
 const context = @import("brotli_context.zig");
 
 /// `insert` literals, then `copy` bytes from `distance` back; the last
-/// command may copy nothing.
+/// command may copy nothing. A distance past the farthest reachable one
+/// (`distance_max`) names a static dictionary word instead, of `copy`
+/// letters, transformed (section 8): `out` is the bytes it produces.
 pub const Command = struct {
     insert: u32,
     copy: u32,
     distance: u32,
+    out: u32,
 };
+
+/// The farthest a copy may reach after `produced` bytes: what has been
+/// produced, within the window. Farther is a dictionary word.
+pub fn distance_max(window: u32, produced: usize) u32 {
+    return @intCast(@min(window, produced));
+}
 
 /// NPOSTFIX 0, NDIRECT 0: the 16 short codes and 48 general ones.
 pub const distance_alphabet = 16 + 48;
@@ -54,8 +63,10 @@ pub const DistanceCache = struct {
     }
 };
 
-/// The command's symbols; the cache moves as the decoder's will.
-pub fn code(command: Command, distances: *DistanceCache) Coded {
+/// The command's symbols; the cache moves as the decoder's will: never for
+/// a dictionary word (`reach` is the farthest real distance here), nor for
+/// the last distance again.
+pub fn code(command: Command, distances: *DistanceCache, reach: u32) Coded {
     const insert = insert_length_code(command.insert);
     // The last command copies nothing: any copy code, never read.
     const copy = if (command.copy == 0) 0 else copy_length_code(command.copy);
@@ -77,20 +88,19 @@ pub fn code(command: Command, distances: *DistanceCache) Coded {
             implied = true; // the last distance, in the symbol itself
         } else if (short) |short_code| {
             coded.distance = short_code;
-            if (short_code != 0) distances.push(command.distance);
         } else {
             code_distance(command.distance, &coded);
-            distances.push(command.distance);
         }
+        if (pushes(distances, command.distance, reach)) distances.push(command.distance);
     }
     coded.insert_copy = insert_copy_symbol(insert, copy, implied);
     return coded;
 }
 
-/// Whether a command with this distance moves the cache: every distance
-/// but the last one's (short code 0) does.
-pub fn pushes(distances: *const DistanceCache, distance: u32) bool {
-    return distances.last[0] != distance;
+/// Whether a copy at this distance moves the cache: a real distance does,
+/// unless it is the last one again (short code 0); a dictionary word never.
+pub fn pushes(distances: *const DistanceCache, distance: u32, reach: u32) bool {
+    return distance <= reach and distances.last[0] != distance;
 }
 
 /// The insert code for `insert` literals: by table where a table is small.
@@ -171,7 +181,7 @@ pub const Histograms = struct {
     insert_copy: [704]u32 = @splat(0),
     distances: [distance_alphabet]u32 = @splat(0),
 
-    pub fn count(input: []const u8, commands: []const Command) Histograms {
+    pub fn count(input: []const u8, commands: []const Command, window: u32) Histograms {
         var histograms: Histograms = .{};
         var distances: DistanceCache = .{};
         var position: usize = 0;
@@ -179,10 +189,11 @@ pub const Histograms = struct {
             for (position..position + command.insert) |at| {
                 histograms.literals[context.at(input, at)][input[at]] += 1;
             }
-            const coded = code(command, &distances);
+            position += command.insert;
+            const coded = code(command, &distances, distance_max(window, position));
             histograms.insert_copy[coded.insert_copy] += 1;
             if (coded.distance) |symbol| histograms.distances[symbol] += 1;
-            position += command.insert + command.copy;
+            position += command.out;
         }
         assert(position == input.len);
         return histograms;

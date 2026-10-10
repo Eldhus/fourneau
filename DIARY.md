@@ -1537,3 +1537,44 @@ recomputed for the merged cluster only (85 ms).
 Against the reference q10: datastar +2.8%, index.html +5.5%, style.css
 +7%, but demo.js +14%, README.md +18%, latest.json +35%: the small files
 lack what they cannot find in themselves, the static dictionary.
+
+## 2026-10-10: brotli encoder, pass 4: the static dictionary
+
+A copy whose distance reaches past everything produced names a
+dictionary word (section 8): 13,504 words of 4..24 letters through 121
+transforms. Two changes to the model first. A word's coded length (its
+base length) can differ from what it produces, so a command carries
+`out`. And a word never enters the distance cache, even when a short
+code names its distance, which can happen near the start, where the
+cache's initial 4, 11, 15, 16 reach past what is produced: so coding a
+command takes the farthest real distance at its position (`reach`).
+
+Finding words (`brotli_words.zig`): words indexed by their first four
+letters, case-folded; at each position each prefix the transforms use
+("", " ", " the ", ".com/", ...), then the words matching after it under
+each transform of that prefix (as is, capitalized, upper-cased, last
+letters omitted; never first letters omitted, whose body does not start
+with the word). Cheap tests first (exact or case-folded common lengths),
+then the transform made and compared. The parser prices a word as a copy
+at distance reach + 1 + id, which does not move the cache.
+
+Sizes (all decode with the reference), now against q10 and q11:
+
+| file | gzip -9 | q10 | q11 | ours |
+|---|---|---|---|---|
+| datastar-v1.0.2.js | 13,287 | 12,278 | 12,038 | 12,183 |
+| demo.js | 1,593 | 1,370 | 1,326 | 1,357 |
+| index.html | 7,896 | 6,301 | 6,067 | 6,273 |
+| style.css | 5,332 | 4,680 | 4,590 | 4,645 |
+| latest.json | 866 | 638 | 645 | 651 |
+| DESIGN.md | 7,418 | 6,443 | 6,257 | 6,332 |
+| server.zig | 13,759 | 12,431 | 12,147 | 12,267 |
+| README.md | 1,837 | 1,532 | 1,486 | 1,516 |
+| favicon.svg | 238 | 198 | 209 | 194 |
+
+Smaller than q10 on all but latest.json (+2%), within 0.6-3.4% of q11,
+smaller than both on favicon.svg. The index page at 79% of gzip's.
+ReleaseFast times: index.html 122 ms, server.zig 256 ms.
+
+What is left of q11's lead is block splitting and distance contexts; at
+~1-3% it can wait. Next: serve it.

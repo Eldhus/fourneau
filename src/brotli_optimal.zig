@@ -17,6 +17,7 @@ const tables = @import("brotli_tables.zig");
 const command_module = @import("brotli_command.zig");
 const context = @import("brotli_context.zig");
 const match = @import("brotli_match.zig");
+const words = @import("brotli_words.zig");
 
 const Allocator = std.mem.Allocator;
 const Command = command_module.Command;
@@ -28,8 +29,9 @@ const Match = match.Match;
 /// and pricing each shorter length costs more than it wins (brotli's
 /// `max_zopfli_len`).
 const long_length = 325;
-/// Matches kept per position.
+/// Matches kept per position, and dictionary words.
 const candidates_max = 16;
+const words_per_position_max = 32;
 /// Rounds of pricing and parsing. Measured on index.html: 1 round 7,159
 /// bytes, 3 rounds 7,126, 6 rounds 7,125.
 pub const rounds = 3;
@@ -77,6 +79,9 @@ const Node = struct {
     /// The copy that reached this node; 0: a literal did.
     length: u32,
     distance: u32,
+    /// The copy's length as coded: `length`, but a dictionary word's base
+    /// length (its transform may make it longer or shorter).
+    copy: u32,
     /// Reached by a literal: the literals since the last command. Reached
     /// by a copy: that command's literals.
     insert: u32,
@@ -137,12 +142,14 @@ pub fn parse(
     try match.parse_lazy(gpa, input, window, commands);
     var matches = try collect(gpa, input, window);
     defer matches.deinit(gpa);
+    var dictionary = try words.Index.init(gpa);
+    defer dictionary.deinit(gpa);
     const nodes = try gpa.alloc(Node, input.len + 1);
     defer gpa.free(nodes);
     for (0..rounds) |_| {
-        const histograms = Histograms.count(input, commands.items);
+        const histograms = Histograms.count(input, commands.items, window);
         const model = Model.from(&histograms);
-        shortest_path(input, window, &matches, &model, nodes);
+        shortest_path(input, window, &matches, &dictionary, &model, nodes);
         try trace(gpa, nodes, commands);
     }
 }
@@ -151,6 +158,7 @@ fn shortest_path(
     input: []const u8,
     window: u32,
     matches: *const Matches,
+    dictionary: *const words.Index,
     model: *const Model,
     nodes: []Node,
 ) void {
@@ -158,6 +166,7 @@ fn shortest_path(
     const unreached: Node = .{
         .cost = std.math.inf(f32),
         .length = 0,
+        .copy = 0,
         .distance = 0,
         .insert = 0,
         .shortcut = 0,
@@ -165,12 +174,14 @@ fn shortest_path(
     @memset(nodes, unreached);
     nodes[0].cost = 0;
     var skip_until: usize = 0;
+    var found: [words_per_position_max]words.Found = undefined;
     for (0..input.len) |position| {
         const node = nodes[position];
         assert(node.cost < std.math.inf(f32)); // a literal reaches every node
         relax(nodes, position + 1, .{
             .cost = node.cost + model.literal_bits(input, position),
             .length = 0,
+            .copy = 0,
             .distance = 0,
             .insert = node.run() + 1,
             .shortcut = node.shortcut,
@@ -183,7 +194,7 @@ fn shortest_path(
             skip_until = position + here[here.len - 1].length;
         }
         const cache = cache_at(nodes, position);
-        var from: Copies = .{ .position = position, .node = node, .cache = cache, .model = model };
+        const from: Copies = .init(position, node, cache, model, window);
         // The cache's own distances first: often shorter, and cheap. Only
         // `long_length` ahead: a longer copy is among the matches anyway,
         // and looking further made a run of zeros quadratic (15 s for
@@ -199,6 +210,8 @@ fn shortest_path(
             from.lengths(nodes, candidate.distance, shortest, candidate.length);
             shortest = candidate.length + 1;
         }
+        const count = dictionary.find(input, position, &found);
+        for (found[0..count]) |word| from.word(nodes, word);
     }
 }
 
@@ -206,51 +219,96 @@ fn relax(nodes: []Node, position: usize, candidate: Node) void {
     if (candidate.cost < nodes[position].cost) nodes[position] = candidate;
 }
 
-/// Copies from one node, priced.
+/// Copies from one node, priced: the literals before them are the node's
+/// run, and the distances they may reach end at `reach`.
 const Copies = struct {
     position: usize,
     node: Node,
     cache: DistanceCache,
     model: *const Model,
+    reach: u32,
+    insert_code: u5,
+    insert_bits: f32,
+
+    fn init(
+        position: usize,
+        node: Node,
+        cache: DistanceCache,
+        model: *const Model,
+        window: u32,
+    ) Copies {
+        const insert_code = command_module.insert_length_code(node.run());
+        return .{
+            .position = position,
+            .node = node,
+            .cache = cache,
+            .model = model,
+            .reach = command_module.distance_max(window, position),
+            .insert_code = insert_code,
+            .insert_bits = @floatFromInt(tables.insert_ranges[insert_code].extra),
+        };
+    }
 
     /// Copies of `shortest..longest` bytes at `distance`: each length up
     /// to `long_length`, and the longest.
-    fn lengths(copies: *Copies, nodes: []Node, distance: u32, shortest: u32, longest: u32) void {
+    fn lengths(
+        copies: *const Copies,
+        nodes: []Node,
+        distance: u32,
+        shortest: u32,
+        longest: u32,
+    ) void {
+        assert(distance <= copies.reach);
         if (shortest > longest) return;
-        const model = copies.model;
-        const run = copies.node.run();
-        const insert_code = command_module.insert_length_code(run);
-        const insert_bits: f32 = @floatFromInt(tables.insert_ranges[insert_code].extra);
-        const short = copies.cache.short_code(distance);
-        const distance_bits: f32 = if (short) |code|
-            model.distance[code]
-        else blk: {
-            var coded: command_module.Coded = undefined;
-            command_module.code_distance(distance, &coded);
-            const extra: f32 = @floatFromInt(coded.distance_extra_bits);
-            break :blk model.distance[coded.distance.?] + extra;
-        };
-        const moves = command_module.pushes(&copies.cache, distance);
+        const price = copies.distance_price(distance);
         const top = @min(longest, long_length);
         var length = shortest;
         for (0..longest - shortest + 2) |_| {
             if (length > longest) break;
             if (length > top) length = longest;
-            const copy_code = command_module.copy_length_code(length);
-            const implied = short == 0 and insert_code < 8 and copy_code < 16;
-            const symbol = command_module.insert_copy_symbol(insert_code, copy_code, implied);
-            const copy_bits: f32 = @floatFromInt(tables.copy_ranges[copy_code].extra);
-            const end = copies.position + length;
-            relax(nodes, end, .{
-                .cost = copies.node.cost + model.insert_copy[symbol] + insert_bits + copy_bits +
-                    (if (implied) 0 else distance_bits),
-                .length = length,
-                .distance = distance,
-                .insert = run,
-                .shortcut = if (moves) @intCast(end) else copies.node.shortcut,
-            });
+            copies.edge(nodes, .{ .out = length, .copy = length, .distance = distance }, price);
             length += 1;
         } else unreachable;
+    }
+
+    /// A static dictionary word: its distance is past the reach, by its id.
+    fn word(copies: *const Copies, nodes: []Node, found: words.Found) void {
+        const distance = copies.reach + 1 + found.id;
+        const edge_copy: Edge = .{ .out = found.out, .copy = found.length, .distance = distance };
+        copies.edge(nodes, edge_copy, copies.distance_price(distance));
+    }
+
+    /// A copy producing `out` bytes, coded as `copy` of them at `distance`.
+    const Edge = struct { out: u32, copy: u32, distance: u32 };
+
+    const DistancePrice = struct { bits: f32, short: ?u16 };
+
+    fn distance_price(copies: *const Copies, distance: u32) DistancePrice {
+        if (copies.cache.short_code(distance)) |code| {
+            return .{ .bits = copies.model.distance[code], .short = code };
+        }
+        var coded: command_module.Coded = undefined;
+        command_module.code_distance(distance, &coded);
+        const extra: f32 = @floatFromInt(coded.distance_extra_bits);
+        return .{ .bits = copies.model.distance[coded.distance.?] + extra, .short = null };
+    }
+
+    fn edge(copies: *const Copies, nodes: []Node, copy: Edge, price: DistancePrice) void {
+        const copy_code = command_module.copy_length_code(copy.copy);
+        const implied = price.short == 0 and copies.insert_code < 8 and copy_code < 16;
+        const symbol = command_module.insert_copy_symbol(copies.insert_code, copy_code, implied);
+        const copy_bits: f32 = @floatFromInt(tables.copy_ranges[copy_code].extra);
+        const end = copies.position + copy.out;
+        const moves = command_module.pushes(&copies.cache, copy.distance, copies.reach);
+        relax(nodes, end, .{
+            .cost = copies.node.cost + copies.model.insert_copy[symbol] + copies.insert_bits +
+                copy_bits + (if (implied) 0 else price.bits),
+            .length = copy.out,
+            .copy = copy.copy,
+            .distance = copy.distance,
+            .insert = copies.node.run(),
+            .shortcut = if (moves) @intCast(end) else copies.node.shortcut,
+        });
     }
 };
 
@@ -281,7 +339,9 @@ fn trace(
     commands.clearRetainingCapacity();
     var position = nodes.len - 1;
     const trailing = nodes[position].run();
-    if (trailing > 0) try commands.append(gpa, .{ .insert = trailing, .copy = 0, .distance = 0 });
+    if (trailing > 0) {
+        try commands.append(gpa, .{ .insert = trailing, .copy = 0, .distance = 0, .out = 0 });
+    }
     position -= trailing;
     for (0..nodes.len) |_| {
         if (position == 0) break;
@@ -289,8 +349,9 @@ fn trace(
         assert(node.length > 0); // literals are counted in the copy's insert
         try commands.append(gpa, .{
             .insert = node.insert,
-            .copy = node.length,
+            .copy = node.copy,
             .distance = node.distance,
+            .out = node.length,
         });
         position -= node.length + node.insert;
     } else unreachable;
@@ -306,15 +367,33 @@ test "brotli_optimal: the parse covers the input and copies what was there" {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         @embedFile("testdata/style.css"),
     };
+    const window = 1 << 20;
+    var words_used: usize = 0;
     for (inputs) |input| {
         var commands: std.ArrayList(Command) = .empty;
         defer commands.deinit(gpa);
-        try parse(gpa, input, 1 << 20, &commands);
+        try parse(gpa, input, window, &commands);
+        // Replayed as section 10 decodes: literals, then a copy, or a word
+        // when the distance reaches past what was produced.
         var out: [4096]u8 = undefined;
         var used: usize = 0;
         for (commands.items) |command| {
             @memcpy(out[used..][0..command.insert], input[used..][0..command.insert]);
             used += command.insert;
+            const reach = command_module.distance_max(window, used);
+            if (command.copy > 0 and command.distance > reach) {
+                words_used += 1;
+                const id = command.distance - reach - 1;
+                const bits = tables.ndbits[command.copy];
+                const word = tables.word(command.copy, id & ((@as(u32, 1) << bits) - 1));
+                var buffer: [tables.transformed_bytes_max]u8 = undefined;
+                const made = tables.transform_word(word, @intCast(id >> bits), &buffer);
+                try std.testing.expectEqual(command.out, made.len);
+                @memcpy(out[used..][0..made.len], made);
+                used += made.len;
+                continue;
+            }
+            try std.testing.expectEqual(command.copy, command.out);
             for (0..command.copy) |_| {
                 out[used] = out[used - command.distance];
                 used += 1;
@@ -322,4 +401,5 @@ test "brotli_optimal: the parse covers the input and copies what was there" {
         }
         try std.testing.expectEqualStrings(input, out[0..used]);
     }
+    try std.testing.expect(words_used > 0); // the sentences and the CSS use some
 }
