@@ -74,7 +74,10 @@
       limit.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). 1 to 4 done (2026-10-10); starting 5, HTTP/2.
+     release (checked). 1 to 4 done (2026-10-10). 5, HTTP/2: planned in
+     docs/http2.md (layers: HPACK, frames, the connection's state
+     machine, the server; stream slots held until handlers return).
+     Starting HPACK.
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
