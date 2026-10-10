@@ -132,13 +132,15 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
             response.* = undefined;
         }
 
-        /// The redirect's server on `port`, beside a shard's HTTPS one.
+        /// The redirect's server on `port`, beside a shard's HTTPS one, and
+        /// stopped with it (`Config.stop`).
         pub fn listen(
             redirect: *Redirect,
             gpa: Allocator,
             io: Io,
             address: []const u8,
             port: u16,
+            stop: *const std.atomic.Value(bool),
         ) !Server {
             const plain = try std.Io.net.IpAddress.parse(address, port);
             const listen_options: Io.net.IpAddress.ListenOptions = .{
@@ -146,7 +148,9 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
                 .kernel_backlog = 1024,
             };
             const listener = try plain.listen(io, listen_options);
-            return Server.init(gpa, io, redirect, listener, config);
+            var stopped = config;
+            stopped.stop = stop;
+            return Server.init(gpa, io, redirect, listener, stopped);
         }
     };
 }

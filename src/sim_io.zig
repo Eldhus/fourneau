@@ -228,6 +228,12 @@ pub const Sim = struct {
         return .{ .userdata = sim, .vtable = &vtable };
     }
 
+    /// Whether a task (`io.concurrent`'s) has finished: for the
+    /// simulator's own loop, which cannot await.
+    pub fn finished(sim: *const Sim, any_future: *Io.AnyFuture) bool {
+        return sim.fibers[sim.fiber_index(any_future)].state == .done;
+    }
+
     pub fn now_ns(sim: *const Sim) u64 {
         return sim.tick_now * sim.options.tick_ns;
     }

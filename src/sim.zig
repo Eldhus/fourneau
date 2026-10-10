@@ -43,6 +43,10 @@ pub const Setup = struct {
     /// Clients start at random ticks up to this one.
     start_ticks_max: u32,
     ticks_max: u64,
+    /// The tick the server is told to stop (`Config.stop`), if it is: it
+    /// must drain and return within `drain_ticks_max` of it.
+    stop_tick: ?u64,
+    drain_ticks_max: u64,
 };
 
 pub fn setup(prng: *Prng) Setup {
@@ -81,10 +85,10 @@ pub fn setup(prng: *Prng) Setup {
     // A server that waits for the client after a stream cut short is
     // closed by its idle timeout at the soonest: the silence must be less.
     assert(cut_short_silence_ticks_max < server.idle_timeout_ms);
-    return .{
+    var plan: Setup = .{
         .server = server,
         .network = .{
-            // The server's own count, and the fiber `run` accepts on:
+            // The server's own count, and the fiber `run` itself runs on:
             // exact, so every interleaving tests the count.
             .fibers_max = server.fibers_max() + 1,
             .stack_bytes = 512 * 1024,
@@ -109,7 +113,29 @@ pub fn setup(prng: *Prng) Setup {
         .linked = prng.boolean(),
         .start_ticks_max = prng.int_at_most(u32, 0, 2000),
         .ticks_max = 2_000_000,
+        .stop_tick = null,
+        .drain_ticks_max = 0,
     };
+    if (prng.boolean()) plan_stop(prng, &plan, latency_ticks_max); // last: see there
+    return plan;
+}
+
+/// When the server is told to stop, and how long its drain may take. Drawn
+/// after everything else, so a seed that does not stop replays as before.
+fn plan_stop(prng: *Prng, plan: *Setup, latency_ticks_max: u32) void {
+    const server = &plan.server;
+    plan.stop_tick = prng.int_at_most(u64, 0, plan.start_ticks_max + 4000);
+    // Never shorter than a fast client's longest wait, so the drain's
+    // deadline cuts only slow clients, never a fast one's response.
+    const waits_ms_max = @max(
+        @max(server.head_timeout_ms, server.body_timeout_ms),
+        server.send_timeout_ms,
+    );
+    server.drain_timeout_ms = waits_ms_max + prng.int_at_most(u32, 0, 500);
+    // Noticed at the next tick; then the deadline; then the closes, each a
+    // few network turns late at most.
+    plan.drain_ticks_max = 6 * server.tick_ms + server.drain_timeout_ms +
+        (latency_ticks_max + 1) * 8;
 }
 
 /// The simulated application: it reads every request body (the model
@@ -227,6 +253,12 @@ pub const Outcome = struct {
     timed_out: u64,
     /// Streams the application gave up on, as the clients received them.
     cut_short: u64,
+    /// Drains: runs stopped, connections closed idle at a drain's start
+    /// and at its deadline, and new ones closed unserved.
+    stopped: u64,
+    drain_idle: u64,
+    drain_cut: u64,
+    shut_out: u64,
 };
 
 pub fn run(gpa: std.mem.Allocator, seed: u64, canary: bool) !Outcome {
@@ -262,7 +294,10 @@ fn run_server(
     clients_seed: u64,
 ) !Outcome {
     const io = sim.io();
-    var server = try Server.init(gpa, io, app, listener, plan.server);
+    var stop: std.atomic.Value(bool) = .init(false);
+    var config = plan.server;
+    config.stop = &stop;
+    var server = try Server.init(gpa, io, app, listener, config);
     defer server.deinit(gpa);
 
     const clients = try gpa.alloc(sim_client.Client, plan.clients_count);
@@ -275,23 +310,60 @@ fn run_server(
     }
 
     // The server runs on a fiber; this loop is the simulator's own. Its
-    // future is never awaited: the run ends when the clients do.
-    _ = try io.concurrent(Server.run, .{&server});
-    const ticks = loop(sim, &server, clients, plan.ticks_max);
-    return outcome(&server, clients, ticks, plan.ticks_max);
+    // future is never awaited: the simulator's loop is no fiber. A run
+    // ends when the clients do, or, told to stop, when the server returns.
+    const running = try io.concurrent(Server.run, .{&server});
+    const run_task = running.any_future.?;
+    const ticks = loop(sim, &server, clients, plan, &stop, run_task);
+    var result = outcome(&server, clients, ticks, plan.ticks_max);
+    if (result.exit_code == 0 and plan.stop_tick != null) {
+        const stop_tick = plan.stop_tick.?;
+        // Told to stop, it must return within the drain's bound.
+        if (!sim.finished(run_task) or ticks > stop_tick + plan.drain_ticks_max) {
+            std.debug.print("server: not drained by tick {d} (stopped at {d})\n", .{
+                stop_tick + plan.drain_ticks_max, stop_tick,
+            });
+            result.exit_code = exit_liveness;
+        }
+    }
+    return result;
 }
 
-fn loop(sim: *sim_io.Sim, server: anytype, clients: []sim_client.Client, ticks_max: u64) u64 {
-    for (0..ticks_max) |tick| {
+/// Ticks for the clients to read the last bytes of a drained server.
+const settle_ticks = 4;
+
+fn loop(
+    sim: *sim_io.Sim,
+    server: anytype,
+    clients: []sim_client.Client,
+    plan: Setup,
+    stop: *std.atomic.Value(bool),
+    run_task: *std.Io.AnyFuture,
+) u64 {
+    var returned_tick: ?u64 = null;
+    for (0..plan.ticks_max) |tick| {
         sim.tick_now = tick;
+        if (plan.stop_tick == tick) {
+            stop.store(true, .release);
+            for (clients) |*client| client.server_draining = true;
+        }
         for (clients) |*client| client.step(sim, tick);
         const runs = sim.run_ready(runs_per_tick_max);
         assert(runs < runs_per_tick_max); // fibers woke each other without end
         server.check_invariants();
-        if (finished(server, clients)) return tick;
         if (failed(clients)) return tick;
+        if (returned_tick == null and sim.finished(run_task)) returned_tick = tick;
+        if (returned_tick) |returned| {
+            if (tick >= returned + settle_ticks) return tick;
+            continue;
+        }
+        // One that will be stopped runs until it returns.
+        if (plan.stop_tick == null and finished(server, clients)) return tick;
+        if (plan.stop_tick) |stop_tick| {
+            if (tick > stop_tick + plan.drain_ticks_max) return tick; // judged by the caller
+        }
     }
-    return ticks_max;
+    return plan.ticks_max;
 }
 
 fn finished(server: anytype, clients: []const sim_client.Client) bool {
@@ -325,12 +397,17 @@ fn outcome(
         .retries = 0,
         .timed_out = 0,
         .cut_short = 0,
+        .stopped = @intFromBool(server.draining),
+        .drain_idle = server.stats.drain_idle,
+        .drain_cut = server.stats.drain_cut,
+        .shut_out = 0,
     };
     for (clients, 0..) |*client, index| {
         result.responses += client.stats.responses;
         result.retries += client.stats.retries;
         result.timed_out += client.stats.timed_out;
         result.cut_short += client.stats.cut_short;
+        result.shut_out += client.stats.shut_out;
         if (client.failure != .none) {
             if (client.report_failures) std.debug.print("client {d}: {s} at request {d}\n", .{
                 index, @tagName(client.failure), client.failure_index,
@@ -351,8 +428,11 @@ pub fn print(seed: u64, result: Outcome) void {
     std.debug.print("seed={d} exit={d} ticks={d} requests={d} responses={d} refused={d} ", .{
         seed, result.exit_code, result.ticks, result.requests, result.responses, result.refused,
     });
-    std.debug.print("retries={d} timeouts={d}/{d} cut_short={d}\n", .{
+    std.debug.print("retries={d} timeouts={d}/{d} cut_short={d} ", .{
         result.retries, result.timed_out, result.timeouts, result.cut_short,
+    });
+    std.debug.print("stopped={d} drain_idle={d} drain_cut={d} shut_out={d}\n", .{
+        result.stopped, result.drain_idle, result.drain_cut, result.shut_out,
     });
 }
 
