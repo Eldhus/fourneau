@@ -5308,45 +5308,31 @@ fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     for (sockets) |sock| ev.close(sock.handle);
 }
 
+/// fourneau: the system call, not IORING_OP_SHUTDOWN. A shutdown never
+/// blocks, so the ring bought nothing, and cost a race: the caller yielded
+/// until the operation completed, and meanwhile the fiber that owns the
+/// socket could close it; io_uring does not order unlinked operations, so
+/// the shutdown could run after the close and fail with EBADF (fourneau's
+/// drain, shutting many idle connections at once, 2026-10-09). Now no
+/// fiber runs between a caller's check that the socket is open and the
+/// shutdown.
 fn netShutdown(
     userdata: ?*anyopaque,
     handle: net.Socket.Handle,
     how: net.ShutdownHow,
 ) net.ShutdownError!void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
-    while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .SHUTDOWN,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = handle,
-            .off = 0,
-            .addr = 0,
-            .len = switch (how) {
-                .recv => linux.SHUT.RD,
-                .send => linux.SHUT.WR,
-                .both => linux.SHUT.RDWR,
-            },
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.yield(null, .nothing);
-        switch (cancel_region.errno()) {
-            .SUCCESS => return,
-            .INTR, .CANCELED => {},
-            .BADF, .NOTSOCK, .INVAL => |err| return errnoBug(err),
-            .NOTCONN => return error.SocketUnconnected,
-            .NOBUFS => return error.SystemResources,
-            else => |err| return unexpectedErrno(err),
-        }
+    _ = userdata;
+    const flags: i32 = switch (how) {
+        .recv => linux.SHUT.RD,
+        .send => linux.SHUT.WR,
+        .both => linux.SHUT.RDWR,
+    };
+    switch (linux.errno(linux.shutdown(handle, flags))) {
+        .SUCCESS => return,
+        .BADF, .NOTSOCK, .INVAL => |err| return errnoBug(err),
+        .NOTCONN => return error.SocketUnconnected,
+        .NOBUFS => return error.SystemResources,
+        else => |err| return unexpectedErrno(err),
     }
 }
 
