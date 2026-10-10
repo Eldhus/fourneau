@@ -232,14 +232,26 @@ const TextCopy = struct {
 /// the wait after it nothing changes.
 const Signal = struct {
     word: u32 = 0,
+    /// Fibers waiting now. A wake is a system call (an io_uring enter)
+    /// even when none waits, so it is made only when one does (the zig
+    /// skill's evented.md: ~2.9 us a request in roux's VFS).
+    waiters: u32 = 0,
 
     fn wait(signal: *Signal, io: Io, seen: u32) Io.Cancelable!void {
+        signal.waiters += 1;
+        defer signal.waiters -= 1;
         return io.futexWait(u32, &signal.word, seen);
+    }
+
+    fn wait_uncancelable(signal: *Signal, io: Io, seen: u32) void {
+        signal.waiters += 1;
+        defer signal.waiters -= 1;
+        io.futexWaitUncancelable(u32, &signal.word, seen);
     }
 
     fn notify(signal: *Signal, io: Io) void {
         signal.word +%= 1;
-        io.futexWake(u32, &signal.word, std.math.maxInt(u32));
+        if (signal.waiters > 0) io.futexWake(u32, &signal.word, std.math.maxInt(u32));
     }
 };
 
@@ -1369,7 +1381,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             // Bounded only to say so: each pass sees a stream fiber end.
             for (0..std.math.maxInt(u64)) |_| {
                 if (h2.fibers == 0) break;
-                server.io.futexWaitUncancelable(u32, &h2.signal.word, h2.signal.word);
+                h2.signal.wait_uncancelable(server.io, h2.signal.word);
             } else unreachable;
             assert(h2.machine.streams_held() == 0);
             connection.http2 = false;

@@ -1782,3 +1782,19 @@ segments (TESTING.md); against `/echo` it is 146 of 147 every run.
 Resident memory after the load: 278 MB, all of one mapping, since oha's
 reconnects (45,901) had cycled through all 1,024 connection slots, and
 each slot's HTTP/2 machine is ~110 KB (TODO: smaller).
+
+## 2026-10-10: HTTP/2: wake only a fiber that waits
+
+The zig skill knew it (roux's VFS, 2026-10-06): `io.futexWake` is an
+`io_uring_enter` even with no waiter. The server's `Signal` woke on
+every send's end, and every window update woke each of the connection's
+streams. Now it counts its waiters and wakes only when one waits.
+
+`fourneau-hello --counts`, oha 400,000 requests at 32 connections of 8
+streams, h2c, the two builds interleaved twice (the desktop at load 2.3,
+so the rates are noisy; the counts are not):
+
+| per 100 requests | submissions | enters | requests/s |
+|---|---|---|---|
+| woken always | 175, 175 | 126, 125 | 324k, 311k |
+| woken when one waits | 52, 51 | 2, 3 | 380k, 377k |
