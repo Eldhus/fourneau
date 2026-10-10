@@ -1418,3 +1418,31 @@ no static workload. So it is not built (bespoke, not a product), and
 DESIGN's promise of "zero-copy sends, which kTLS keeps working over
 HTTPS" was wrong: corrected. Revisit when a site serves large files, or
 for a static-file race.
+
+## 2026-10-09: brotli, first the decoder
+
+Is an encoder of our own worth it? Measured on the deployed site's own
+files, the reference `brotli -q 11` against `gzip -9`: datastar.js
+13,287 to 12,038 bytes (91%), demo.js 83%, favicon.svg 88%, style.css
+5,332 to 4,590 (86%), the index page 7,896 to 6,067 (77%), latest.json
+74%. A real gain on a first visit, but most of it is brotli's machinery
+(the static dictionary, context modeling, optimal parsing): a plain
+LZ77-and-Huffman brotli would land near gzip. So the encoder is built in
+passes, each kept only when it shrinks these files.
+
+First the oracle: `brotli_tables.zig` (the RFC's tables, each checked
+against the CRC-32 the RFC publishes for it: dictionary, transforms,
+the three context lookups; all matched the first time) and
+`brotli_decode.zig`, strict and plain (a bit at a time, canonical codes
+decoded a length at a time, as puff does). The dictionary is vendored
+(`vendor/brotli/`, google/brotli's `dictionary.bin`, CRC 0x5136cb04 as
+the RFC says), copied in with `cp`: a binary file has no Edit.
+
+Checked against the reference: 13 files (the site's assets, prose, Zig,
+100 KB of random bytes, 70 KB of zeros, empty, one byte) at qualities 0,
+1, 2, 5, 9 and 11, 78 streams, every one decoded byte for byte by
+`fourneau-brotli decode` (a file-to-file tool for these comparisons).
+Every byte of style.css's q11 stream flipped (4,590 streams, Debug
+build): 4,044 refused, 546 decoded to other bytes (brotli carries no
+checksum), no crash. The suite keeps one reference stream (3,000 bytes
+of the stylesheet, q11) and flips each of its bytes three ways.

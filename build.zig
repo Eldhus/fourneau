@@ -40,6 +40,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = test_optimize,
     }));
+    // Brotli's static dictionary (vendor/brotli: data the format fixes).
+    tests.root_module.addImport("brotli_dictionary", b.createModule(.{
+        .root_source_file = b.path("vendor/brotli/dictionary.zig"),
+        .target = target,
+        .optimize = test_optimize,
+    }));
     const optimize = b.standardOptimizeOption(.{});
     // For programs that embed fourneau (fourneau-dragrace's competitors):
     // the server and our port of Evented, in the importer's mode and target.
@@ -110,6 +116,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(static);
+
+    // Our brotli, file to file, against the reference (brotli_tool.zig).
+    const brotli_tool = b.addExecutable(.{
+        .name = "fourneau-brotli",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/brotli_tool.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "brotli_dictionary", .module = b.createModule(.{
+                .root_source_file = b.path("vendor/brotli/dictionary.zig"),
+            }) }},
+        }),
+    });
+    b.installArtifact(brotli_tool);
 
     const load = b.addExecutable(.{
         .name = "fourneau-load",

@@ -69,7 +69,10 @@
       limit.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). 1, 2 and 3 done; starting 4.
+     release (checked). 1, 2 and 3 done. 4: the decoder (the oracle)
+     done and checked against the reference; next the encoder in
+     passes, measured against `gzip -9` and `brotli -q 11` on the site's
+     files (DIARY).
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does

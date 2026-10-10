@@ -1,0 +1,81 @@
+/* FOURNEAU DRAG RACE: a drag strip at sunset, with something cooking.
+ *
+ * Dark only, on purpose: a deep purple evening, warm flames, no menace.
+ * Series colors are fixed per competitor (never by rank) and were
+ * validated together against --surface with the dataviz palette checks
+ * (all pairs: lightness band, chroma, contrast >= 3:1 vs the surface,
+ * normal-vision dE 19.5; colorblind dE 6.4 at worst, axum and roux;
+ * basic-webserver's violet, added 2026-10-06, is 9.9 from every other),
+ * so every bar is also labeled with its competitor's name, and every
+ * chart has a table view).
+ * Re-run the checks before changing or adding one.
+ */
+:root {
+  color-scheme: dark;
+  --surface: #170b26;
+  --surface-2: #211235;
+  --surface-3: #2d1947;
+  --grid: #3b2459;
+  --text: #fbf2ff;
+  --text-2: #cfb8e6;
+  --text-3: #9a82b8;
+  --magenta: #ff5fb4;
+  --flame: #ffa94d;
+  --gold: #ffd76e;
+  --link: #ffd76e;
+  --series-go: #3987e5;
+  --series-axum: #c98500;
+  --series-fourneau-zig: #e64fae;
+  --series-roux: #19a35f;
+  --series-basic-webserver: #8010f8;
+  --pixel: "Press Start 2P", ui-monospace, monospace;
+  --mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--surface); }
+body {
+  margin: 0;
+  background:
+    radial-gradient(ellipse at 50% 0%, #4b1f6e 0%, transparent 60%),
+    var(--surface);
+  color: var(--text);
+  font: 16px/1.65 var(--mono);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { color: var(--magenta); }
+code { font-family: var(--mono); background: var(--surface-3); padding: 0 .35em; border-radius: 3px; }
+
+/* CRT: scanlines and a soft vignette over everything, ignoring the mouse. */
+.crt {
+  pointer-events: none;
+  position: fixed; inset: 0; z-index: 50;
+  background:
+    repeating-linear-gradient(to bottom, transparent 0, transparent 2px, rgba(0,0,0,.16) 3px),
+    radial-gradient(ellipse at center, transparent 62%, rgba(10,0,25,.45) 100%);
+}
+
+/* Masthead: the fire, a sunset logo, the copper bars. */
+.masthead {
+  position: relative;
+  padding: 48px 16px 0;
+  text-align: center;
+  overflow: hidden;
+  border-bottom: 1px solid var(--grid);
+}
+/* The masthead is the same on every page, the logo, the menu and the bar
+   in the same place (the owner, 2026-10-07); on the front page the fire
+   burns up from the bar behind the menu and the logo. */
+#fire {
+  position: absolute; left: 0; right: 0; bottom: 6px; width: 100%; height: 70%; z-index: 0;
+  image-rendering: pixelated; opacity: .6;
+  mask-image: linear-gradient(to top, black 40%, transparent);
+}
+.logo, nav, .copper { position: relative; z-index: 1; }
+.logo { display: inline-block; text-decoration: none; line-height: 1.1; margin-bottom: 22px; }
+.logo span { display: block; font-family: var(--pixel); letter-spacing: .06em; }
+.logo-top {
+  font-size: clamp(22px, 6vw, 52px);
+  background: linear-gradient(#fff7e0 0%, #ffd76e 38%, #ffa9
