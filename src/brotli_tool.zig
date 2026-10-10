@@ -2,9 +2,11 @@
 //! reference (`brotli`) by hand and in `zig build brotli-check`.
 //!
 //!   fourneau-brotli decode IN OUT
+//!   fourneau-brotli encode IN OUT
 
 const std = @import("std");
 const brotli_decode = @import("brotli_decode.zig");
+const brotli_encode = @import("brotli_encode.zig");
 
 const bytes_max = 64 * 1024 * 1024;
 
@@ -23,5 +25,9 @@ pub fn main(init: std.process.Init) !void {
         defer init.gpa.free(output);
         const decoded = try brotli_decode.decode(init.gpa, input, output);
         try cwd.writeFile(io, .{ .sub_path = out_path, .data = decoded });
+    } else if (std.mem.eql(u8, command, "encode")) {
+        const encoded = try brotli_encode.encode(init.gpa, input);
+        defer init.gpa.free(encoded);
+        try cwd.writeFile(io, .{ .sub_path = out_path, .data = encoded });
     } else return error.Usage;
 }

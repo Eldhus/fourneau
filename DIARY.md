@@ -1446,3 +1446,36 @@ Every byte of style.css's q11 stream flipped (4,590 streams, Debug
 build): 4,044 refused, 546 decoded to other bytes (brotli carries no
 checksum), no crash. The suite keeps one reference stream (3,000 bytes
 of the stylesheet, q11) and flips each of its bytes three ways.
+
+## 2026-10-09: brotli encoder, pass 1: a plain stream
+
+One meta-block, one block type and one prefix code per category, LSB6
+context (unused: one literal code), NPOSTFIX and NDIRECT 0; hash-chain
+LZ77 (4-byte hash, 1,024 steps, matches from 4 bytes) with one-step lazy
+matching; length-limited Huffman codes (the reference's way: raise the
+smallest counts until the tree fits) written as simple codes up to four
+symbols, else complex with the reference's run-length coding; the
+four-distance cache used for any distance it names, the last one implied
+in the insert-and-copy symbol where the codes allow; an uncompressed
+meta-block when that is smaller.
+
+The decoder caught one bug at once: the fixed code for code-length code
+lengths, which the RFC prints "as parsed from the right"; read as binary
+numbers, the patterns are already the values to write least significant
+bit first, and I had reversed them. The Huffman code, the RFC's
+canonical example and every run of 1..119 lengths are tests.
+
+Every stream decodes with the reference `brotli -d` (13 files), and the
+sizes are what the doubt predicted, gzip's (ReleaseSafe build): 
+
+| file | bytes | gzip -9 | brotli -q 11 | ours |
+|---|---|---|---|---|
+| datastar-v1.0.2.js | 34,083 | 13,287 | 12,038 | 13,255 |
+| index.html | 37,624 | 7,896 | 6,067 | 7,629 |
+| style.css | 15,543 | 5,332 | 4,590 | 5,304 |
+| DESIGN.md | 16,852 | 7,418 | 6,257 | 7,344 |
+| server.zig | 56,824 | 13,759 | 12,147 | 13,578 |
+| latest.json | 1,814 | 866 | 645 | 862 |
+| random.bin | 100,000 | 100,049 | 100,005 | 100,005 |
+
+Next: the passes that make brotli brotli, each measured on this table.
