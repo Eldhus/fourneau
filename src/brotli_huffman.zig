@@ -40,10 +40,6 @@ pub const BitWriter = struct {
         try writer.write(gpa, 0, 8 - writer.pending_count);
         assert(writer.pending_count == 0);
     }
-
-    pub fn bit_count(writer: *const BitWriter) u64 {
-        return writer.bytes.items.len * 8 + writer.pending_count;
-    }
 };
 
 /// A prefix code over an alphabet: each symbol's length and its code,
