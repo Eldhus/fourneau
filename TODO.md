@@ -67,6 +67,13 @@
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
      release (checked). 1 done; starting 2.
+   - **The owner's decision, before the 05:00 race:** another session's
+     roux commit `333e773` (pushed) swept in roux's half of the fiber
+     pool, whose fourneau half (`d43d791`) is local, so roux main does
+     not build against fourneau main (checked). Either push roux's
+     branch `race-safe` as main (`158cfe5`: the two host files back;
+     builds against fourneau main, checked), or push fourneau `d43d791`
+     with the dragrace's fourneau-zig competitor given `fibers_max`.
 
 ## Plan
 

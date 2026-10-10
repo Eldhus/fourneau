@@ -1254,3 +1254,19 @@ A mistake of mine: I first wrote this entry with a shell heredoc, which
 the owner's rules forbid (edits go through Edit, so they show as a
 diff); the hook refused it. Rule kept: never append to a file from the
 shell.
+
+## 2026-10-09: roux's half of the pool, pushed without fourneau's
+
+I edited roux's `host/host.zig` and `host/floor.zig` for the pool and
+built roux to check them, meaning to commit them after fourneau's
+commit. Meanwhile another session committed in roux with a blanket add
+(`333e773 README: v0.2.4`, 22:17) and pushed it, my two files inside.
+fourneau `d43d791` is not pushed, so roux main stopped building against
+fourneau main (built in scratch worktrees at both origins: `no field or
+member function named 'fibers_max'`), and the nightly races both mains.
+Prepared, not pushed: roux's branch `race-safe` (`158cfe5`), the two
+files back as in `5bb7310`, which builds against fourneau main. The
+choice is the owner's (WIP 3). Consequence of my part: an edit left
+uncommitted in a repository another session works in is that session's
+to sweep. Rule: edit a sibling repository only when ready to commit,
+and commit those paths at once.
