@@ -76,9 +76,16 @@
       the site's socket units; the owner runs `site install-server` once
       it is merged. The old-and-new overlap the plan feared does not
       happen (stop, then start), so the locked-memory limit holds.
-   7. Differential tests against Go and axum (M11, `dragrace diff`).
-   - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). 1 to 4 done (2026-10-10). 5, HTTP/2: planned in
+   7. ~~Differential tests against Go and axum (M11, `dragrace diff`)~~
+      (done 2026-10-10: three fixes, 28 divergences kept as decisions in
+      docs/differential.md; the command on the dragrace's `after-race`).
+      M11's other half, the static server against Go's FileServer,
+      tower-http's ServeDir and Caddy, is in that doc's "Next".
+   - Where it stands (2026-10-10): every item done; Zig 0.17.0 still the
+     newest release (checked again: master is 0.18.0-dev.131). After the
+     race, the owner merges the `after-race` branches of roux and
+     fourneau-dragrace (each needs fourneau main pushed first) and runs
+     `site install-server` for the socket units. 1 to 4 done. 5, HTTP/2: planned in
      docs/http2.md (layers: HPACK, frames, the connection's state
      machine, the server; stream slots held until handlers return).
      HPACK (`eb43c46`), frames (`ced6ca7`), the connection's state
@@ -105,11 +112,15 @@
      (now `76a41bb`; `b9ffad1` gives fourneau-zig `fibers_max`, built and
      served, checked). The race then runs the pool, the drain and
      brotli (the dragrace site's static files get brotli copies).
-     Since this note, fourneau main has HTTP/2 too (HPACK to ALPN):
-     pushing it puts HTTP/2 on the site at its next deploy
-     (`fourneau-static` speaks it); fourneau-zig and roux leave
-     `Config.http2` unset, so the race's HTTP/1.1 path is the same code
-     but for the protocol switch in `Request` (roux builds, checked).
+     Since this note, fourneau main has more (all local, roux main and
+     the dragrace's main fourneau-zig build against it, checked at
+     `367d79d`): HTTP/2 (only where `Config.http2` is set:
+     `fourneau-static`, `fourneau-hello`; roux main and fourneau-zig
+     leave it unset, so the site, a roux app, stays HTTP/1.1 until roux's
+     `after-race`); socket activation (used only when systemd passes
+     sockets); and three HTTP/1.1 parser changes from the differential
+     test (HTTP/1.2 read as 1.1, garbage refused at once, a small unread
+     body skipped), which the race's workloads do not reach.
 
 ## Plan
 
