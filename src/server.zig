@@ -713,6 +713,24 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 connection.recv_used = start + @as(u32, @intCast(rest.len));
             }
 
+            /// A length-framed body the handler did not read, all of it
+            /// already received: skipped, so the connection can serve the
+            /// next request (Go and axum do; the differential test found a
+            /// GET with a small body closing the connection, and losing
+            /// the request pipelined after it). One still on its way, or
+            /// chunked, is not read for nothing: the connection closes.
+            fn skip_buffered_body(connection: *Connection) void {
+                const remaining = switch (connection.body) {
+                    .length => |length| length,
+                    .none, .chunked => return,
+                };
+                assert(remaining > 0);
+                const buffered = connection.recv_used - connection.request_end;
+                if (remaining > buffered) return;
+                connection.request_end += @intCast(remaining);
+                connection.body = .none;
+            }
+
             fn send_continue(connection: *Connection) BodyError!void {
                 if (!connection.head.expect_continue or connection.continue_sent) return;
                 connection.continue_sent = true;
@@ -730,9 +748,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 headers: []const http1_response.Header,
             ) StreamError!void {
                 assert(connection.stream_state == .none);
-                // A body left unread cannot be skipped safely: the
-                // connection closes after this response, and its head
-                // must say so now.
+                // A body left unread and not here cannot be skipped
+                // safely: the connection closes after this response, and
+                // its head must say so now.
+                connection.skip_buffered_body();
                 if (connection.body != .none) connection.keep_alive = false;
                 const result = connection.write_head(status, headers, .chunked) orelse
                     return error.Disconnected;
@@ -1870,8 +1889,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// The handler's response, sent whole.
         fn write_unstreamed(server: *Server, connection: *Connection, response: App.Response) bool {
             assert(connection.stream_state == .none);
-            // A body the handler left unread cannot be skipped safely:
-            // the connection closes after this response.
+            // A body the handler left unread and not here cannot be
+            // skipped safely: the connection closes after this response.
+            connection.skip_buffered_body();
             if (connection.body != .none) connection.keep_alive = false;
             return server.write_response(connection, .{
                 .status = response.status,

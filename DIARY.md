@@ -1863,3 +1863,22 @@ not bind: shutting a listening socket down stops it listening for every
 copy, the redirect after it included. It polls instead, seeing its stop
 within 100 ms. A test answers a challenge on a held socket and finds it
 still listening after; with the shutdown put back, it fails.
+
+## 2026-10-10: second opinions: Go and axum, byte for byte (M11)
+
+`dragrace diff` (the dragrace's branch `after-race`): 59 requests as raw
+bytes to fourneau-zig, Go and axum, each on a new connection, the
+answers compared by status, close and body. 46 differed at first; the
+triage, and every case kept, is docs/differential.md. Fixed in fourneau:
+`HTTP/1.2` read as 1.1 (RFC 9110 §2.5; was 505), bytes that cannot
+begin a method refused at once (TLS on the plain port waited 10 s for a
+line end), and a length-framed body already received but unread is
+skipped rather than closing the connection (a GET with a small body lost
+the request pipelined after it). `Head.path()` is new (no query). The
+competitor routes HEAD as GET, ignores the query, answers 405 with
+`Allow`. Then 28 differ, each a decision: stricter on purpose (both
+framings, bare LF, chunked in HTTP/1.0, folding), our limits (413, 414,
+431), or the app's (`OPTIONS *`, dot segments, percent-encoding).
+
+The simulator's "bad version" was `HTTP/1.2`, expecting 505: now
+`HTTP/3.0`. 1,000 seeds pass.

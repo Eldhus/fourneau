@@ -100,6 +100,13 @@ pub const Head = struct {
     keep_alive: bool,
     /// The client waits for `100 Continue` before sending the body.
     expect_continue: bool,
+
+    /// The path without its query: what an application routes on (`*`
+    /// for `OPTIONS *`). No percent-decoding: `/%70` is not `/p` here.
+    pub fn path(head: *const Head) []const u8 {
+        const whole = head.path_and_query;
+        return whole[0 .. std.mem.indexOfScalar(u8, whole, '?') orelse whole.len];
+    }
 };
 
 pub const Result = union(enum) {
@@ -165,6 +172,16 @@ pub const Parser = struct {
             return .{ .refusal = .bad_request }; // an LF without its CR
         }
         if (parser.request_line == null) {
+            // A method is a token: bytes that cannot begin one (TLS sent
+            // to a plain port, a scanner's garbage) are refused at once,
+            // not waited on for a line end until the head's timeout (the
+            // differential test found the wait). A lone CR may begin one
+            // of the empty lines allowed before a request.
+            const method_end = std.mem.indexOfScalar(u8, partial, ' ') orelse partial.len;
+            const method = partial[0..method_end];
+            if (!std.mem.eql(u8, method, "\r") and !all_in(method, &token_table)) {
+                return .{ .refusal = .bad_request };
+            }
             const target_bytes_max = parser.limits.target_bytes_max;
             // A request line longer than any method, target and version.
             if (partial.len > target_bytes_max + request_line_overhead_bytes) {
@@ -289,6 +306,9 @@ fn parse_version(text: []const u8) VersionResult {
     // HTTP/0.9 is never well-formed here): 505. Anything else is garbage.
     const well_formed = text.len == 8 and std.mem.startsWith(u8, text, "HTTP/") and
         std.ascii.isDigit(text[5]) and text[6] == '.' and std.ascii.isDigit(text[7]);
+    // A later minor version of 1 is read as 1.1, the highest known (RFC
+    // 9110 §2.5; Go does, the differential test found us refusing it).
+    if (well_formed and text[5] == '1') return .{ .version = .http_1_1 };
     return .{ .refusal = if (well_formed) .version_not_supported else .bad_request };
 }
 
@@ -633,6 +653,23 @@ test "http1: head: incomplete until the blank line" {
 test "http1: head: empty lines before the request line are ignored" {
     const head = try expect_head("\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n");
     try testing.expectEqualStrings("/", head.target);
+    try expect_incomplete("\r");
+    try expect_incomplete("\r\n\r");
+}
+
+test "http1: head: the path, without its query" {
+    const head = try expect_head("GET /a/b?c=d HTTP/1.1\r\nHost: h\r\n\r\n");
+    try testing.expectEqualStrings("/a/b", head.path());
+    const plain = try expect_head("GET /a HTTP/1.1\r\nHost: h\r\n\r\n");
+    try testing.expectEqualStrings("/a", plain.path());
+}
+
+test "http1: head: bytes that cannot begin a method are refused before a line ends" {
+    try expect_refusal(.bad_request, "\x16\x03\x01\x00\x05hello"); // TLS on a plain port
+    try expect_refusal(.bad_request, "GE{");
+    try expect_refusal(.bad_request, "\r\n\x00");
+    try expect_incomplete("GET");
+    try expect_incomplete("PRI * HTTP/2.0"); // HTTP/2's preface is the server's to take
 }
 
 test "http1: head: a pipelined request after the head is left alone" {
@@ -670,10 +707,11 @@ test "http1: head: request line refusals" {
     try expect_refusal(.bad_request, "GET / HTTP/1.10\r\nHost: h\r\n\r\n");
 }
 
-test "http1: head: other versions are 505" {
+test "http1: head: other versions are 505; a later 1.x is 1.1" {
     try expect_refusal(.version_not_supported, "GET / HTTP/2.0\r\nHost: h\r\n\r\n");
-    try expect_refusal(.version_not_supported, "GET / HTTP/1.2\r\nHost: h\r\n\r\n");
     try expect_refusal(.version_not_supported, "GET / HTTP/0.9\r\nHost: h\r\n\r\n");
+    const head = try expect_head("GET / HTTP/1.2\r\nHost: h\r\n\r\n");
+    try testing.expectEqual(Version.http_1_1, head.version);
 }
 
 test "http1: head: methods are case-sensitive tokens" {

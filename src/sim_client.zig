@@ -280,7 +280,8 @@ pub fn write_request(spec: *const Spec, limits: Limits, out: []u8) []const u8 {
     } else {
         writer.text(target_text(spec, &target_buffer));
     }
-    writer.text(if (spec.kind == .bad_version) " HTTP/1.2\r\n" else " HTTP/1.1\r\n");
+    // Not HTTP/1.2: a later 1.x is read as 1.1 (RFC 9110 §2.5).
+    writer.text(if (spec.kind == .bad_version) " HTTP/3.0\r\n" else " HTTP/1.1\r\n");
     writer.text("Host: sim.example\r\n");
     write_headers(spec, limits, &writer);
     writer.text(if (spec.kind == .bare_lf) "\n" else "\r\n");
