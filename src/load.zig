@@ -3,6 +3,7 @@
 //!
 //!   fourneau-load --port P [--path /] [--connections N] [--threads T]
 //!                 [--seconds S] [--pipeline K] [--format text|json]
+//!                 [--mode requests|events]
 //!
 //! Built as the server is: each thread owns an io_uring and a fixed array
 //! of connections, each a small state machine (send K requests, read K
@@ -11,12 +12,20 @@
 //! Latency goes into a log-linear histogram of fixed buckets, so the
 //! percentiles cost no memory per request.
 //!
+//! `--mode events` measures a server-sent event stream instead: each
+//! connection asks for the path once and reads the stream, counting
+//! events, and asks again when it ends. The body is decoded by the
+//! server's own chunked decoder and the events by the format's rules (a
+//! blank line after a `data` field), never by searching the bytes.
+//!
 //! Why our own: on one 8-core machine, oha on two cores saturated at
 //! ~160k requests/s while a six-core server sat at 134% CPU, so it measured oha, not servers.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
+const http1_chunked = @import("http1_chunked.zig");
+const stdx = @import("stdx.zig");
 
 const Options = struct {
     port: u16 = 8080,
@@ -28,6 +37,99 @@ const Options = struct {
     /// `text`, for people (stderr); `json`, one object on stdout, for a
     /// program that shows the result (roux's dev server).
     format: enum { text, json } = .text,
+    /// `requests`: answers a second; `events`: server-sent events a
+    /// second, each connection holding one stream at a time.
+    mode: enum { requests, events } = .requests,
+};
+
+/// A stream's body: as long as it lasts, within reason.
+const stream_limits: http1_chunked.Limits = .{
+    .body_bytes_max = 1 << 50,
+    .extension_bytes_max = 4096,
+    .trailer_bytes_max = 4096,
+};
+
+/// Server-sent events counted as they arrive, by the format's rules
+/// (WHATWG HTML, "Parsing an event stream"): lines end in CRLF, LF or CR;
+/// a blank line dispatches an event if a `data` field came since the last
+/// one; comments (`:`) and other fields alone dispatch nothing.
+const EventCounter = struct {
+    /// No byte of the current line yet.
+    line_empty: bool = true,
+    /// Still in the line's field name (no `:` yet).
+    in_name: bool = false,
+    /// How much of "data" the name has matched; more than 4: not "data".
+    name_matched: u8 = 0,
+    /// The last line ended in CR: an LF next is part of that end.
+    after_cr: bool = false,
+    /// A `data` field since the last event.
+    has_data: bool = false,
+
+    const field = "data";
+
+    fn feed(counter: *EventCounter, bytes: []const u8) u64 {
+        var events: u64 = 0;
+        var index: usize = 0;
+        // Each pass takes at least one byte.
+        for (0..bytes.len + 1) |_| {
+            if (index == bytes.len) break;
+            const byte = bytes[index];
+            if (counter.after_cr) {
+                counter.after_cr = false;
+                if (byte == '\n') {
+                    index += 1;
+                    continue;
+                }
+            }
+            if (byte == '\r' or byte == '\n') {
+                events += counter.line_end();
+                counter.after_cr = byte == '\r';
+                index += 1;
+            } else if (counter.line_empty or counter.in_name) {
+                counter.name_byte(byte);
+                index += 1;
+            } else {
+                // A field's value: nothing in it matters until its end.
+                const end = std.mem.indexOfAnyPos(u8, bytes, index, "\r\n") orelse bytes.len;
+                assert(end > index);
+                index = end;
+            }
+        } else unreachable;
+        assert(index == bytes.len);
+        return events;
+    }
+
+    fn name_byte(counter: *EventCounter, byte: u8) void {
+        assert(byte != '\r' and byte != '\n');
+        if (counter.line_empty) {
+            counter.line_empty = false;
+            counter.in_name = true;
+            counter.name_matched = 0;
+        }
+        assert(counter.in_name);
+        if (byte == ':') {
+            counter.in_name = false;
+            if (counter.name_matched == field.len) counter.has_data = true;
+        } else if (counter.name_matched < field.len and byte == field[counter.name_matched]) {
+            counter.name_matched += 1;
+        } else {
+            counter.name_matched = field.len + 1;
+        }
+    }
+
+    /// One line ended: a blank one dispatches; "data" alone is a field.
+    fn line_end(counter: *EventCounter) u64 {
+        var dispatched = false;
+        if (counter.line_empty) {
+            dispatched = counter.has_data;
+            counter.has_data = false;
+        } else if (counter.in_name and counter.name_matched == field.len) {
+            counter.has_data = true;
+        }
+        counter.line_empty = true;
+        counter.in_name = false;
+        return @intFromBool(dispatched);
+    }
 };
 
 const response_buffer_bytes = 64 * 1024;
@@ -91,6 +193,10 @@ const Connection = struct {
     response_used: u32,
     responses_due: u32,
     sent_ns: u64,
+    /// `--mode events`: past the stream's head, into its chunked body.
+    in_body: bool = false,
+    decoder: http1_chunked.Decoder = .init(stream_limits),
+    counter: EventCounter = .{},
 };
 
 const Worker = struct {
@@ -101,6 +207,9 @@ const Worker = struct {
     histogram: Histogram = .{},
     responses: u64 = 0,
     errors: u64 = 0,
+    /// `--mode events`: events read, and room to decode a body into.
+    events: u64 = 0,
+    decoded: []u8,
     address: linux.sockaddr.in,
 
     fn run(worker: *Worker, deadline_ns: u64) void {
@@ -181,7 +290,10 @@ const Worker = struct {
                 connection.state = .receiving;
                 worker.receive(connection, cqe.user_data);
             },
-            .receiving => worker.on_receive(connection, cqe, now),
+            .receiving => switch (worker.options.mode) {
+                .requests => worker.on_receive(connection, cqe, now),
+                .events => worker.on_receive_events(connection, cqe, now),
+            },
             .failed => {},
         }
     }
@@ -228,7 +340,75 @@ const Worker = struct {
         if (connection.responses_due == 0) return worker.send(connection, cqe.user_data, now);
         worker.receive(connection, cqe.user_data);
     }
+
+    /// A stream's bytes: its head, then its body, decoded and its events
+    /// counted as they come; at its end, the next stream is asked for.
+    fn on_receive_events(
+        worker: *Worker,
+        connection: *Connection,
+        cqe: linux.io_uring_cqe,
+        now: u64,
+    ) void {
+        assert(worker.options.pipeline == 1);
+        if (cqe.res == 0) return worker.fail(connection);
+        connection.response_used += @intCast(cqe.res);
+        var input: []const u8 = connection.response[0..connection.response_used];
+        if (!connection.in_body) {
+            const head_end = std.mem.indexOf(u8, input, "\r\n\r\n") orelse {
+                if (input.len == connection.response.len) return worker.fail(connection);
+                return worker.receive(connection, cqe.user_data);
+            };
+            if (!is_event_stream_head(input[0..head_end])) return worker.fail(connection);
+            connection.in_body = true;
+            connection.decoder = .init(stream_limits);
+            connection.counter = .{};
+            worker.histogram.record(now - connection.sent_ns);
+            input = input[head_end + 4 ..];
+        }
+        // Each pass consumes input, or fills the decoded bytes' room.
+        for (0..input.len + 1) |_| {
+            if (input.len == 0) break;
+            const progress = switch (connection.decoder.decode(input, worker.decoded)) {
+                .progress => |progress| progress,
+                .refusal => return worker.fail(connection),
+            };
+            assert(progress.consumed > 0 or progress.produced > 0);
+            worker.events += connection.counter.feed(worker.decoded[0..progress.produced]);
+            input = input[progress.consumed..];
+            if (progress.done) {
+                // Nothing was asked for after the stream.
+                if (input.len > 0) return worker.fail(connection);
+                connection.in_body = false;
+                connection.response_used = 0;
+                worker.responses += 1;
+                return worker.send(connection, cqe.user_data, now);
+            }
+        } else unreachable;
+        connection.response_used = 0;
+        worker.receive(connection, cqe.user_data);
+    }
+
+    fn fail(worker: *Worker, connection: *Connection) void {
+        worker.errors += 1;
+        connection.state = .failed;
+    }
 };
+
+/// A 200 whose body is chunked: what a stream of events is sent as.
+fn is_event_stream_head(head: []const u8) bool {
+    if (!std.mem.startsWith(u8, head, "HTTP/1.1 200 ")) return false;
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next(); // The status line.
+    var chunked = false;
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (stdx.equal_ignoring_case(line[0..colon], "transfer-encoding")) {
+            chunked = stdx.equal_ignoring_case(value, "chunked");
+        }
+    }
+    return chunked;
+}
 
 /// The bytes of one response at the start of `bytes`, if it is all here.
 fn response_length(bytes: []const u8) ?usize {
@@ -279,9 +459,14 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
         } else if (std.mem.eql(u8, arg, "--format")) {
             options.format = std.meta.stringToEnum(@TypeOf(options.format), value) orelse
                 return error.Usage;
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            options.mode = std.meta.stringToEnum(@TypeOf(options.mode), value) orelse
+                return error.Usage;
         } else return error.Usage;
     }
     if (options.pipeline == 0 or options.pipeline > 64) return error.Usage;
+    // A stream holds its connection until it ends: one at a time.
+    if (options.mode == .events and options.pipeline != 1) return error.Usage;
     if (options.threads == 0 or options.connections < options.threads) return error.Usage;
     return options;
 }
@@ -301,7 +486,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     for (workers) |*worker| {
         const connections = try gpa.alloc(Connection, per_thread);
         for (connections) |*connection| {
-            connection.response = try gpa.alloc(u8, response_buffer_bytes);
+            connection.* = .{
+                .fd = -1,
+                .state = .failed,
+                .response = try gpa.alloc(u8, response_buffer_bytes),
+                .response_used = 0,
+                .responses_due = 0,
+                .sent_ns = 0,
+            };
         }
         const entries = try std.math.ceilPowerOfTwo(u32, @max(per_thread * 2, 64));
         worker.* = .{
@@ -309,6 +501,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .ring = try linux.IoUring.init(@intCast(@min(entries, 32768)), 0),
             .connections = connections,
             .request = request,
+            .decoded = try gpa.alloc(u8, response_buffer_bytes),
             .address = .{
                 .port = std.mem.nativeToBig(u16, options.port),
                 .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
@@ -322,7 +515,53 @@ pub fn main(init: std.process.Init.Minimal) !void {
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, deadline });
     }
     for (threads) |thread| thread.join();
-    report(workers, now_ns() - start, options.format);
+    const elapsed_ns = now_ns() - start;
+    switch (options.mode) {
+        .requests => report(workers, elapsed_ns, options.format),
+        .events => report_events(workers, elapsed_ns, options.format),
+    }
+}
+
+/// Events a second; streams are the ones that ended (and were asked
+/// again); the percentiles are of the time to a stream's head.
+fn report_events(workers: []Worker, elapsed_ns: u64, format: @FieldType(Options, "format")) void {
+    var histogram: Histogram = .{};
+    var events: u64 = 0;
+    var streams: u64 = 0;
+    var errors: u64 = 0;
+    for (workers) |*worker| {
+        histogram.merge(&worker.histogram);
+        events += worker.events;
+        streams += worker.responses;
+        errors += worker.errors;
+    }
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const rate = @as(f64, @floatFromInt(events)) / seconds;
+    if (format == .json) {
+        var buffer: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "{{\"events_per_second\":{d:.0}," ++
+            "\"events\":{d},\"streams\":{d},\"errors\":{d},\"head_p50_us\":{d}," ++
+            "\"head_p99_us\":{d}}}\n", .{
+            rate,
+            events,
+            streams,
+            errors,
+            histogram.percentile_us(500),
+            histogram.percentile_us(990),
+        }) catch unreachable; // six numbers fit
+        _ = linux.write(1, line.ptr, line.len);
+        return;
+    }
+    std.debug.print("events/s={d:.0} events={d} streams={d} errors={d} ", .{
+        rate,
+        events,
+        streams,
+        errors,
+    });
+    std.debug.print("head p50={d}us p99={d}us\n", .{
+        histogram.percentile_us(500),
+        histogram.percentile_us(990),
+    });
 }
 
 fn report(workers: []Worker, elapsed_ns: u64, format: @FieldType(Options, "format")) void {
@@ -381,4 +620,52 @@ test "load: response framing" {
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello\nHTTP/1.1";
     try std.testing.expectEqual(@as(?usize, 44), response_length(response));
     try std.testing.expectEqual(@as(?usize, null), response_length(response[0..40]));
+}
+
+fn count_events(stream: []const u8) u64 {
+    var counter: EventCounter = .{};
+    return counter.feed(stream);
+}
+
+test "load: events end at a blank line, after a data field" {
+    // Datastar's shape: an event line, data lines, a blank line.
+    const patch = "event: datastar-patch-elements\ndata: elements <b id=\"n\">7</b>\n\n";
+    try std.testing.expectEqual(1, count_events(patch));
+    try std.testing.expectEqual(3, count_events(patch ++ patch ++ patch));
+    // Every line ending the format allows, mixed.
+    try std.testing.expectEqual(3, count_events("data: a\r\n\r\ndata: b\r\rdata: c\n\r\n"));
+    // "data" with no colon is a data field with an empty value.
+    try std.testing.expectEqual(1, count_events("data\n\n"));
+}
+
+test "load: events: what dispatches nothing" {
+    try std.testing.expectEqual(0, count_events(": a comment\n\n"));
+    try std.testing.expectEqual(0, count_events("event: x\nid: 1\nretry: 5\n\n"));
+    try std.testing.expectEqual(0, count_events("dat: a\n\ndatas: a\n\n data: a\n\n"));
+    // Blank lines alone, and an event not ended yet.
+    try std.testing.expectEqual(0, count_events("\n\n\r\n\rdata: a\n"));
+    // CRLF is one line end, not two: no blank line between these fields.
+    try std.testing.expectEqual(0, count_events("event: x\r\ndata: a\r\n"));
+}
+
+test "load: events: a stream split anywhere counts the same" {
+    const stream = "event: e\r\ndata: one\r\n\r\n: ping\n\ndata\rdata: two\n\ndata: three\r\r";
+    try std.testing.expectEqual(3, count_events(stream));
+    for (0..stream.len + 1) |split| {
+        var counter: EventCounter = .{};
+        const events = counter.feed(stream[0..split]) + counter.feed(stream[split..]);
+        try std.testing.expectEqual(3, events);
+    }
+}
+
+test "load: a stream's head" {
+    const chunked = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" ++
+        "Transfer-Encoding: chunked";
+    try std.testing.expect(is_event_stream_head(chunked));
+    try std.testing.expect(is_event_stream_head("HTTP/1.1 200 OK\r\ntransfer-encoding:  Chunked "));
+    try std.testing.expect(!is_event_stream_head("HTTP/1.1 404 Not Found\r\n" ++
+        "Transfer-Encoding: chunked"));
+    try std.testing.expect(!is_event_stream_head("HTTP/1.1 200 OK\r\nContent-Length: 5"));
+    try std.testing.expect(!is_event_stream_head("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip"));
+    try std.testing.expect(!is_event_stream_head("HTTP/1.1 200 OK\r\nno colon"));
 }
