@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const stdx = @import("stdx.zig");
 const Prng = @import("prng.zig").Prng;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -338,8 +339,10 @@ pub const DynamicTable = struct {
     const Entry = struct { start: u32, name_length: u32, value_length: u32 };
 
     pub fn init(gpa: std.mem.Allocator, size_limit: u32) std.mem.Allocator.Error!DynamicTable {
-        const bytes = try gpa.alloc(u8, @as(usize, size_limit) * 2);
-        errdefer gpa.free(bytes);
+        // Untouched until a client's headers fill it: a server holds one
+        // beside every connection slot (`stdx.alloc_untouched`).
+        const bytes = try stdx.alloc_untouched(gpa, u8, .of(u8), @as(usize, size_limit) * 2);
+        errdefer stdx.free_untouched(gpa, u8, .of(u8), bytes);
         return .{
             .bytes = bytes,
             // An entry takes 32 at least: no more than this many fit.
@@ -350,7 +353,7 @@ pub const DynamicTable = struct {
     }
 
     pub fn deinit(table: *DynamicTable, gpa: std.mem.Allocator) void {
-        gpa.free(table.bytes);
+        stdx.free_untouched(gpa, u8, .of(u8), table.bytes);
         gpa.free(table.entries);
         table.* = undefined;
     }

@@ -28,7 +28,8 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const maybe = @import("stdx.zig").maybe;
+const stdx = @import("stdx.zig");
+const maybe = stdx.maybe;
 const http1_head = @import("http1_head.zig");
 const http1_chunked = @import("http1_chunked.zig");
 const http1_response = @import("http1_response.zig");
@@ -181,6 +182,16 @@ const recv_window_bytes = 4096;
 pub const scratch_align = 16;
 /// The slabs a scratch is cut from start on a page.
 const slab_align = std.heap.page_size_min;
+
+/// A slab every slot takes a stride of, its pages untouched until a slot
+/// first writes them (`stdx.alloc_untouched` says why).
+fn slab_alloc(gpa: std.mem.Allocator, comptime T: type, count: usize) ![]align(slab_align) T {
+    return stdx.alloc_untouched(gpa, T, .fromByteUnits(slab_align), count);
+}
+
+fn slab_free(gpa: std.mem.Allocator, comptime T: type, slab: []align(slab_align) T) void {
+    stdx.free_untouched(gpa, T, .fromByteUnits(slab_align), slab);
+}
 
 pub const BodyError = error{ BadRequest, ContentTooLarge, Disconnected };
 
@@ -369,10 +380,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         free_slots: Io.Semaphore,
         group: Io.Group = .init,
         /// The slabs every connection takes its strides of.
-        recv_slab: []u8 = &.{},
-        heads_slab: []u8 = &.{},
+        recv_slab: []align(slab_align) u8 = &.{},
+        heads_slab: []align(slab_align) u8 = &.{},
         scratch_slab: []align(slab_align) u8 = &.{},
-        headers_slab: []Header = &.{},
+        headers_slab: []align(slab_align) Header = &.{},
         stats: Stats = .{},
         /// The Date header, refreshed by the timekeeper each tick, not read
         /// from the clock per response (that was 6% of a pipelined
@@ -391,7 +402,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         stream_free_count: u32 = 0,
         stream_deadlines: []u32 = &.{},
         stream_slab: []align(slab_align) u8 = &.{},
-        stream_headers_slab: []Header = &.{},
+        stream_headers_slab: []align(slab_align) Header = &.{},
 
         /// An HTTP/2 connection's state, beside its slot's `Connection`
         /// (whose `recv` it reads into).
@@ -971,14 +982,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 @max(config.body_timeout_ms, config.send_timeout_ms),
             );
             server.ticks_max = server.ticks_for(timeout_ms_max);
-            const recv = try gpa.alloc(u8, count * config.recv_bytes());
-            const heads = try gpa.alloc(u8, count * config.send_bytes_max);
-            const scratch = try gpa.alignedAlloc(
-                u8,
-                .fromByteUnits(slab_align),
-                count * config.scratch_bytes_max,
-            );
-            const headers = try gpa.alloc(Header, count * config.headers_max);
+            const recv = try slab_alloc(gpa, u8, count * config.recv_bytes());
+            const heads = try slab_alloc(gpa, u8, count * config.send_bytes_max);
+            const scratch = try slab_alloc(gpa, u8, count * config.scratch_bytes_max);
+            const headers = try slab_alloc(gpa, Header, count * config.headers_max);
             for (server.connections, 0..) |*connection, index_usize| {
                 const index: u32 = @intCast(index_usize);
                 connection.* = undefined;
@@ -1026,8 +1033,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.stream_free = try gpa.alloc(u32, count);
             server.stream_deadlines = try gpa.alloc(u32, count);
             const slab_bytes = @as(usize, count) * bytes;
-            server.stream_slab = try gpa.alignedAlloc(u8, .fromByteUnits(slab_align), slab_bytes);
-            server.stream_headers_slab = try gpa.alloc(Header, count * config.headers_max);
+            server.stream_slab = try slab_alloc(gpa, u8, slab_bytes);
+            server.stream_headers_slab = try slab_alloc(gpa, Header, count * config.headers_max);
             for (server.streams, 0..) |*stream, index_usize| {
                 const index: u32 = @intCast(index_usize);
                 const own = stride(u8, server.stream_slab, bytes, index);
@@ -1061,10 +1068,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             gpa.free(server.deadlines);
             gpa.free(server.idle_since);
             gpa.free(server.free);
-            gpa.free(server.recv_slab);
-            gpa.free(server.heads_slab);
-            gpa.free(server.scratch_slab);
-            gpa.free(server.headers_slab);
+            slab_free(gpa, u8, server.recv_slab);
+            slab_free(gpa, u8, server.heads_slab);
+            slab_free(gpa, u8, server.scratch_slab);
+            slab_free(gpa, Header, server.headers_slab);
             if (server.h2.len > 0) {
                 for (server.h2) |*h2| h2.machine.deinit(gpa);
                 gpa.free(server.h2);
@@ -1072,8 +1079,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 gpa.free(server.streams);
                 gpa.free(server.stream_free);
                 gpa.free(server.stream_deadlines);
-                gpa.free(server.stream_slab);
-                gpa.free(server.stream_headers_slab);
+                slab_free(gpa, u8, server.stream_slab);
+                slab_free(gpa, Header, server.stream_headers_slab);
             }
             server.* = undefined;
         }

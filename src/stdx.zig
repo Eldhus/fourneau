@@ -62,6 +62,54 @@ test "stdx: copy_disjoint" {
     try std.testing.expectEqualStrings("xycd", &target);
 }
 
+/// `count` items, their pages untouched until first written. Not
+/// `alloc`: in a safe build it writes `undefined` (0xAA) over all it
+/// gives, and `free` over all it takes back, which made all of a server's
+/// slots resident at startup. One shard of 1,024 connections with HTTP/2
+/// was 406 MB, more than a 512 MiB machine's kernel lets a server keep.
+/// For memory
+/// allocated at startup for slots that may never be used; the items are
+/// undefined, as `alloc`'s are.
+pub fn alloc_untouched(
+    gpa: std.mem.Allocator,
+    comptime T: type,
+    comptime alignment: std.mem.Alignment,
+    count: usize,
+) std.mem.Allocator.Error![]align(alignment.toByteUnits()) T {
+    comptime assert(alignment.compare(.gte, .of(T)));
+    assert(count > 0);
+    const bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfMemory;
+    const raw = gpa.rawAlloc(bytes, alignment, @returnAddress()) orelse
+        return error.OutOfMemory;
+    assert(alignment.check(@intFromPtr(raw)));
+    const items: [*]align(alignment.toByteUnits()) T = @ptrCast(@alignCast(raw));
+    return items[0..count];
+}
+
+/// Gives back what `alloc_untouched` gave, at the same alignment.
+pub fn free_untouched(
+    gpa: std.mem.Allocator,
+    comptime T: type,
+    comptime alignment: std.mem.Alignment,
+    items: []align(alignment.toByteUnits()) T,
+) void {
+    assert(items.len > 0);
+    assert(alignment.check(@intFromPtr(items.ptr)));
+    gpa.rawFree(std.mem.sliceAsBytes(items), alignment, @returnAddress());
+}
+
+test "stdx: alloc_untouched" {
+    const gpa = std.testing.allocator; // its leak check pairs the two
+    const page = comptime std.mem.Alignment.fromByteUnits(std.heap.page_size_min);
+    const items = try alloc_untouched(gpa, u32, page, 3000);
+    try std.testing.expect(page.check(@intFromPtr(items.ptr)));
+    try std.testing.expectEqual(3000, items.len);
+    items[2999] = 7; // all of it is ours
+    free_untouched(gpa, u32, page, items);
+    const words = try alloc_untouched(gpa, u64, .of(u64), 1);
+    free_untouched(gpa, u64, .of(u64), words);
+}
+
 /// `text` repeated `count` times, at compile time (Zig 0.17 removed `**`).
 pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count]u8 {
     comptime {

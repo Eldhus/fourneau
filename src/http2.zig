@@ -226,14 +226,16 @@ pub const Connection = struct {
         limits.assert_valid();
         var decoder: hpack.Decoder = try .init(gpa, header_table_bytes);
         errdefer decoder.deinit(gpa);
-        const block = try gpa.alloc(u8, limits.head_bytes_max);
-        errdefer gpa.free(block);
-        const head = try gpa.alloc(u8, limits.head_bytes());
-        errdefer gpa.free(head);
+        // A server holds one beside every connection slot, from startup:
+        // the buffers stay untouched until a client speaks HTTP/2.
+        const block = try stdx.alloc_untouched(gpa, u8, .of(u8), limits.head_bytes_max);
+        errdefer stdx.free_untouched(gpa, u8, .of(u8), block);
+        const head = try stdx.alloc_untouched(gpa, u8, .of(u8), limits.head_bytes());
+        errdefer stdx.free_untouched(gpa, u8, .of(u8), head);
         const fields = try gpa.alloc(hpack.Header, limits.fields_max());
         errdefer gpa.free(fields);
-        const out = try gpa.alloc(u8, limits.out_bytes);
-        errdefer gpa.free(out);
+        const out = try stdx.alloc_untouched(gpa, u8, .of(u8), limits.out_bytes);
+        errdefer stdx.free_untouched(gpa, u8, .of(u8), out);
         const stream_ids = try gpa.alloc(u32, limits.streams_max);
         errdefer gpa.free(stream_ids);
         const streams = try gpa.alloc(Stream, limits.streams_max);
@@ -251,10 +253,10 @@ pub const Connection = struct {
 
     pub fn deinit(connection: *Connection, gpa: std.mem.Allocator) void {
         connection.decoder.deinit(gpa);
-        gpa.free(connection.block);
-        gpa.free(connection.head);
+        stdx.free_untouched(gpa, u8, .of(u8), connection.block);
+        stdx.free_untouched(gpa, u8, .of(u8), connection.head);
         gpa.free(connection.fields);
-        gpa.free(connection.out);
+        stdx.free_untouched(gpa, u8, .of(u8), connection.out);
         gpa.free(connection.stream_ids);
         gpa.free(connection.streams);
         connection.* = undefined;
