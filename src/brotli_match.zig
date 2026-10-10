@@ -6,13 +6,7 @@ const assert = std.debug.assert;
 
 const Allocator = std.mem.Allocator;
 
-/// `insert` literals, then `copy` bytes from `distance` back; the last
-/// command may copy nothing.
-pub const Command = struct {
-    insert: u32,
-    copy: u32,
-    distance: u32,
-};
+const Command = @import("brotli_command.zig").Command;
 
 pub const Match = struct { length: u32, distance: u32 };
 
@@ -93,7 +87,36 @@ pub const Chains = struct {
     }
 };
 
-fn common_length(a: []const u8, b: []const u8) usize {
+/// Every match worth having at `position`, nearest first: each one longer
+/// than all nearer ones (so any length up to its own is had at its
+/// distance, the nearest that has it). Stops at `out.len` matches, or at
+/// one of `long` bytes, which no later one improves enough to matter.
+pub fn candidates(chains: *Chains, position: usize, long: u32, out: []Match) usize {
+    assert(out.len > 0);
+    if (position + match_min > chains.input.len) return 0;
+    chains.insert_until(position);
+    const rest = chains.input[position..];
+    var count: usize = 0;
+    var best: usize = match_min - 1;
+    var candidate = chains.heads[chains.hash(position)];
+    for (0..chain_steps_max) |_| {
+        if (candidate == 0 or count == out.len) break;
+        const earlier = candidate - 1;
+        const distance: u32 = @intCast(position - earlier);
+        if (distance > chains.window) break;
+        const length = common_length(chains.input[earlier..], rest);
+        if (length > best) {
+            best = length;
+            out[count] = .{ .length = @intCast(length), .distance = distance };
+            count += 1;
+            if (length >= long or length == rest.len) break;
+        }
+        candidate = chains.previous[earlier];
+    }
+    return count;
+}
+
+pub fn common_length(a: []const u8, b: []const u8) usize {
     const limit = @min(a.len, b.len);
     return std.mem.indexOfDiff(u8, a[0..limit], b[0..limit]) orelse limit;
 }
