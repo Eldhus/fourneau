@@ -59,7 +59,12 @@
    3. ~~Zero-copy static sends~~ (M6): measured, not built (2026-10-09,
       DIARY, DESIGN): no use in the owner's setup (HTTPS, small files);
       the owner may overrule.
-   4. Brotli, our encoder (M6); a compression benchmark?
+   4. ~~Brotli~~ (M6, done 2026-10-10, DIARY): our encoder, within
+      0.6-3.4% of `brotli -q 11` on the site's files, served when
+      accepted; checked against the reference (2,000 seeds). A public
+      benchmark needs the owner's choices: proposed in the dragrace's
+      TODO. Left for later: block splitting, distance contexts (q11's
+      last ~1-3%).
    5. HTTP/2 (M9); a dragrace workload.
    6. Graceful restart (M10). Old and new processes overlap, so it
       meets the locked-memory finding (DIARY 2026-10-09): io_uring
@@ -69,10 +74,7 @@
       limit.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). 1, 2 and 3 done. 4: the decoder (the oracle)
-     done and checked against the reference; next the encoder in
-     passes, measured against `gzip -9` and `brotli -q 11` on the site's
-     files (DIARY).
+     release (checked). 1 to 4 done (2026-10-10); starting 5, HTTP/2.
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
@@ -81,10 +83,11 @@
      on `333e773`: the two host files back; builds against fourneau
      main, checked) to roux's main; local roux main then needs a merge
      of it before its own next push. Or
-     (b) everything: push fourneau main first, then roux main
-     (`dda7f80`: the pool and the drain) and fourneau-dragrace main
-     (`b9ffad1`: fourneau-zig gives `fibers_max`; built and served,
-     checked). The race then runs the pool and the drain.
+     (b) everything: push fourneau main first, then roux main (now
+     `519fd86`: the pool, the drain, brotli) and fourneau-dragrace main
+     (now `76a41bb`; `b9ffad1` gives fourneau-zig `fibers_max`, built and
+     served, checked). The race then runs the pool, the drain and
+     brotli (the dragrace site's static files get brotli copies).
 
 ## Plan
 

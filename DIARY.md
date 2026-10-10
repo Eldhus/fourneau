@@ -1578,3 +1578,36 @@ ReleaseFast times: index.html 122 ms, server.zig 256 ms.
 
 What is left of q11's lead is block splitting and distance contexts; at
 ~1-3% it can wait. Next: serve it.
+
+## 2026-10-10: brotli served, and checked against the reference
+
+`site.zig` makes a brotli copy of each text file beside the gzip one
+(kept when a tenth smaller; files up to 1 MiB, past which the parser's
+memory is too much at load on a small droplet). Accept-Encoding is now
+weighed as RFC 9110 §12.5.3 says (q-values, `*` for unnamed codings,
+identity acceptable unless excluded), the client's highest weight wins
+and brotli wins a tie; before, the site asked only whether gzip was
+acceptable. A doubt checked against the owner's setup: roux serves its
+static files through this module, and `roux dev` restarts the app on
+every edit; datastar.js alone takes ~74 ms to compress. So loading takes
+`LoadOptions`, and roux's host asks for no brotli in development
+(roux 519fd86).
+
+fourneau-static on the dragrace site's files, with curl: index.html
+37,624 bytes as 6,273 brotli (gzip 7,973), style.css 4,645 (5,351),
+datastar 12,183 (13,344), latest.json 651 (854); `br;q=0.5, gzip` gets
+gzip, `identity` gets the file; curl's libbrotli (the reference
+decoder, as browsers have it) decodes ours byte for byte. The site
+loads in 380 ms, compression included (ReleaseFast).
+
+`zig build brotli-check`: inputs from seeds (random bytes, runs,
+dictionary words under random transforms, copies of what came before,
+mixtures, one in sixteen up to 400 KB), each encoded by us and decoded
+by our decoder and the reference `brotli -d`. 2,000 seeds, 34 MB in, 11
+MB out: all agree. A word's distance off by one, injected, fails seed 0.
+
+Not a public benchmark tonight: a race of compression compares defaults
+(Go's FileServer does not compress; tower-http compresses per response),
+so a static-file workload needs the owner's choices; proposed in the
+dragrace's TODO. Nothing to teach in the tutor: brotli is invisible to a
+roux app.
