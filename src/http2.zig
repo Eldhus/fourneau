@@ -29,7 +29,7 @@ const http1_response = @import("http1_response.zig");
 const stdx = @import("stdx.zig");
 const Prng = @import("prng.zig").Prng;
 
-const ErrorCode = frame.ErrorCode;
+pub const ErrorCode = frame.ErrorCode;
 const header_bytes = frame.header_bytes;
 
 pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
