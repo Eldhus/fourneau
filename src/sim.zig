@@ -84,8 +84,9 @@ pub fn setup(prng: *Prng) Setup {
     return .{
         .server = server,
         .network = .{
-            // Every connection's fiber, the accept loop, the timekeeper.
-            .fibers_max = connections_max + 4,
+            // The server's own count, and the fiber `run` accepts on:
+            // exact, so every interleaving tests the count.
+            .fibers_max = server.fibers_max() + 1,
             .stack_bytes = 512 * 1024,
             .connections_max = 64,
             .window_bytes = window_bytes,
@@ -336,6 +337,11 @@ fn outcome(
             });
             result.exit_code = exit_correctness;
         }
+    }
+    // The pool is exactly what the server says it needs (`setup`).
+    if (server.stats.fiberless != 0) {
+        std.debug.print("server: {d} connections found no fiber\n", .{server.stats.fiberless});
+        result.exit_code = exit_correctness;
     }
     if (result.exit_code == 0 and ticks == ticks_max) result.exit_code = exit_liveness;
     return result;

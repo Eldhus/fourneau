@@ -69,6 +69,12 @@ main_fiber_buffer: [
 ]u8 align(@max(@alignOf(Fiber), @alignOf(Completion))),
 log2_ring_entries: u4,
 threads: Thread.List,
+/// fourneau: every fiber's memory, reserved once at `init` (`Fiber.reserve`),
+/// `fibers_max` strides of `Fiber.allocation_size`.
+fibers: []align(std.heap.page_size_min) u8,
+/// fourneau: how many strides of `fibers` have been carved into fibers
+/// (`carveFiber`); a fiber, once carved, is recycled through the free queues.
+fibers_carved: u32,
 sync_limit: ?Io.Semaphore,
 
 stderr_writer_initialized: bool = false,
@@ -117,12 +123,8 @@ const Thread = struct {
         return self.?;
     }
 
-    fn deinit(thread: *Thread, gpa: Allocator) void {
-        var next_fiber = thread.free_queue;
-        while (next_fiber) |free_fiber| {
-            next_fiber = free_fiber.status.free_next;
-            gpa.free(free_fiber.allocatedSlice());
-        }
+    /// fourneau: the fibers are `Evented.fibers`, unmapped once by `deinit`.
+    fn deinit(thread: *Thread) void {
         thread.io_uring.deinit();
     }
 
@@ -327,18 +329,32 @@ const Fiber = struct {
             return free_fiber;
         }
         @atomicStore(?*Fiber, &thread.free_queue, null, .monotonic);
-        // fourneau: the raw allocation, which does not fill the memory: in safe
-        // builds `alignedAlloc` writes 0xaa over all 60 MiB of a fiber's
-        // stack, committing it (16 GB resident for 256 connections). Raw, the
-        // kernel commits stack pages only as a fiber touches them.
-        const memory = ev.allocator().rawAlloc(allocation_size, .of(Fiber), @returnAddress()) orelse
+        // fourneau: never allocated here: a fiber not used before is carved
+        // from the mapping `init` reserved, and a spent pool is a refusal.
+        return ev.carveFiber();
+    }
+
+    /// fourneau: room for `count` fibers, reserved at `init`: address
+    /// space, not memory. NORESERVE: the kernel commits a page only when a
+    /// fiber first touches it, so an idle server's pool costs nothing, and
+    /// 8 MiB stacks are not charged up front. No huge pages: a fiber
+    /// touches a few KiB at the top of its stride, and with transparent
+    /// huge pages always on, each first touch committed 2 MiB (4,000
+    /// connections: 2.0 GB resident, against 0.13-0.3 GB as small pages).
+    fn reserve(count: u32) error{OutOfMemory}![]align(std.heap.page_size_min) u8 {
+        assert(count > 0);
+        const bytes = @as(usize, count) * allocation_size;
+        const prot: linux.PROT = .{ .READ = true, .WRITE = true };
+        const flags: linux.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true };
+        const address = linux.mmap(null, bytes, prot, flags, -1, 0);
+        if (linux.errno(address) != .SUCCESS) return error.OutOfMemory;
+        const memory: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
+        const advised = linux.madvise(memory, bytes, linux.MADV.NOHUGEPAGE);
+        if (linux.errno(advised) != .SUCCESS) {
+            _ = linux.munmap(memory, bytes);
             return error.OutOfMemory;
-        // fourneau: the guard page needs page-aligned memory (the page
-        // allocator's, which fourneau gives the port).
-        assert(@intFromPtr(memory) % std.heap.page_size_min == 0);
-        const protected = linux.mprotect(memory, guard_size, .{});
-        if (linux.errno(protected) != .SUCCESS) return error.OutOfMemory;
-        return @ptrCast(@alignCast(memory + header_offset));
+        }
+        return memory[0..bytes];
     }
 
     fn destroy(fiber: *Fiber) void {
@@ -354,11 +370,6 @@ const Fiber = struct {
             .acq_rel,
             .acquire,
         ) orelse break;
-    }
-
-    fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
-        const base: [*]align(@alignOf(Fiber)) u8 = @ptrFromInt(@intFromPtr(f) - header_offset);
-        return base[0..allocation_size];
     }
 
     /// fourneau: the end of the closure and context, where the header starts
@@ -840,6 +851,11 @@ pub const InitOptions = struct {
     sync_limit: Io.Limit = .unlimited,
 
     log2_ring_entries: u4 = 3,
+    /// fourneau: how many fibers may exist at once, all mapped at `init`
+    /// (TigerStyle's static allocation): `concurrent` beyond it is
+    /// `ConcurrencyUnavailable`, and `async` runs its function inline.
+    /// The main fiber is not one of them.
+    fibers_max: u32,
 
     /// Affects the following operations:
     /// * `processExecutablePath` on OpenBSD and Haiku.
@@ -870,6 +886,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
             .reserved = 1,
             .active = 1,
         },
+        .fibers = &.{},
+        .fibers_carved = 0,
         .sync_limit = if (options.sync_limit.toInt()) |sync_limit| .{ .permits = sync_limit } else null,
 
         .stderr_writer_initialized = false,
@@ -941,6 +959,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng = .uninitialized,
     };
     errdefer main_thread.io_uring.deinit();
+    ev.fibers = try Fiber.reserve(options.fibers_max);
     if (tracy.enable) tracy.fiberEnter(main_fiber.name);
 }
 
@@ -962,10 +981,34 @@ pub fn deinit(ev: *Evented) void {
         std.heap.pageSize(),
     );
     for (ev.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
-    for (ev.threads.allocated[0..active_threads]) |*thread| thread.deinit(ev.backing_allocator);
+    for (ev.threads.allocated[0..active_threads]) |*thread| thread.deinit();
     assert(active_threads == ev.threads.active); // spawned threads while there was no pending async?
+    _ = linux.munmap(ev.fibers.ptr, ev.fibers.len);
     ev.backing_allocator.free(allocated_ptr[0..idle_stack_end_offset]);
     ev.* = undefined;
+}
+
+/// fourneau: the next stride of `fibers` never used, its guard page set
+/// now (an overflow faults instead of writing into the fiber below), so
+/// a fiber's memory is touched only once it is needed. Every stride
+/// carved: the pool is spent.
+fn carveFiber(ev: *Evented) error{OutOfMemory}!*Fiber {
+    const count = ev.fibers.len / Fiber.allocation_size;
+    assert(count * Fiber.allocation_size == ev.fibers.len);
+    var carved = @atomicLoad(u32, &ev.fibers_carved, .monotonic);
+    while (true) {
+        assert(carved <= count);
+        if (carved == count) return error.OutOfMemory;
+        carved = @cmpxchgWeak(u32, &ev.fibers_carved, carved, carved + 1, .monotonic, .monotonic) orelse
+            break;
+    }
+    const base: [*]align(std.heap.page_size_min) u8 =
+        @alignCast(ev.fibers.ptr + @as(usize, carved) * Fiber.allocation_size);
+    // Fails only when the process is out of mappings (vm.max_map_count):
+    // the stride is lost, and the refusal said.
+    const protected = linux.mprotect(base, Fiber.guard_size, .{});
+    if (linux.errno(protected) != .SUCCESS) return error.OutOfMemory;
+    return @ptrCast(@alignCast(base + Fiber.header_offset));
 }
 
 fn findReadyFiber(ev: *Evented, thread: *Thread) ?*Fiber {

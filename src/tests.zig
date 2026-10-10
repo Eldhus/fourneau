@@ -2,6 +2,7 @@
 
 test {
     _ = @import("http1_chunked.zig");
+    _ = @import("hello.zig");
     _ = @import("hybrid.zig");
     _ = @import("http1_head.zig");
     _ = @import("http1_response.zig");
