@@ -20,9 +20,8 @@
      one core: within ~5-10% of fourneau-floor (raw io_uring), the kernel
      ~85% of a request (experiments 18-23: the 8-entry ring, the fiber
      layout, the send path). Split out of roux into this repository
-     2026-10-06 (DIARY). Idle eviction is back (2026-10-06). Next: the
-     fiber pool (Todo),
-     then M6 (static files and compression).
+     2026-10-06 (DIARY). Idle eviction is back (2026-10-06). The rest
+     is item 3.
 
 2. **HTTPS and templates, end to end and deployed.** (owner, 2026-10-06)
    "Work through a few more milestones, particularly templating and
@@ -40,9 +39,28 @@
      std.http.Client fetches the site; testssl.sh 3.2 finds TLS 1.3 only,
      the chain and name OK, no vulnerability (BREACH flagged for gzip:
      a static site has no secrets to leak); HSTS now sent. Templates in
-     roux and the dragrace are done (their TODOs). Next: M6's rest
-     (brotli, graceful shutdown, zero-copy), M9, M10's graceful restart and
-     the roux app.
+     roux and the dragrace are done (their TODOs). M10's roux app is
+     live too: the dragrace site has been a roux app since 2026-10-06
+     (roux's TODO). What is left is item 3.
+
+3. **Finish the open milestones, one at a time.** (owner, 2026-10-09)
+   "Get everything finished, step by step, not in parallel; take notes
+   and iterate, experiment, wander, doubt yourself; research the state
+   of the art. Measure measure measure. Don't make it ugly for speed: get
+   the speed from the right data structures." Each finished item is
+   weighed for a public benchmark (HTTP/2 surely, compression perhaps):
+   added to the dragrace and tested hard, but **nothing pushed tonight**
+   (the dragrace must race as it is). What should be taught goes into
+   roux-tutor. In order:
+   1. The fiber pool (Todo; item 1's next).
+   2. Graceful shutdown (M6; the simulator models cancellation first).
+   3. Zero-copy static sends (M6).
+   4. Brotli, our encoder (M6); a compression benchmark?
+   5. HTTP/2 (M9); a dragrace workload.
+   6. Graceful restart (M10).
+   7. Differential tests against Go and axum (M11, `dragrace diff`).
+   - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
+     release (checked). Starting 1.
 
 ## Plan
 
@@ -128,7 +146,8 @@ Read the diary, keep the tests, delete what did not pay, write it again.
   pins together (`.zig-version` here and in roux, fourneau-dragrace's
   `versions.json`), refreshes the vendored docs, and says what to run
   (the suite, a 1000-seed sweep whose totals must not change).
-  - Last done: 2026-10-04 (0.16.0 to 0.17.0).
+  - Last done: 2026-10-09 (0.17.0 still the newest; master is
+    0.18.0-dev.131).
 
 - **Vendored sources**, monthly and when a security release appears:
   `vendor/zig-io-evented/` against upstream `Io/Uring.zig` (what upstream
