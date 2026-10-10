@@ -1642,3 +1642,22 @@ additions and resizes against a plain model of what it must hold;
 eight malformed blocks refused (index 0, an empty table's index, a size
 update after a field or past the limit, bad padding, EOS inside a
 string, a string past the block, an integer too long); the bomb.
+
+## 2026-10-10: HTTP/2 frames
+
+`http2_frame.zig`, sans-IO, layer 2 of docs/http2.md: the nine-byte
+header, each type's payload checked as RFC 9113 §6 says, and the frames
+a server writes (SETTINGS and its ACK, PING ACK, RST_STREAM, GOAWAY,
+WINDOW_UPDATE). A malformed frame is not an error value but a
+`Refusal`: the code the RFC names and whether it ends one stream or the
+connection (a PRIORITY of the wrong length ends its stream; a
+RST_STREAM of the wrong length ends everything). What a frame means
+for state (an idle stream, a closed one, the windows) is the connection
+machine's, the next layer. A PUSH_PROMISE from a client is refused: a
+server never receives one.
+
+Tests: every refusal in §6, 27 cases with their code and scope; padding,
+a priority block and an unknown type taken apart; each writer's frame
+read back by the parser. Learned again: 0.17's `zig fmt` rewrites
+`@enumFromInt` to `@fromBackingInt`, and `.{0} ** 8` no longer parses
+(`@splat`); the zig skill had both and I wrote from memory anyway.
