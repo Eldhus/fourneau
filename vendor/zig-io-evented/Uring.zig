@@ -6404,6 +6404,11 @@ fn netReadStream(ev: *Evented, o: Io.Operation.NetRead) (Io.Operation.NetRead.Er
             .CONNRESET => return error.ConnectionResetByPeer,
             .NOTCONN => return error.SocketUnconnected,
             .NOBUFS, .NOMEM => return error.SystemResources,
+            // fourneau: kTLS, a record that is not data, read without a
+            // control buffer for its type: the peer's close_notify (TLS's
+            // end of stream: every curl sends one), or a KeyUpdate the
+            // kernel will not decode for us. Either way the stream ends.
+            .IO => return .{ .data_len = 0 },
             else => |err| return unexpectedErrno(err),
         }
     }
