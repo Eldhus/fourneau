@@ -61,6 +61,14 @@ pub const Config = struct {
     send_timeout_ms: u32 = 30_000,
     /// How often the timekeeper looks at the deadlines.
     tick_ms: u32 = 100,
+    /// Set, from any thread (a signal's), to drain and return from `run`:
+    /// accept no more, close the connections idle between requests, finish
+    /// the requests in flight (their responses say `Connection: close`),
+    /// and close what is left after `drain_timeout_ms`. Read once a tick.
+    stop: ?*const std.atomic.Value(bool) = null,
+    /// How long a drain waits for requests in flight (a stream, a slow
+    /// client) before it closes them.
+    drain_timeout_ms: u32 = 10_000,
     /// A bound on the keep-alive loop: generous, and asserted.
     requests_per_connection_max: u32 = 1 << 24,
     /// Real sockets want it (see `no_delay`); a simulated one has none.
@@ -76,6 +84,7 @@ pub const Config = struct {
         assert(config.send_bytes_max >= config.response_head_bytes_max);
         assert(config.tick_ms > 0);
         assert(config.tick_ms <= config.head_timeout_ms);
+        assert(config.tick_ms <= config.drain_timeout_ms);
         config.head_limits().assert_valid();
         if (config.tls != null) {
             // The handshake borrows the scratch (both of tls.zig's buffers)
@@ -183,6 +192,10 @@ pub const Stats = struct {
     /// Connections closed because the `Io` had no fiber for them: its pool
     /// is smaller than `Config.fibers_max` says. Always 0 when it is not.
     fiberless: u64 = 0,
+    /// Connections a drain closed: idle ones at its start, and those left
+    /// at its deadline.
+    drain_idle: u64 = 0,
+    drain_cut: u64 = 0,
 };
 
 /// The address of this, per thread, names the thread a shard runs on.
@@ -221,6 +234,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         ticks_max: u32,
         /// The thread the shard runs on (`thread_marker`), from `run`.
         thread: ?*const u8 = null,
+        /// Stopping (`Config.stop`): no more accepts, no next requests.
+        draining: bool = false,
+        /// The tick at which a drain closes what is left; 0 once it has
+        /// (or before a drain).
+        drain_deadline: u32 = 0,
         free: []u32,
         free_count: u32,
         /// Counts free slots: the acceptor waits on it, so a full server
@@ -436,14 +454,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 // connection closes after this response, and its head
                 // must say so now.
                 if (connection.body != .none) connection.keep_alive = false;
-                const result = connection.write_head(.{
-                    .status = status,
-                    .headers = headers,
-                    .framing = .chunked,
-                    .keep_alive = connection.keep_alive,
-                    .date = connection.server.date(),
-                    .secure = connection.kernel_tls,
-                }) orelse return error.Disconnected;
+                const result = connection.write_head(status, headers, .chunked) orelse
+                    return error.Disconnected;
                 switch (result) {
                     .bytes => {},
                     .refusal => |refusal| {
@@ -500,17 +512,31 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
             /// A response head into the send buffer, after what waits
             /// there (flushed first when the largest head might not fit).
-            /// Null: the peer is gone.
+            /// What the head says of the connection is the connection's:
+            /// whether it stays open, the date, HTTPS. A draining server
+            /// closes after every response, and says so. Null: the peer is
+            /// gone.
             fn write_head(
                 connection: *Connection,
-                head: http1_response.Head,
+                status: u16,
+                headers: []const http1_response.Header,
+                framing: http1_response.Framing,
             ) ?http1_response.Result {
-                const head_max = connection.server.config.response_head_bytes_max;
+                const server = connection.server;
+                if (server.draining) connection.keep_alive = false;
+                const head_max = server.config.response_head_bytes_max;
                 if (connection.send.len - connection.send_used < head_max) {
                     if (!connection.flush()) return null;
                 }
                 const start = connection.send_used;
-                const result = http1_response.write(connection.send[start..][0..head_max], head);
+                const result = http1_response.write(connection.send[start..][0..head_max], .{
+                    .status = status,
+                    .headers = headers,
+                    .framing = framing,
+                    .keep_alive = connection.keep_alive,
+                    .date = server.date(),
+                    .secure = connection.kernel_tls,
+                });
                 switch (result) {
                     .bytes => |bytes| {
                         assert(bytes <= head_max);
@@ -681,33 +707,46 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             return all[start..][0..size];
         }
 
-        /// Accept and serve until the process ends: the timekeeper on its
-        /// own fiber, accepting on this one.
+        /// Accept and serve until `Config.stop` (or a cancelation of this
+        /// task), then drain and return: accepting on its own fiber, the
+        /// timekeeper on this one.
         pub fn run(server: *Server) !void {
             assert(server.thread == null); // run once
             server.thread = &thread_marker;
             server.refresh_date(); // before the first response needs it
             assert(server.date_second != 0);
-            try server.group.concurrent(server.io, timekeeper, .{server});
-            server.accept_loop();
+            var acceptor = try server.io.concurrent(accept_loop, .{server});
+            server.timekeeper(&acceptor);
+            assert(server.draining);
+            assert(server.free_count == server.config.connections_max);
+            // Every connection is closed: its fiber ends with that.
+            try server.group.await(server.io);
         }
 
         /// Accept first, then find a slot: when none is free, the connection
         /// idle longest is closed for the new one (a server full of idle
         /// keep-alives otherwise locks new clients out for the idle timeout).
         /// With none idle, the new client waits for a slot, and the kernel's
-        /// backlog holds the rest.
+        /// backlog holds the rest. Ends when canceled (a drain).
         fn accept_loop(server: *Server) void {
-            // A server's accept loop does not end: bounded only to say so.
+            // Bounded only to say so: it ends by cancelation.
             for (0..std.math.maxInt(u64)) |_| {
-                const stream = server.listener.accept(server.io) catch |err| {
-                    log.warn("accept: {t}", .{err});
-                    // Out of descriptors: wait a tick rather than spin.
-                    server.io.sleep(.fromMilliseconds(server.config.tick_ms), .awake) catch {};
-                    continue;
+                const stream = server.listener.accept(server.io) catch |err| switch (err) {
+                    error.Canceled => return,
+                    else => {
+                        log.warn("accept: {t}", .{err});
+                        // Out of descriptors: wait a tick rather than spin.
+                        const tick: Io.Duration = .fromMilliseconds(server.config.tick_ms);
+                        server.io.sleep(tick, .awake) catch return; // canceled
+                        continue;
+                    },
                 };
                 if (server.free_count == 0) server.evict_idle();
-                server.free_slots.waitUncancelable(server.io);
+                server.free_slots.wait(server.io) catch {
+                    // Canceled while the server was full: never served.
+                    stream.close(server.io);
+                    return;
+                };
                 const index = server.take_slot();
                 server.open_connection(index, stream);
                 server.stats.accepted += 1;
@@ -887,6 +926,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     .incomplete => {},
                 }
                 const idle = connection.recv_used == 0 and connection.requests > 0;
+                // Draining: no next request (one already here is served).
+                if (idle and server.draining) return false;
                 const config = server.config;
                 const timeout = if (idle) config.idle_timeout_ms else config.head_timeout_ms;
                 const window = connection.recv[connection.recv_used..];
@@ -961,14 +1002,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 .none
             else
                 .{ .length = options.body.len };
-            const result = connection.write_head(.{
-                .status = options.status,
-                .headers = options.headers,
-                .framing = framing,
-                .keep_alive = connection.keep_alive,
-                .date = server.date(),
-                .secure = connection.kernel_tls,
-            }) orelse return false;
+            const result = connection.write_head(options.status, options.headers, framing) orelse
+                return false;
             switch (result) {
                 .bytes => {
                     const body = if (options.omit_body or forbids_body) "" else options.body;
@@ -1021,6 +1056,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 if (deadline != 0) assert(connection.open);
                 assert(deadline <= server.tick + server.ticks_max);
             }
+            // A drain closed every idle connection, and none waits for a
+            // next request since.
+            if (server.draining) {
+                for (server.idle_since) |since| assert(since == 0);
+            }
         }
 
         /// The longest wait in ticks: deadlines stay within it of the clock.
@@ -1040,17 +1080,69 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.deadlines[index] = 0;
         }
 
-        /// One fiber for every deadline: a scan of one array per tick.
-        fn timekeeper(server: *Server) void {
+        /// One fiber for every deadline: a scan of one array per tick. It
+        /// starts the drain, and returns when the drain has closed the
+        /// last connection.
+        fn timekeeper(server: *Server, acceptor: *Io.Future(void)) void {
+            // Bounded only to say so: it ends with a drain.
             for (0..std.math.maxInt(u64)) |_| {
-                server.io.sleep(.fromMilliseconds(server.config.tick_ms), .awake) catch return;
+                const tick: Io.Duration = .fromMilliseconds(server.config.tick_ms);
+                // A cancelation of `run` is a stop too.
+                const canceled = if (server.io.sleep(tick, .awake)) false else |_| true;
                 server.tick += 1;
                 assert(server.tick < std.math.maxInt(u32) - server.ticks_max); // years away
                 server.refresh_date();
                 for (server.deadlines, 0..) |due, index| {
                     if (due != 0 and due <= server.tick) server.expire(@intCast(index));
                 }
+                if (!server.draining and (canceled or server.stop_requested())) {
+                    server.drain_start(acceptor);
+                }
+                if (server.draining) {
+                    if (server.free_count == server.config.connections_max) return;
+                    if (server.drain_deadline != 0 and server.tick >= server.drain_deadline) {
+                        server.drain_cut();
+                    }
+                }
             } else unreachable;
+        }
+
+        fn stop_requested(server: *const Server) bool {
+            const stop = server.config.stop orelse return false;
+            return stop.load(.acquire);
+        }
+
+        /// Stop accepting (the accept loop is canceled: the listening
+        /// socket itself is untouched, for a successor that shares it),
+        /// then close every connection idle between requests, by shutting
+        /// it for reading as eviction does. Those in flight close after
+        /// their response (`read_head`, `write_head`).
+        fn drain_start(server: *Server, acceptor: *Io.Future(void)) void {
+            assert(!server.draining);
+            server.draining = true;
+            const ticks = server.ticks_for(server.config.drain_timeout_ms);
+            server.drain_deadline = server.tick + ticks;
+            acceptor.cancel(server.io);
+            for (server.idle_since, 0..) |since, index| {
+                if (since == 0) continue;
+                assert(server.connections[index].open);
+                server.idle_since[index] = 0;
+                server.connections[index].stream.shutdown(server.io, .recv) catch {};
+                server.stats.drain_idle += 1;
+            }
+        }
+
+        /// The drain's deadline: shut every connection still open, as a
+        /// timeout does; its fiber reads 0, or fails to write, and closes.
+        fn drain_cut(server: *Server) void {
+            assert(server.draining);
+            server.drain_deadline = 0;
+            for (server.connections, 0..) |*connection, index| {
+                if (!connection.open) continue;
+                server.deadlines[index] = 0;
+                connection.stream.shutdown(server.io, .both) catch {};
+                server.stats.drain_cut += 1;
+            }
         }
 
         /// Shut the socket down: the fiber waiting on it reads 0 and closes.

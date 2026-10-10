@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 const Evented = @import("zig_io_evented");
 const server_module = @import("server.zig");
 const http1_response = @import("http1_response.zig");
+const Stop = @import("stop.zig").Stop;
 
 const App = struct {
     pub const Response = struct {
@@ -100,7 +101,10 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
 pub fn main(init: std.process.Init.Minimal) !void {
     var options = try parse_options(init);
     if (options.shards == 0) options.shards = cpu_count();
-    return run_shards(options);
+    var stop: Stop = .{};
+    try stop.watch(); // before any shard's thread
+    try run_shards(options, &stop.requested);
+    std.debug.print("fourneau-hello: stopped\n", .{});
 }
 
 /// The CPUs in this process's affinity mask.
@@ -117,29 +121,32 @@ fn cpu_count() u32 {
 
 /// Shared nothing: `shards` threads, each a whole server on one thread.
 /// The kernel spreads connections between their listeners (SO_REUSEPORT).
-fn run_shards(options: Options) !void {
+/// Returns once every shard has drained and returned.
+fn run_shards(options: Options, stop: *const std.atomic.Value(bool)) !void {
     assert(options.shards > 0);
     const shards_max = 256;
     assert(options.shards <= shards_max);
     var threads: [shards_max]std.Thread = undefined;
     for (threads[1..options.shards]) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, run_shard, .{options});
+        thread.* = try std.Thread.spawn(.{}, run_shard, .{ options, stop });
     }
     std.debug.print("fourneau-hello on http://127.0.0.1:{d} ({d} shards)\n", .{
         options.port,
         options.shards,
     });
-    run_shard(options);
+    run_shard(options, stop);
+    for (threads[1..options.shards]) |thread| thread.join();
 }
 
-fn run_shard(options: Options) void {
-    run_shard_or_fail(options) catch |err| std.debug.panic("shard: {t}", .{err});
+fn run_shard(options: Options, stop: *const std.atomic.Value(bool)) void {
+    run_shard_or_fail(options, stop) catch |err| std.debug.panic("shard: {t}", .{err});
 }
 
-fn run_shard_or_fail(options: Options) !void {
+fn run_shard_or_fail(options: Options, stop: *const std.atomic.Value(bool)) !void {
     const gpa = std.heap.page_allocator;
     const config: server_module.Config = .{
         .connections_max = @max(1, options.connections / options.shards),
+        .stop = stop,
     };
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{
@@ -156,7 +163,10 @@ fn run_shard_or_fail(options: Options) !void {
     const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
     var app: App = .{};
     var server = try Server.init(gpa, io, &app, listener, config);
+    defer server.deinit(gpa);
+    defer server.listener.deinit(io);
     var group: std.Io.Group = .init;
+    defer group.cancel(io); // `print_counts`
     if (options.counts) try group.concurrent(io, print_counts, .{ &runtime, &server });
     try server.run();
 }
@@ -187,6 +197,108 @@ fn print_counts(runtime: *Evented, server: *Server) void {
 
 fn count_one(count: *u32) void {
     count.* += 1;
+}
+
+/// A client on plain system calls, on its own thread, for the drain test:
+/// it orders every step by what it sees, never by sleeping.
+const DrainClient = struct {
+    port: u16,
+    stop: *std.atomic.Value(bool),
+    /// What the request in flight got: its response, then the end.
+    answer: [512]u8 = undefined,
+    answer_len: usize = 0,
+    idle_ended: bool = false,
+
+    const linux = std.os.linux;
+    const request_start = "GET / HTTP/1.1\r\nHost: drain\r\n";
+
+    fn run(client: *DrainClient) void {
+        client.run_or_fail() catch |err| std.debug.panic("drain client: {t}", .{err});
+    }
+
+    fn run_or_fail(client: *DrainClient) !void {
+        // In flight: half its first request, before the idle one connects,
+        // so it is accepted first (one listener's backlog is in order).
+        const in_flight = try connect(client.port);
+        defer _ = linux.close(in_flight);
+        try send(in_flight, request_start);
+        // Idle: a whole request answered, so both are accepted.
+        const idle = try connect(client.port);
+        defer _ = linux.close(idle);
+        try send(idle, request_start ++ "\r\n");
+        var buffer: [512]u8 = undefined;
+        const got = try receive_until_end_or(idle, &buffer, "hello\n");
+        if (!std.mem.endsWith(u8, buffer[0..got], "hello\n")) return error.NoAnswer;
+        client.stop.store(true, .release);
+        // The drain closes the idle connection: it has begun.
+        client.idle_ended = try receive_until_end_or(idle, &buffer, null) == 0;
+        try send(in_flight, "\r\n");
+        client.answer_len = try receive_until_end_or(in_flight, &client.answer, null);
+    }
+
+    fn connect(port: u16) !linux.fd_t {
+        const fd: linux.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+        if (fd < 0) return error.Socket;
+        const address: linux.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        };
+        const result = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
+        if (linux.errno(result) != .SUCCESS) return error.Connect;
+        return fd;
+    }
+
+    fn send(fd: linux.fd_t, bytes: []const u8) !void {
+        const result = linux.write(fd, bytes.ptr, bytes.len);
+        if (linux.errno(result) != .SUCCESS or result != bytes.len) return error.Send;
+    }
+
+    /// Reads until the peer closes, or until what was read ends with
+    /// `until`; the count read.
+    fn receive_until_end_or(fd: linux.fd_t, buffer: []u8, until: ?[]const u8) !usize {
+        var used: usize = 0;
+        for (0..buffer.len + 1) |_| {
+            if (until) |end| if (std.mem.endsWith(u8, buffer[0..used], end)) return used;
+            if (used == buffer.len) return error.TooLong;
+            const result = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+            if (linux.errno(result) != .SUCCESS) return error.Receive;
+            if (result == 0) return used;
+            used += result;
+        } else unreachable; // each pass reads a byte or returns
+    }
+};
+
+test "a stopped server drains: the request in flight is answered and closed" {
+    const gpa = std.testing.allocator;
+    var stop: std.atomic.Value(bool) = .init(false);
+    const config: server_module.Config = .{
+        .connections_max = 4,
+        .tick_ms = 10,
+        .drain_timeout_ms = 5_000,
+        .stop = &stop,
+    };
+    var runtime: Evented = undefined;
+    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = config.fibers_max() });
+    defer runtime.deinit();
+    const io = runtime.io();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try address.listen(io, .{ .reuse_address = false });
+    var app: App = .{};
+    var server = try Server.init(gpa, io, &app, listener, config);
+    defer server.deinit(gpa);
+    defer server.listener.deinit(io);
+
+    var client: DrainClient = .{ .port = listener.socket.address.getPort(), .stop = &stop };
+    const thread = try std.Thread.spawn(.{}, DrainClient.run, .{&client});
+    try server.run(); // returns: drained
+    thread.join();
+    try std.testing.expect(client.idle_ended);
+    const answer = client.answer[0..client.answer_len];
+    try std.testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\r\nConnection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, answer, "\r\n\r\nhello\n"));
+    try std.testing.expectEqual(1, server.stats.drain_idle);
+    try std.testing.expectEqual(0, server.stats.drain_cut);
 }
 
 test "the port's fibers: a pool mapped at init, refused beyond it, reused" {

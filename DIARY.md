@@ -1270,3 +1270,66 @@ choice is the owner's (WIP 3). Consequence of my part: an edit left
 uncommitted in a repository another session works in is that session's
 to sweep. Rule: edit a sibling repository only when ready to commit,
 and commit those paths at once.
+
+## 2026-10-09: graceful shutdown
+
+First the simulator learned cancelation (it awaited): a request marks
+the fiber, a sleep, accept, read, write or cancelable futex wait
+delivers it once, a fiber blocked at one is woken for it, protection
+holds it back, recancel re-arms it. Its test cancels a sleep, an accept
+and a protected task; it fails when a request does not wake a blocked
+fiber. (A first injection, dropping the check after a wake, passed: the
+check on entry already delivers it, so that check went.)
+
+Then the drain, read against Go's `Server.Shutdown`, nginx's quit and
+hyper's `graceful_shutdown`, which agree: stop accepting, close idle
+connections, let requests in flight finish, then close, under a
+deadline. The TODO had planned an eventfd per shard with a fiber reading
+it; simpler: one flag, set by a signal thread, read by each shard's
+timekeeper once a tick (it wakes every tick anyway), so nothing crosses
+threads but a bool, and the simulator sets it at a seeded tick. `run`
+now accepts on its own fiber and keeps time on its own; at a stop it
+cancels the accept loop rather than shutting the listener, because M10's
+restart hands the same listening socket to the next process, and a
+shutdown would stop that one too. Idle connections are shut for reading,
+as eviction does; `write_head` now owns the head's connection fields
+(keep-alive, date, HSTS) and closes when draining; `read_head` serves no
+next request; at the deadline (`drain_timeout_ms`, 10 s) every open
+connection is shut. Waiting for a slot became cancelable: uncancelable,
+a full server of streams would hold the timekeeper in `cancel` forever.
+
+The simulator stops half the seeds at a random tick, with a drain
+timeout no shorter than a fast client's longest wait (so only slow
+clients may be cut); clients then accept a close they did not ask for
+and a new connection closed unanswered (accepted as the drain began
+with no slot free), and the run must return within its bound. 3,000
+seeds pass: 1,473 stopped, 1,110 idle connections closed at a drain's
+start, 25 cut at its deadline, 87 shut out (`zig build sim
+-Doptimize=ReleaseSafe -- --seeds 3000`, 54 s). Injected: no cancel of
+the accept loop (caught, seed 40, liveness), no cut at the deadline
+(seed 184, liveness), idle connections left alone (caught by a new
+invariant: draining, none waits idle). Not caught: responses without
+`Connection: close` during the drain, since clients retry a request on
+a closed keep-alive connection, which the simulator cannot tell from the
+idle race. It matters (no client retries a POST by itself), so a test on
+the real kernel orders events by what it sees, not by sleeping: a
+connection half-way through its first request, an idle one answered,
+the stop, the idle one's end (the drain began), then the rest of the
+first request, whose answer must say `Connection: close`. It catches
+that injection, and runs the port's cancelation of a pending accept
+(io_uring's async cancel) for real.
+
+`stop.zig`: SIGTERM and SIGINT blocked in every thread, taken by one
+(`rt_sigtimedwait`); the first sets the flag, a second exits at once.
+fourneau-hello and fourneau-static (its redirect server too) join their
+shards and exit 0. Measured (Debug build, 4 shards, 200 connections of
+`fourneau-load`): exit 0 in 209-219 ms after SIGTERM, three runs; a
+client that stalls half-way through a head holds it to the deadline,
+10.2 s; a second SIGINT quits in 9 ms with exit 1.
+
+Found on the way: every HTTPS connection curl closed dumped `unexpected
+errno: 5` from the port's stream read (in builds with error tracing;
+silent in release). kTLS fails a read with EIO when the next record is
+not data and no control buffer asks for its type: curl's close_notify.
+It is TLS's end of stream, now read as one; verified by curl, a test is
+in the Todo.

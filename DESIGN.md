@@ -135,6 +135,17 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   without its end (it failed, or the peer left) closes the connection
   without the last chunk: the client sees a response cut short, never a
   complete wrong one. The body is read before a stream starts.
+- **stopping** (`stop.zig`, `Config.stop`): SIGTERM or SIGINT is taken
+  by one thread (blocked in all others) and sets a flag each shard's
+  timekeeper reads once a tick; nothing crosses threads but that. The
+  shard drains, as Go's `Shutdown` and nginx's quit do: it cancels its
+  accept loop (the listening socket stays untouched, so a successor
+  that shares it loses nothing: M10), closes connections idle between
+  requests (shut for reading, as eviction does), answers what is in
+  flight with `Connection: close`, and at the drain's deadline (10 s)
+  shuts what is left; `run` returns when the last connection has
+  closed, and the process when every shard has. A second signal exits
+  at once. Measured: 200 busy connections drain in ~210 ms (two ticks).
 - **http1**: request line, headers, `Content-Length` and chunked bodies,
   keep-alive. It is strict where looseness is how smuggling happens
   (RFC 9112 §6.3, §11.2): both `Content-Length` and `Transfer-Encoding`,
@@ -159,7 +170,9 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   load it: the site host loads it at boot), checked at startup
   (`tcp_available_ulp`), so a server without it refuses to start rather
   than fail every handshake; a client gone before its keys reach the
-  kernel is `PeerClosed` (ENOTCONN), routine. A kTLS socket refuses `MSG_WAITALL`, so HTTPS connections
+  kernel is `PeerClosed` (ENOTCONN), routine. A record that is not data
+  (the client's `close_notify`, a KeyUpdate) fails a kTLS read with EIO,
+  read as the end of the stream. A kTLS socket refuses `MSG_WAITALL`, so HTTPS connections
   flush and then read rather than use the linked send-then-receive
   (experiment 18's +15%); a client's KeyUpdate closes the connection (the
   kernel will not decode it for us); no ML-KEM hybrid until tls.zig's

@@ -17,6 +17,7 @@ test {
     _ = @import("sim_io.zig");
     _ = @import("static.zig");
     _ = @import("stdx.zig");
+    _ = @import("stop.zig");
     _ = @import("tidy.zig");
     _ = @import("tls.zig");
     _ = @import("der.zig");

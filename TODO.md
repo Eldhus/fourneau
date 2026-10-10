@@ -54,7 +54,8 @@
    roux-tutor. In order:
    1. ~~The fiber pool~~ (done 2026-10-09, DIARY; no public benchmark:
       nothing a visitor would see, and nothing to teach).
-   2. Graceful shutdown (M6; the simulator models cancellation first).
+   2. ~~Graceful shutdown~~ (done 2026-10-09, DIARY; roux's host too.
+      No public benchmark, nothing to teach: it is invisible when right).
    3. Zero-copy static sends (M6).
    4. Brotli, our encoder (M6); a compression benchmark?
    5. HTTP/2 (M9); a dragrace workload.
@@ -66,7 +67,7 @@
       limit.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). 1 done; starting 2.
+     release (checked). 1 and 2 done; starting 3.
    - **The owner's decision, before the 05:00 race:** another session's
      roux commit `333e773` (pushed) swept in roux's half of the fiber
      pool, whose fourneau half (`d43d791`) is local, so roux main does
@@ -236,15 +237,9 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 - [ ] `fourneau-static` names the file that broke a limit at load
   (`StreamTooLong` alone, 2026-10-06, for a 33 MB file in the root).
   (2026-10-06)
-- [ ] Graceful shutdown (M6; M10's graceful restart needs it): on
-  SIGTERM, each shard stops accepting, shuts its idle connections for
-  reading (as eviction does), lets requests in flight finish within a
-  deadline, then returns; the process exits when every shard has. The
-  signal reaches a shard without shared memory: one eventfd per shard,
-  written by the signal thread, read by a fiber in the shard, which
-  cancels its accept loop. First, the simulator must model cancellation
-  (today its `cancel` awaits), so the drain is tested like everything
-  else. (2026-10-06)
+- [ ] A test of kTLS's EIO: a TLS client (tls.zig has one) that sends
+  close_notify over a kTLS connection, read as the end of the stream.
+  Verified by curl only (2026-10-09). (2026-10-09)
 
 ## Tickler
 

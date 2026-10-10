@@ -22,6 +22,7 @@ const server_module = @import("server.zig");
 const site_module = @import("site.zig");
 const tls = @import("tls.zig");
 const https = @import("https.zig");
+const Stop = @import("stop.zig").Stop;
 
 const shards_max = 256;
 
@@ -110,7 +111,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const site = try site_module.Site.load(gpa, io, options.root.?, "");
     if (site.routes.count() == 0) return error.EmptySite;
     // The certificate, loaded once and shared read-only by every shard.
-    const shared: Shared = .{ .site = &site, .tls = try https.context(gpa, io, options.https) };
+    const tls_context = try https.context(gpa, io, options.https);
+    var stop: Stop = .{};
+    try stop.watch(); // before any shard's thread
+    const shared: Shared = .{ .site = &site, .tls = tls_context, .stop = &stop.requested };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
     var threads: [shards_max]std.Thread = undefined;
@@ -125,12 +129,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         options.shards,
     });
     run_shard(&shared, options);
+    for (threads[1..options.shards]) |thread| thread.join();
+    std.debug.print("fourneau-static: stopped\n", .{});
 }
 
 /// What every shard reads and none writes.
 const Shared = struct {
     site: *const site_module.Site,
     tls: ?*const tls.Context,
+    /// Set by a signal: every shard drains and returns.
+    stop: *const std.atomic.Value(bool),
 };
 
 fn cpu_count() u32 {
@@ -157,6 +165,7 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     const config: server_module.Config = .{
         .connections_max = @max(64, 1024 / options.shards),
         .tls = shared.tls,
+        .stop = shared.stop,
     };
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{
@@ -171,14 +180,21 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
     var app: App = .{ .site = shared.site };
     var server = try Server.init(gpa, io, &app, listener, config);
+    defer server.deinit(gpa);
+    defer server.listener.deinit(io);
     var group: std.Io.Group = .init;
     var redirect: Redirect = undefined;
     var redirect_server: Redirect.Server = undefined;
     if (options.https.redirect_port) |port| {
         assert(shared.tls != null); // redirecting to an HTTPS site
         redirect = .{ .host = options.https.https_host.? };
-        redirect_server = try redirect.listen(gpa, io, options.address, port);
+        redirect_server = try redirect.listen(gpa, io, options.address, port, shared.stop);
         try group.concurrent(io, run_redirect, .{&redirect_server});
     }
     try server.run();
+    try group.await(io); // the redirect drains too
+    if (options.https.redirect_port != null) {
+        redirect_server.listener.deinit(io);
+        redirect_server.deinit(gpa);
+    }
 }

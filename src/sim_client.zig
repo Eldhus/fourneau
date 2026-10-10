@@ -803,6 +803,11 @@ pub const Client = struct {
     /// Print what a failed check saw. Off for the canary, whose failure
     /// is expected: its report would bury a real one.
     report_failures: bool = true,
+    /// The server was told to stop (from the tick it was; the server
+    /// notices at its next tick, so this is never later than the drain).
+    /// It may then close after any response, and say so, and close a
+    /// connection it accepted but could not serve.
+    server_draining: bool = false,
     stats: Stats = .{},
 
     pub const Stats = struct {
@@ -813,6 +818,8 @@ pub const Client = struct {
         reconnects: u32 = 0,
         /// Streams the application gave up on, received as far as they went.
         cut_short: u32 = 0,
+        /// Connections a draining server closed before any response.
+        shut_out: u32 = 0,
     };
 
     pub fn init(client: *Client, seed: u64, limits: Limits, start_tick: u64) void {
@@ -967,7 +974,12 @@ pub const Client = struct {
             return;
         }
         if (response.status != expected.status) return client.fail(.response_wrong);
-        if (response.closes != expected.closes) return client.fail(.response_wrong);
+        // A draining server closes after every response: it may say so
+        // where it otherwise would not, never the other way round.
+        const closes_draining = client.server_draining and response.closes;
+        if (response.closes != expected.closes and !closes_draining) {
+            return client.fail(.response_wrong);
+        }
         if (response.chunked != expected.chunked) return client.fail(.response_wrong);
         // A HEAD's stream has no body to cut short.
         const cut_short = expected.cut_short and !expected.head;
@@ -1030,6 +1042,9 @@ pub const Client = struct {
                 // The server closed an idle keep-alive connection as the
                 // request was on its way: the race every client retries.
                 client.stats.retries += 1;
+            } else if (client.server_draining) {
+                // Accepted as the drain began, with no slot to serve it.
+                client.stats.shut_out += 1;
             } else {
                 return client.fail(.closed_without_response);
             }
