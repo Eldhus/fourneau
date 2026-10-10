@@ -441,6 +441,20 @@ pub const Decoder = struct {
         decoder.* = undefined;
     }
 
+    /// Empty, as a new connection's table starts.
+    pub fn reset(decoder: *Decoder) void {
+        const table = &decoder.table;
+        // Copied first: the new value must not be built in place from itself.
+        const empty: DynamicTable = .{
+            .bytes = table.bytes,
+            .entries = table.entries,
+            .size_max = table.size_limit,
+            .size_limit = table.size_limit,
+        };
+        table.* = empty;
+        assert(table.count == 0 and table.size == 0);
+    }
+
     /// A header block's fields into `fields`, their names and values copied
     /// into `storage`; the count. Out of either: `HeaderListTooLarge`.
     pub fn decode(

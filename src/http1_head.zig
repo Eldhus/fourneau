@@ -459,7 +459,7 @@ fn valid_host(value: []const u8) bool {
     return all_in(value, &host_table);
 }
 
-fn all_in(text: []const u8, table: *const [256]bool) bool {
+pub fn all_in(text: []const u8, table: *const [256]bool) bool {
     for (text) |byte| {
         if (!table[byte]) return false;
     }
@@ -467,7 +467,7 @@ fn all_in(text: []const u8, table: *const [256]bool) bool {
 }
 
 /// tchar (RFC 9110 §5.6.2).
-const token_table = table: {
+pub const token_table = table: {
     var table: [256]bool = @splat(false);
     for ("!#$%&'*+-.^_`|~") |byte| table[byte] = true;
     for ('0'..'9' + 1) |byte| table[byte] = true;
@@ -478,7 +478,7 @@ const token_table = table: {
 
 /// Request targets: visible ASCII. Clients percent-encode the rest;
 /// anything outside (space, controls, DEL, non-ASCII bytes) is refused.
-const target_table = table: {
+pub const target_table = table: {
     var table: [256]bool = @splat(false);
     for (0x21..0x7f) |byte| table[byte] = true;
     break :table table;
@@ -486,7 +486,7 @@ const target_table = table: {
 
 /// field-value (RFC 9110 §5.5): visible ASCII, obs-text (0x80-0xff), and
 /// space or tab inside. NUL, CR, LF and other controls are refused.
-const value_table = table: {
+pub const value_table = table: {
     var table: [256]bool = @splat(false);
     for (0x21..0x7f) |byte| table[byte] = true;
     for (0x80..0x100) |byte| table[byte] = true;

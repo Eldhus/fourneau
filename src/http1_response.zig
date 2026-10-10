@@ -46,7 +46,9 @@ pub const Head = struct {
 /// `includeSubDomains`: a server speaks for its own host, not its
 /// siblings (fourneau.y2kbugger.com must not bind y2kbugger.com's
 /// others). Browsers ignore it for an IP address (RFC 6797 §8.1.1).
-const strict_transport_security_line = "Strict-Transport-Security: max-age=31536000\r\n";
+pub const strict_transport_security = "max-age=31536000";
+const strict_transport_security_line =
+    "Strict-Transport-Security: " ++ strict_transport_security ++ "\r\n";
 
 pub const Refusal = enum {
     status_invalid,
@@ -176,7 +178,8 @@ const reserved_names = [_][]const u8{
     "strict-transport-security",
 };
 
-fn header_refusal(header: Header) ?Refusal {
+/// An application's header the server will not send (HTTP/2's heads too).
+pub fn header_refusal(header: Header) ?Refusal {
     if (header.name.len == 0) return .header_name_invalid;
     // Tables, not comparisons: this runs for every header of every response.
     for (header.name) |byte| {

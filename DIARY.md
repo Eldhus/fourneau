@@ -1661,3 +1661,37 @@ a priority block and an unknown type taken apart; each writer's frame
 read back by the parser. Learned again: 0.17's `zig fmt` rewrites
 `@enumFromInt` to `@fromBackingInt`, and `.{0} ** 8` no longer parses
 (`@splat`); the zig skill had both and I wrote from memory anyway.
+
+## 2026-10-10: HTTP/2 connections, the state machine
+
+`http2.zig`, layer 3: bytes in, events out, frames in one send buffer;
+the choices and their reasons are in docs/http2.md ("The connection, as
+built"). Read before writing: RFC 9113 §5 and §8 again, and h2spec's own
+cases (its http2/*.go), to know what it accepts. Its verifiers pass on
+a closed connection whatever the GOAWAY says, so the codes matter only
+where the RFC says MUST; the frames on closed streams follow Go's
+server where the RFC leaves a choice.
+
+Found while designing: a HEADERS frame whose priority names itself is a
+stream error, but its block must still be decoded or the HPACK tables
+part ways, so the frame layer now flags it instead of refusing it. And a
+drain's GOAWAY must name the last stream when it is decided, not when
+it is written, or streams ignored in between would be reported taken.
+
+Tests: a GET answered and its HEADERS decoded back; 12 connection errors
+and 6 stream errors as h2spec names them; 13 malformed requests reset
+and never seen; Rapid Reset (two streams reset by the client, their
+handlers still running: the third is REFUSED_STREAM until one returns);
+send windows through SETTINGS, WINDOW_UPDATE and a negative window;
+receive windows enforced and given back at half; trailers; cookie
+crumbs joined; a PING flood cut in its 52nd round of 1,200; a drain;
+release's resets; heads refused. Then 500 random conversations
+(requests split across CONTINUATION, bodies, resets, settings, garbage
+frames, flipped bits) against a server acting at random, the invariants
+checked after every call: 85 end open and 415 in a connection error,
+none breaks. The tests tested: freeing a stream's entry at the peer's
+reset fails the Rapid Reset test.
+
+The first run passed 17 of 19; the two failures were the invariant
+check catching windows over 2^31-1 left behind by the error paths
+(added, then refused); now checked before they change.
