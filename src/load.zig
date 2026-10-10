@@ -2,7 +2,7 @@
 //! server from fewer cores than the server has.
 //!
 //!   fourneau-load --port P [--path /] [--connections N] [--threads T]
-//!                 [--seconds S] [--pipeline K]
+//!                 [--seconds S] [--pipeline K] [--format text|json]
 //!
 //! Built as the server is: each thread owns an io_uring and a fixed array
 //! of connections, each a small state machine (send K requests, read K
@@ -26,6 +26,9 @@ const Options = struct {
     threads: u32 = 2,
     seconds: u32 = 10,
     pipeline: u32 = 1,
+    /// `text`, for people (stderr); `json`, one object on stdout, for a
+    /// program that shows the result (roux's dev server).
+    format: enum { text, json } = .text,
 };
 
 const response_buffer_bytes = 64 * 1024;
@@ -274,6 +277,9 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.seconds = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, arg, "--pipeline")) {
             options.pipeline = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            options.format = std.meta.stringToEnum(@TypeOf(options.format), value) orelse
+                return error.Usage;
         } else return error.Usage;
     }
     if (options.pipeline == 0 or options.pipeline > 64) return error.Usage;
@@ -317,10 +323,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, deadline });
     }
     for (threads) |thread| thread.join();
-    report(workers, now_ns() - start);
+    report(workers, now_ns() - start, options.format);
 }
 
-fn report(workers: []Worker, elapsed_ns: u64) void {
+fn report(workers: []Worker, elapsed_ns: u64, format: @FieldType(Options, "format")) void {
     var histogram: Histogram = .{};
     var responses: u64 = 0;
     var errors: u64 = 0;
@@ -331,6 +337,20 @@ fn report(workers: []Worker, elapsed_ns: u64) void {
     }
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
     const rate = @as(f64, @floatFromInt(responses)) / seconds;
+    if (format == .json) {
+        var buffer: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "{{\"requests_per_second\":{d:.0}," ++
+            "\"responses\":{d},\"errors\":{d},\"p50_us\":{d},\"p99_us\":{d},\"p999_us\":{d}}}\n", .{
+            rate,
+            responses,
+            errors,
+            histogram.percentile_us(500),
+            histogram.percentile_us(990),
+            histogram.percentile_us(999),
+        }) catch unreachable; // six numbers fit
+        _ = linux.write(1, line.ptr, line.len);
+        return;
+    }
     std.debug.print("requests/s={d:.0} responses={d} errors={d} ", .{ rate, responses, errors });
     std.debug.print("p50={d}us p99={d}us p99.9={d}us max_bucket={d}us\n", .{
         histogram.percentile_us(500),
