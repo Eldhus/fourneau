@@ -95,6 +95,15 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
         const Redirect = @This();
         pub const Server = server_module.ServerType(Redirect, server_options);
 
+        /// Small: 64 connections, 16 KiB of scratch each.
+        pub const config: server_module.Config = .{
+            .connections_max = 64,
+            .scratch_bytes_max = 16 * 1024,
+        };
+        /// What a redirect adds to its `Io`'s fiber pool: its server's,
+        /// and the fiber its server accepts on.
+        pub const fibers_max = config.fibers_max() + 1;
+
         host: []const u8,
 
         pub const Response = struct {
@@ -123,8 +132,7 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
             response.* = undefined;
         }
 
-        /// The redirect's server on `port`, beside a shard's HTTPS one:
-        /// small (64 connections, 16 KiB of scratch each).
+        /// The redirect's server on `port`, beside a shard's HTTPS one.
         pub fn listen(
             redirect: *Redirect,
             gpa: Allocator,
@@ -138,10 +146,7 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
                 .kernel_backlog = 1024,
             };
             const listener = try plain.listen(io, listen_options);
-            return Server.init(gpa, io, redirect, listener, .{
-                .connections_max = 64,
-                .scratch_bytes_max = 16 * 1024,
-            });
+            return Server.init(gpa, io, redirect, listener, config);
         }
     };
 }

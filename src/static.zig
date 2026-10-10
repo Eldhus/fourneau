@@ -154,20 +154,23 @@ fn run_shard(shared: *const Shared, options: Options) void {
 
 fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     const gpa = std.heap.page_allocator;
+    const config: server_module.Config = .{
+        .connections_max = @max(64, 1024 / options.shards),
+        .tls = shared.tls,
+    };
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{
         .thread_limit = 0, // this thread only
         .log2_ring_entries = 12, // not the default 8 (experiment 23)
+        .fibers_max = config.fibers_max() +
+            if (options.https.redirect_port != null) Redirect.fibers_max else 0,
     });
     defer runtime.deinit();
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse(options.address, options.port);
     const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
     var app: App = .{ .site = shared.site };
-    var server = try Server.init(gpa, io, &app, listener, .{
-        .connections_max = @max(64, 1024 / options.shards),
-        .tls = shared.tls,
-    });
+    var server = try Server.init(gpa, io, &app, listener, config);
     var group: std.Io.Group = .init;
     var redirect: Redirect = undefined;
     var redirect_server: Redirect.Server = undefined;

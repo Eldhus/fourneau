@@ -84,6 +84,15 @@ pub const Config = struct {
         }
     }
 
+    /// The fibers a server runs at once, at most: one per connection slot
+    /// and the timekeeper (accepting runs on `run`'s caller). A slot is
+    /// given back as its fiber's last act, so a new connection never needs
+    /// a fiber before the last one is free. An `Io`'s fiber pool is the
+    /// sum of what runs on it.
+    pub fn fibers_max(config: Config) u32 {
+        return config.connections_max + 1;
+    }
+
     fn head_limits(config: Config) http1_head.Limits {
         return .{
             .head_bytes_max = config.head_bytes_max,
@@ -171,6 +180,9 @@ pub const Stats = struct {
     handshakes_failed: u64 = 0,
     /// Idle keep-alive connections closed to admit new ones.
     evicted: u64 = 0,
+    /// Connections closed because the `Io` had no fiber for them: its pool
+    /// is smaller than `Config.fibers_max` says. Always 0 when it is not.
+    fiberless: u64 = 0,
 };
 
 /// The address of this, per thread, names the thread a shard runs on.
@@ -701,6 +713,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 server.stats.accepted += 1;
                 server.group.concurrent(server.io, serve_connection, .{ server, index }) catch {
                     // No fiber to run it on: close it, as a full server would.
+                    server.stats.fiberless += 1;
                     server.close_connection(&server.connections[index]);
                 };
             } else unreachable;

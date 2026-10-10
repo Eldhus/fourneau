@@ -138,12 +138,16 @@ fn run_shard(options: Options) void {
 
 fn run_shard_or_fail(options: Options) !void {
     const gpa = std.heap.page_allocator;
+    const config: server_module.Config = .{
+        .connections_max = @max(1, options.connections / options.shards),
+    };
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{
         .thread_limit = 0, // this thread only
         // Not the default 8: with hundreds of connections the queues overflowed,
         // costing ~3,000 kernel cycles a request (experiment 23).
         .log2_ring_entries = 12,
+        .fibers_max = config.fibers_max() + 1, // and `print_counts`
     });
     defer runtime.deinit();
 
@@ -151,9 +155,7 @@ fn run_shard_or_fail(options: Options) !void {
     const address = try std.Io.net.IpAddress.parse(options.address, options.port);
     const listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 });
     var app: App = .{};
-    var server = try Server.init(gpa, io, &app, listener, .{
-        .connections_max = @max(1, options.connections / options.shards),
-    });
+    var server = try Server.init(gpa, io, &app, listener, config);
     var group: std.Io.Group = .init;
     if (options.counts) try group.concurrent(io, print_counts, .{ &runtime, &server });
     try server.run();
@@ -181,4 +183,27 @@ fn print_counts(runtime: *Evented, server: *Server) void {
         counts_last = counts;
         requests_last = requests;
     } else unreachable;
+}
+
+fn count_one(count: *u32) void {
+    count.* += 1;
+}
+
+test "the port's fibers: a pool mapped at init, refused beyond it, reused" {
+    const gpa = std.testing.allocator;
+    var runtime: Evented = undefined;
+    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = 2 });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var count: u32 = 0;
+    for (0..3) |_| {
+        var group: std.Io.Group = .init;
+        errdefer group.cancel(io);
+        try group.concurrent(io, count_one, .{&count});
+        try group.concurrent(io, count_one, .{&count});
+        const refused = group.concurrent(io, count_one, .{&count});
+        try std.testing.expectError(error.ConcurrencyUnavailable, refused);
+        try group.await(io);
+    }
+    try std.testing.expectEqual(6, count);
 }

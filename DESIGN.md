@@ -197,13 +197,17 @@ slabs every connection takes a stride of; nothing is allocated per
 request. Limits a deployment has reason to change are configuration; the
 rest are constants with a comptime assertion of how they relate.
 
-Fibers are the exception to static allocation, for now: our `Evented`
-allocates a fiber (8 MiB of stack over a guard page, committed as used,
-its header at the top beside the first frames so a wake touches one
-place; experiment 22) when a task starts and recycles it after. The
-slabs use ordinary pages: huge pages changed nothing (experiment 21).
-A pool sized from `connections_max`, as `sim_io.zig` has, is ours to do
-(TODO).
+Fibers are a pool too: our `Evented` reserves room for `fibers_max` of
+them at startup, one mapping of address space (8 MiB of stack each over
+a guard page, its header at the top beside the first frames so a wake
+touches one place; experiment 22). A fiber is carved from it the first
+time one more is needed, so an idle server's pool costs no memory, and
+recycled after; beyond the pool, a task is refused, never allocated. A
+server says what it needs (`Config.fibers_max`: a fiber per slot and the
+timekeeper), and a program sums what runs on its `Io`; the simulator's
+pool is exactly that, so every seed checks the count. No huge pages,
+for the fibers (each touches a few KiB; transparent huge pages made it
+2 MiB) or the slabs (they changed nothing; experiment 21).
 
 Time comes from `Io`: `now` and `sleep`. In the simulator, time is ticks
 the seed controls. Every timeout (head, idle keep-alive, body, send

@@ -52,15 +52,21 @@
    added to the dragrace and tested hard, but **nothing pushed tonight**
    (the dragrace must race as it is). What should be taught goes into
    roux-tutor. In order:
-   1. The fiber pool (Todo; item 1's next).
+   1. ~~The fiber pool~~ (done 2026-10-09, DIARY; no public benchmark:
+      nothing a visitor would see, and nothing to teach).
    2. Graceful shutdown (M6; the simulator models cancellation first).
    3. Zero-copy static sends (M6).
    4. Brotli, our encoder (M6); a compression benchmark?
    5. HTTP/2 (M9); a dragrace workload.
-   6. Graceful restart (M10).
+   6. Graceful restart (M10). Old and new processes overlap, so it
+      meets the locked-memory finding (DIARY 2026-10-09): io_uring
+      charges rings to `RLIMIT_MEMLOCK` (8 MiB here) and frees a dead
+      process's rings late; fourneau's programs panic where roux's host
+      waits. Move roux's wait into fourneau, and check the site host's
+      limit.
    7. Differential tests against Go and axum (M11, `dragrace diff`).
    - Where it stands (2026-10-09): Zig 0.17.0 is still the newest
-     release (checked). Starting 1.
+     release (checked). 1 done; starting 2.
 
 ## Plan
 
@@ -160,9 +166,6 @@ Read the diary, keep the tests, delete what did not pay, write it again.
 - [ ] A ~2 s worst-case request in the safe-build pipelined run (p99.9
   13.8 ms; DIARY 2026-10-05): find where it waited (the accept backlog at
   start-up is the first suspect). (2026-10-05)
-- [ ] Fibers from a pool sized at startup in the port (static allocation
-  and a bound), not allocated per task; the layout (header on top, guard
-  page) is done. (2026-10-05)
 - [ ] Parsing with SIMD: line scanning and header validation are a large
   share of user time (DIARY 2026-10-05). (2026-10-05)
 - [ ] SQLite-grade branch coverage: 100% branch coverage (MC/DC, as
