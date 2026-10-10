@@ -1,7 +1,7 @@
 //! A directory of files, served from memory: fourneau-static's, and roux's
 //! static files. Every file under a root is read once, at startup, into
-//! one table (all memory taken before serving, none after), with a gzip
-//! copy when compressing pays, an ETag, and byte ranges.
+//! one table (all memory taken before serving, none after), with gzip and
+//! brotli copies when compressing pays, an ETag, and byte ranges.
 //!
 //! Routes: `/` is `index.html`; `/a` is `a`, else `a.html`, else
 //! `a/index.html`; nothing else exists, so no request names a path outside
@@ -12,6 +12,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const http1_response = @import("http1_response.zig");
 const http1_head = @import("http1_head.zig");
+const brotli_encode = @import("brotli_encode.zig");
+const brotli_decode = @import("brotli_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -29,20 +31,44 @@ const Variant = struct {
     etag: []const u8,
 };
 
-/// A file, and its gzip-compressed copy when compressing it paid: made at
+/// A file, and its compressed copies when compressing it paid: made at
 /// load, so a request costs no compression (M6).
 const File = struct {
     identity: Variant,
     gzip: ?Variant = null,
+    brotli: ?Variant = null,
 
-    /// The copy this request may have: gzip when it says it accepts it.
+    /// The copy this request should have: of the codings it accepts, the
+    /// one it weights highest (RFC 9110 §12.5.3), the smaller on a tie.
     fn variant(file: *const File, headers: []const http1_head.Header) *const Variant {
+        const weights = Weights.of(headers);
+        var best = &file.identity;
+        var best_weight = weights.identity;
         if (file.gzip) |*compressed| {
-            if (accepts_gzip(headers)) return compressed;
+            if (weights.gzip > 0 and weights.gzip >= best_weight) {
+                best = compressed;
+                best_weight = weights.gzip;
+            }
         }
-        return &file.identity;
+        if (file.brotli) |*compressed| {
+            if (weights.brotli > 0 and weights.brotli >= best_weight) best = compressed;
+        }
+        return best;
     }
 };
+
+/// What a site does at load beyond reading its files.
+pub const LoadOptions = struct {
+    /// A brotli copy of each text file, by our encoder: ~15-25% smaller
+    /// than gzip's on text, and ~0.1 s a 40 KB page at load. Off where
+    /// load time matters more (roux's development server restarts the
+    /// app on every edit).
+    brotli: bool = true,
+};
+
+/// Files past this get no brotli copy: the encoder's optimal parse keeps
+/// tens of bytes a byte of input, too much at load on a small machine.
+const brotli_bytes_max = 1 << 20;
 
 /// The site: every route and its file, built before the first shard starts
 /// and never written again; the shards share it read-only.
@@ -57,10 +83,11 @@ pub const Site = struct {
         io: std.Io,
         root: []const u8,
         mount: []const u8,
+        options: LoadOptions,
     ) !Site {
         assert(mount.len == 0 or (mount[0] == '/' and mount[mount.len - 1] != '/'));
         var site: Site = .{};
-        try load_into(gpa, io, root, mount, &site);
+        try load_into(gpa, io, root, mount, options, &site);
         return site;
     }
 
@@ -231,18 +258,35 @@ fn content_type(name: []const u8) []const u8 {
 }
 
 /// A file as served: its body and its headers, the ETag a hash of the body.
-fn make_file(gpa: std.mem.Allocator, name: []const u8, body: []const u8) !File {
+fn make_file(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    body: []const u8,
+    options: LoadOptions,
+) !File {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
-    const compressed = if (compressible(name, body.len)) try gzip(gpa, body) else null;
-    // A copy at least a tenth smaller is worth its CPU and memory.
-    const worth = if (compressed) |bytes| bytes.len * 10 < body.len * 9 else false;
+    const text = compressible(name, body.len);
+    const gzipped = if (text) worth(gpa, body, try gzip(gpa, body)) else null;
+    const brotli_wanted = text and options.brotli and body.len <= brotli_bytes_max;
+    const brotlied = if (brotli_wanted)
+        worth(gpa, body, try brotli_encode.encode(gpa, body))
+    else
+        null;
+    const vary = gzipped != null or brotlied != null;
     const tag = try std.fmt.allocPrint(gpa, "{x}", .{digest[0..8]});
-    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, worth) };
-    if (worth) {
-        file.gzip = try make_variant(gpa, name, compressed.?, tag, "gzip", true);
-    } else if (compressed) |bytes| gpa.free(bytes);
+    var file: File = .{ .identity = try make_variant(gpa, name, body, tag, null, vary) };
+    if (gzipped) |bytes| file.gzip = try make_variant(gpa, name, bytes, tag, "gzip", true);
+    if (brotlied) |bytes| file.brotli = try make_variant(gpa, name, bytes, tag, "br", true);
     return file;
+}
+
+/// A compressed copy, kept when it is at least a tenth smaller: then it is
+/// worth its memory, and a header the client must undo.
+fn worth(gpa: std.mem.Allocator, body: []const u8, compressed: []u8) ?[]u8 {
+    if (compressed.len * 10 < body.len * 9) return compressed;
+    gpa.free(compressed);
+    return null;
 }
 
 /// The headers of one copy. `vary`: the file has another copy, so caches
@@ -300,59 +344,99 @@ fn gzip(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     return output.toOwnedSlice();
 }
 
-/// Whether Accept-Encoding allows gzip: `gzip` (or `*`) listed, and not
-/// with q=0 (RFC 9110 §12.5.3).
-fn accepts_gzip(headers: []const http1_head.Header) bool {
-    for (headers) |header| {
-        if (!std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) continue;
-        var codings = std.mem.splitScalar(u8, header.value, ',');
-        // n bytes split into at most n + 1 codings, then the end.
-        for (0..header.value.len + 2) |_| {
-            const coding = codings.next() orelse break;
-            var parts = std.mem.splitScalar(u8, coding, ';');
-            const coding_name = std.mem.trim(u8, parts.first(), " \t");
-            const named = std.ascii.eqlIgnoreCase(coding_name, "gzip") or
-                std.mem.eql(u8, coding_name, "*");
-            if (named) return !refused(parts.rest());
-        } else unreachable;
-    }
-    return false;
-}
+/// How much the client wants each coding we have (RFC 9110 §12.5.3), in
+/// thousandths: a coding's own q, else `*`'s, else 0. Identity is
+/// acceptable unless excluded, but least wanted when unnamed. No
+/// Accept-Encoding: identity (the RFC allows any coding, but curl and
+/// other clients that send none cannot undo one).
+const Weights = struct {
+    identity: u16 = 1,
+    gzip: u16 = 0,
+    brotli: u16 = 0,
 
-/// A coding's parameters say q=0 (or 0.0, 0.00, 0.000).
-fn refused(parameters: []const u8) bool {
+    const unnamed: u16 = std.math.maxInt(u16);
+
+    fn of(headers: []const http1_head.Header) Weights {
+        var identity: u16 = unnamed;
+        var gzip_weight: u16 = unnamed;
+        var brotli_weight: u16 = unnamed;
+        var star: u16 = unnamed;
+        var seen = false;
+        for (headers) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) continue;
+            seen = true;
+            var codings = std.mem.splitScalar(u8, header.value, ',');
+            // n bytes split into at most n + 1 codings, then the end.
+            for (0..header.value.len + 2) |_| {
+                const coding = codings.next() orelse break;
+                var parts = std.mem.splitScalar(u8, coding, ';');
+                const name = std.mem.trim(u8, parts.first(), " \t");
+                const weight = quality(parts.rest()) orelse continue; // malformed: ignored
+                if (std.ascii.eqlIgnoreCase(name, "gzip")) gzip_weight = weight;
+                if (std.ascii.eqlIgnoreCase(name, "br")) brotli_weight = weight;
+                if (std.ascii.eqlIgnoreCase(name, "identity")) identity = weight;
+                if (std.mem.eql(u8, name, "*")) star = weight;
+            } else unreachable;
+        }
+        if (!seen) return .{};
+        const others = if (star == unnamed) 0 else star;
+        return .{
+            .identity = if (identity != unnamed) identity else if (star == 0) 0 else 1,
+            .gzip = if (gzip_weight != unnamed) gzip_weight else others,
+            .brotli = if (brotli_weight != unnamed) brotli_weight else others,
+        };
+    }
+};
+
+/// A coding's q in thousandths: 1000 when none is given; null when the
+/// value is not a qvalue (RFC 9110 §12.4.2: "0", "0.", up to three
+/// decimals; "1", "1.000").
+fn quality(parameters: []const u8) ?u16 {
     var params = std.mem.splitScalar(u8, parameters, ';');
     for (0..parameters.len + 2) |_| {
-        const param = std.mem.trim(u8, params.next() orelse return false, " \t");
+        const param = std.mem.trim(u8, params.next() orelse return 1000, " \t");
         if (param.len < 2 or !std.ascii.eqlIgnoreCase(param[0..2], "q=")) continue;
         const value = param[2..];
-        if (value.len == 0 or value[0] != '0') return false;
-        for (value[1..]) |c| {
-            if (c != '.' and c != '0') return false;
+        if (value.len == 0 or value.len > 5) return null;
+        if (value[0] != '0' and value[0] != '1') return null;
+        var thousandths: u16 = @as(u16, value[0] - '0') * 1000;
+        if (value.len == 1) return thousandths;
+        if (value[1] != '.') return null;
+        var scale: u16 = 100;
+        for (value[2..]) |digit| {
+            if (!std.ascii.isDigit(digit)) return null;
+            thousandths += (digit - '0') * scale;
+            scale /= 10;
         }
-        return true;
+        return if (thousandths <= 1000) thousandths else null;
     } else unreachable;
 }
 
 test "site: Accept-Encoding, as RFC 9110 reads it" {
-    const cases = [_]struct { value: []const u8, gzip: bool }{
-        .{ .value = "gzip, deflate, br", .gzip = true },
-        .{ .value = "br;q=1.0, gzip;q=0.8", .gzip = true },
-        .{ .value = "*", .gzip = true },
-        .{ .value = "gzip;q=0", .gzip = false },
-        .{ .value = "gzip; q=0.000", .gzip = false },
-        .{ .value = "br, deflate", .gzip = false },
-        .{ .value = "gzipped", .gzip = false },
-        .{ .value = "", .gzip = false },
+    const W = Weights;
+    const cases = [_]struct { value: []const u8, want: W }{
+        .{ .value = "gzip, deflate, br", .want = .{ .gzip = 1000, .brotli = 1000 } },
+        .{ .value = "br;q=1.0, gzip;q=0.8", .want = .{ .gzip = 800, .brotli = 1000 } },
+        .{ .value = "*", .want = .{ .gzip = 1000, .brotli = 1000 } },
+        .{ .value = "gzip;q=0", .want = .{} },
+        .{ .value = "gzip; q=0.000, br;q=0.5", .want = .{ .brotli = 500 } },
+        .{ .value = "gzipped", .want = .{} },
+        .{ .value = "", .want = .{} },
+        .{ .value = "*;q=0", .want = .{ .identity = 0 } },
+        .{
+            .value = "identity;q=0.5, *;q=0.1",
+            .want = .{ .identity = 500, .gzip = 100, .brotli = 100 },
+        },
+        .{ .value = "gzip;q=2, br;q=0.25", .want = .{ .brotli = 250 } }, // q=2 is no qvalue
     };
     for (cases) |case| {
         const headers = [_]http1_head.Header{.{ .name = "Accept-Encoding", .value = case.value }};
-        try std.testing.expectEqual(case.gzip, accepts_gzip(&headers));
+        try std.testing.expectEqual(case.want, Weights.of(&headers));
     }
-    try std.testing.expect(!accepts_gzip(&.{}));
+    try std.testing.expectEqual(W{}, Weights.of(&.{}));
 }
 
-test "site: a compressible file gets a smaller gzip copy that inflates back" {
+test "site: a compressible file gets smaller copies that decode back" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -363,15 +447,36 @@ test "site: a compressible file gets a smaller gzip copy that inflates back" {
         try page_buffer.appendSlice(arena, line);
     }
     const page = page_buffer.items;
-    const file = try make_file(arena, "page.html", page);
-    const compressed = file.gzip orelse return error.TestExpectedGzip;
-    try std.testing.expect(compressed.body.len < page.len / 4);
-    var input: std.Io.Reader = .fixed(compressed.body);
+    const file = try make_file(arena, "page.html", page, .{});
+    const gzipped = file.gzip orelse return error.TestExpectedGzip;
+    try std.testing.expect(gzipped.body.len < page.len / 4);
+    var input: std.Io.Reader = .fixed(gzipped.body);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &window);
     const inflated = try decompress.reader.allocRemaining(arena, .limited(64 * 1024));
     try std.testing.expectEqualStrings(page, inflated);
-    try std.testing.expect(!std.mem.eql(u8, file.identity.etag, compressed.etag));
+    const brotlied = file.brotli orelse return error.TestExpectedBrotli;
+    try std.testing.expect(brotlied.body.len < gzipped.body.len);
+    const out = try arena.alloc(u8, page.len);
+    try std.testing.expectEqualStrings(page, try brotli_decode.decode(arena, brotlied.body, out));
+    // Each copy its own ETag; no brotli when the load asks for none.
+    try std.testing.expect(!std.mem.eql(u8, file.identity.etag, gzipped.etag));
+    try std.testing.expect(!std.mem.eql(u8, gzipped.etag, brotlied.etag));
+    const plain = try make_file(arena, "page.html", page, .{ .brotli = false });
+    try std.testing.expect(plain.brotli == null and plain.gzip != null);
+    // The copy each client gets.
+    const choices = [_]struct { accept: []const u8, body: []const u8 }{
+        .{ .accept = "gzip, deflate, br", .body = brotlied.body },
+        .{ .accept = "gzip", .body = gzipped.body },
+        .{ .accept = "br;q=0.5, gzip", .body = gzipped.body },
+        .{ .accept = "identity", .body = page },
+        .{ .accept = "br;q=0", .body = page },
+    };
+    for (choices) |choice| {
+        const accept: http1_head.Header = .{ .name = "Accept-Encoding", .value = choice.accept };
+        const headers = [_]http1_head.Header{accept};
+        try std.testing.expectEqual(choice.body.ptr, file.variant(&headers).body.ptr);
+    }
 }
 
 /// Read every file under `root` into `site`, with its routes.
@@ -380,6 +485,7 @@ fn load_into(
     io: std.Io,
     root: []const u8,
     mount: []const u8,
+    options: LoadOptions,
     site: *Site,
 ) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
@@ -399,7 +505,7 @@ fn load_into(
         const body = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(file_bytes_max));
         site_bytes += body.len;
         if (site_bytes > site_bytes_max) return error.SiteTooLarge;
-        const file = try make_file(gpa, entry.basename, body);
+        const file = try make_file(gpa, entry.basename, body, options);
         const route = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ mount, entry.path });
         try add_routes(gpa, site, route[1..], file);
     } else return error.TooManyEntries;
@@ -448,9 +554,9 @@ test "site: routes for pages, directories and the 404" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var site: Site = .{};
-    const page = try make_file(arena, "a.html", "page");
-    const index = try make_file(arena, "index.html", "index");
-    const missing = try make_file(arena, "404.html", "missing");
+    const page = try make_file(arena, "a.html", "page", .{});
+    const index = try make_file(arena, "index.html", "index", .{});
+    const missing = try make_file(arena, "404.html", "missing", .{});
     try add_routes(arena, &site, "index.html", index);
     try add_routes(arena, &site, "about.html", page);
     try add_routes(arena, &site, "docs/index.html", index);

@@ -18,6 +18,7 @@ project, so the suite is built to be fast and to be cut:
 | `zig build sim -- --seed N` | one simulator run, replayed exactly | a second |
 | `zig build sim -- --seeds 1000` | a sweep; exits 127 crash, 128 liveness, 129 correctness | minutes |
 | `zig build test -Dfilter=fuzz -Dtest-optimize=safe --fuzz=N` | Zig's coverage-guided fuzzer on the parsers, N runs (LLVM builds only: Debug has no coverage instrumentation) | minutes |
+| `zig build brotli-check -Doptimize=ReleaseSafe -- 2000` | brotli: inputs from 2,000 seeds (random, runs, dictionary words, copies of themselves, up to 400 KB), encoded by us, decoded by our decoder and the reference `brotli` (on PATH) | minutes |
 
 Tests compile Debug by default, fast to build, every assertion on;
 `-Dtest-optimize=safe` for an optimised run. Test

@@ -194,9 +194,19 @@ fibers, so the same server runs on any `Io`: our vendored io_uring
   were ~40% of the server's cycles), and the sites are HTTPS, where kTLS
   refuses `MSG_ZEROCOPY` (`EOPNOTSUPP`; only spliced pages pass, and the
   kernel encrypts from them anyway), with files of a few KB gzipped.
-  Revisited if a site serves large files. Responses are
-  compressed with gzip (`std.compress.flate`) and brotli, whose encoder
-  is ours (RFC 7932; the standard library has none). `fourneau-static` is
+  Revisited if a site serves large files. Text files get a gzip copy
+  (`std.compress.flate`, best level) and a brotli copy (`brotli_*.zig`,
+  RFC 7932, ours: the standard library has none), each kept when a tenth
+  smaller; a request gets the coding its Accept-Encoding weights highest
+  (RFC 9110 §12.5.3), brotli on a tie. The encoder is for compressing
+  once, at load: optimal parsing (Zopfli's method, as brotli's q10/q11),
+  literal context modeling, the static dictionary; within 0.6-3.4% of
+  the reference's q11 on the dragrace site's files, the index page at
+  79% of gzip's (DIARY). Its decoder is the tests' oracle, checked
+  against the reference, which checks the encoder in turn
+  (`zig build brotli-check`). Files over 1 MiB get no brotli copy (the
+  parser's memory), and roux's development server none at all (its
+  restarts). `fourneau-static` is
   a pure-Zig static file server on the same code: an example, and the
   differential target against Go's `FileServer`, tower-http's `ServeDir`
   and Caddy.

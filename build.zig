@@ -53,9 +53,15 @@ pub fn build(b: *std.Build) void {
     const exported_tls = b.addModule("tls", .{
         .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
     });
+    const exported_dictionary = b.addModule("brotli_dictionary", .{
+        .root_source_file = b.path("vendor/brotli/dictionary.zig"),
+    });
     _ = b.addModule("fourneau", .{
         .root_source_file = b.path("src/fourneau.zig"),
-        .imports = &.{.{ .name = "tls", .module = exported_tls }},
+        .imports = &.{
+            .{ .name = "tls", .module = exported_tls },
+            .{ .name = "brotli_dictionary", .module = exported_dictionary },
+        },
     });
     // The style checker, for repositories built on fourneau (roux's host).
     _ = b.addModule("tidy", .{ .root_source_file = b.path("src/tidy.zig") });
@@ -81,6 +87,11 @@ pub fn build(b: *std.Build) void {
     zig_io_evented.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
     const tls = b.createModule(.{
         .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const brotli_dictionary = b.createModule(.{
+        .root_source_file = b.path("vendor/brotli/dictionary.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -112,6 +123,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zig_io_evented", .module = zig_io_evented },
                 .{ .name = "tls", .module = tls },
+                .{ .name = "brotli_dictionary", .module = brotli_dictionary },
             },
         }),
     });
@@ -124,12 +136,18 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/brotli_tool.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "brotli_dictionary", .module = b.createModule(.{
-                .root_source_file = b.path("vendor/brotli/dictionary.zig"),
-            }) }},
+            .imports = &.{.{ .name = "brotli_dictionary", .module = brotli_dictionary }},
         }),
     });
     b.installArtifact(brotli_tool);
+    const run_brotli_check = b.addRunArtifact(brotli_tool);
+    run_brotli_check.addArg("check");
+    run_brotli_check.addPassthruArgs();
+    run_brotli_check.has_side_effects = true;
+    b.step(
+        "brotli-check",
+        "Encode inputs from seeds, decode with ours and the reference (-- SEEDS)",
+    ).dependOn(&run_brotli_check.step);
 
     const load = b.addExecutable(.{
         .name = "fourneau-load",
@@ -187,5 +205,4 @@ pub fn build(b: *std.Build) void {
     // reused, and tidy never looked (2026-10-05: floor.zig went in unchecked).
     run_tests.has_side_effects = true;
     b.step("test", "Run the fast tests (-Dfilter=AREA for one area)").dependOn(&run_tests.step);
-
 }
