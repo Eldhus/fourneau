@@ -23,8 +23,10 @@ const assert = std.debug.assert;
 
 const P256 = std.crypto.ecc.P256;
 const Scalar = P256.scalar.Scalar;
-const Sha256 = std.crypto.hash.sha2.Sha256;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+/// std's, with the CPU's SHA extensions where it has them (src/sha256.zig):
+/// tls.zig's, so the signer's hash is the transcript's type.
+const Sha256 = @import("sha256").Sha256;
+const HmacSha256 = std.crypto.auth.hmac.Hmac(Sha256);
 const IdentityElementError = std.crypto.errors.IdentityElementError;
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 

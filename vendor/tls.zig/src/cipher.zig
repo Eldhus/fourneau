@@ -3,7 +3,9 @@ const crypto = std.crypto;
 const hkdfExpandLabel = crypto.tls.hkdfExpandLabel;
 
 const Sha1 = crypto.hash.Sha1;
-const Sha256 = crypto.hash.sha2.Sha256;
+// fourneau's patch: std's SHA-256 with the CPU's SHA extensions where it has
+// them (fourneau's src/sha256.zig).
+const Sha256 = @import("sha256").Sha256;
 const Sha384 = crypto.hash.sha2.Sha384;
 
 const record = @import("record.zig");

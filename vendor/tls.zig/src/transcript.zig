@@ -3,7 +3,9 @@ const crypto = std.crypto;
 const tls = crypto.tls;
 const hkdfExpandLabel = tls.hkdfExpandLabel;
 
-const Sha256 = crypto.hash.sha2.Sha256;
+// fourneau's patch: std's SHA-256 with the CPU's SHA extensions where it has
+// them (fourneau's src/sha256.zig).
+const Sha256 = @import("sha256").Sha256;
 const Sha384 = crypto.hash.sha2.Sha384;
 const Sha512 = crypto.hash.sha2.Sha512;
 
@@ -200,7 +202,7 @@ pub const Transcript = struct {
     pub fn hash(t: *Transcript, comptime Hash: type) Hash {
         // fourneau's patch: with only the chosen hash fed, the others are stale.
         const tag: HashTag = switch (Hash) {
-            Sha256 => .sha256,
+            Sha256, crypto.hash.sha2.Sha256 => .sha256,
             Sha384 => .sha384,
             Sha512 => .sha512,
             else => @compileError("unimplemented"),
@@ -208,6 +210,9 @@ pub const Transcript = struct {
         if (t.only_selected) std.debug.assert(t.tag == tag);
         return switch (Hash) {
             Sha256 => t.sha256.hash,
+            // fourneau's patch: std's own type (RSA and TLS 1.2 signers ask
+            // for it), from the same state.
+            crypto.hash.sha2.Sha256 => t.sha256.hash.toStd(),
             Sha384 => t.sha384.hash,
             Sha512 => t.sha512.hash,
             else => @compileError("unimplemented"),
