@@ -123,7 +123,12 @@ pub const Handshake = struct {
             try h.writeAlert(null, err);
             return err;
         };
-        h.transcript.use(h.cipher_suite.hash());
+        // fourneau's patch: no client certificate, so only the suite's hash.
+        if (opt.client_auth == null) {
+            h.transcript.useOnly(h.cipher_suite.hash());
+        } else {
+            h.transcript.use(h.cipher_suite.hash());
+        }
 
         h.serverFlight(opt) catch |err| {
             try h.writeAlert(null, err);

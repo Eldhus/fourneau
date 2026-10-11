@@ -27,6 +27,11 @@ pub const Transcript = struct {
     sha512: Type(.sha512) = .{ .hash = Sha512.init(.{}) },
 
     tag: HashTag = .sha256,
+    // fourneau's patch: once a server has chosen its suite and asks for no
+    // client certificate, nothing reads the other two hashes, so only the
+    // chosen one is fed (`useOnly`; 5% of a handshake's instructions went to
+    // SHA-512's).
+    only_selected: bool = false,
 
     // Transcript Type from hash tag
     fn Type(h: HashTag) type {
@@ -42,7 +47,19 @@ pub const Transcript = struct {
         t.tag = tag;
     }
 
+    /// fourneau's patch: `use`, and from now on feed only that hash.
+    pub fn useOnly(t: *Transcript, tag: HashTag) void {
+        t.tag = tag;
+        t.only_selected = true;
+    }
+
     pub fn update(t: *Transcript, buf: []const u8) void {
+        if (t.only_selected) {
+            switch (t.tag) {
+                inline else => |h| @field(t, @tagName(h)).hash.update(buf),
+            }
+            return;
+        }
         t.sha256.hash.update(buf);
         t.sha384.hash.update(buf);
         t.sha512.hash.update(buf);
@@ -181,6 +198,14 @@ pub const Transcript = struct {
 
     /// Copy of the current hash value
     pub fn hash(t: *Transcript, comptime Hash: type) Hash {
+        // fourneau's patch: with only the chosen hash fed, the others are stale.
+        const tag: HashTag = switch (Hash) {
+            Sha256 => .sha256,
+            Sha384 => .sha384,
+            Sha512 => .sha512,
+            else => @compileError("unimplemented"),
+        };
+        if (t.only_selected) std.debug.assert(t.tag == tag);
         return switch (Hash) {
             Sha256 => t.sha256.hash,
             Sha384 => t.sha384.hash,
