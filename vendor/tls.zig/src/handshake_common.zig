@@ -10,6 +10,9 @@ const PrivateKey = @import("PrivateKey.zig");
 const record = @import("record.zig");
 const rsa = @import("rsa/rsa.zig");
 const proto = @import("protocol.zig");
+// fourneau's patch (vendor/tls.zig/README.md): X25519 and P-256 signing on
+// s2n-bignum's verified assembly, through fourneau's src/curves.zig.
+const curves = @import("curves");
 
 const X25519 = crypto.dh.X25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -243,7 +246,11 @@ pub const CertificateBuilder = struct {
                     .ecdsa_secp384r1_sha384 => h.cert_key_pair.ecdsa_key_pair.?.ecdsa_secp384r1_sha384,
                     else => unreachable,
                 };
-                var signer = try key_pair.signer(null);
+                // fourneau's patch: P-256 signs through src/curves.zig.
+                var signer = if (comptime_scheme == .ecdsa_secp256r1_sha256)
+                    curves.P256Signer.init(key_pair)
+                else
+                    try key_pair.signer(null);
                 h.setSignatureVerifyBytes(&signer);
                 const signature = try signer.finalize();
                 break :brk .{
@@ -493,7 +500,7 @@ pub const DhKeyPair = struct {
         var kp: DhKeyPair = .{};
         for (named_groups) |ng|
             switch (ng) {
-                .x25519 => kp.x25519_kp = X25519.KeyPair.generateDeterministic(seed[0..][0..X25519.seed_length].*),
+                .x25519 => kp.x25519_kp = curves.x25519_key_pair(seed[0..][0..X25519.seed_length].*), // fourneau's patch
                 .secp256r1 => kp.secp256r1_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed[32..][0..EcdsaP256Sha256.KeyPair.seed_length].*),
                 .secp384r1 => kp.secp384r1_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic(seed[32 + 32 ..][0..EcdsaP384Sha384.KeyPair.seed_length].*),
                 .x25519_ml_kem768 => kp.ml_kem768 = try MLKem768.KeyPair.generateDeterministic(seed[32 + 32 + 48 + 64 ..][0..MLKem768.seed_length].*),
@@ -508,7 +515,7 @@ pub const DhKeyPair = struct {
             .x25519 => {
                 if (server_pub_key.len != X25519.public_length)
                     return error.TlsIllegalParameter;
-                self.shared_key_buf[0..32].* = try X25519.scalarmult(
+                self.shared_key_buf[0..32].* = try curves.x25519_shared( // fourneau's patch
                     self.x25519_kp.secret_key,
                     server_pub_key[0..X25519.public_length].*,
                 );

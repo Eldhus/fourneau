@@ -32,8 +32,10 @@ pub const Tree = struct {
 const trees = [_]Tree{
     .{
         .dir = "src",
-        .roots = &.{ "tests.zig", "hello.zig", "load.zig" },
-        .untested = &.{ "tests.zig", "hello.zig" },
+        // curves.zig: a module of its own (tls.zig imports it), its tests an
+        // artifact of their own; curves_table.zig: `zig build curves-table`.
+        .roots = &.{ "tests.zig", "hello.zig", "load.zig", "curves.zig", "curves_table.zig" },
+        .untested = &.{ "tests.zig", "hello.zig", "curves.zig", "curves_table.zig" },
         .generated = &.{},
         // sim_io.zig: a deterministic std.Io, so a vtable of its own.
         .interfaces = &.{"sim_io.zig"},

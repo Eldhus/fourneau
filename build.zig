@@ -5,6 +5,40 @@
 
 const std = @import("std");
 
+/// s2n-bignum's routines under src/curves.zig (vendor/s2n-bignum/README.md).
+const curves_assembly = [_][]const u8{
+    "vendor/s2n-bignum/x86/curve25519/curve25519_x25519.S",
+    "vendor/s2n-bignum/x86/curve25519/curve25519_x25519_alt.S",
+    "vendor/s2n-bignum/x86/curve25519/curve25519_x25519base.S",
+    "vendor/s2n-bignum/x86/curve25519/curve25519_x25519base_alt.S",
+    "vendor/s2n-bignum/x86/p256/p256_scalarmulbase.S",
+    "vendor/s2n-bignum/x86/p256/p256_scalarmulbase_alt.S",
+    "vendor/s2n-bignum/x86/p256/bignum_tomont_p256.S",
+    "vendor/s2n-bignum/x86/p256/bignum_tomont_p256_alt.S",
+    "vendor/s2n-bignum/x86/generic/bignum_modinv.S",
+};
+
+/// The handshake's curves (src/curves.zig) with the assembly they call:
+/// tls.zig imports it, so every tls module carries one.
+fn curves_module(
+    b: *std.Build,
+    target: ?std.Build.ResolvedTarget,
+    optimize: ?std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/curves.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    add_curves_assembly(b, module);
+    return module;
+}
+
+fn add_curves_assembly(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("vendor/s2n-bignum/include"));
+    for (curves_assembly) |file| module.addAssemblyFile(b.path(file));
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Tests build Debug by default: every safety check is on, and Zig's own
@@ -28,12 +62,21 @@ pub fn build(b: *std.Build) void {
     });
     // The simulator's fiber switch (src/sim_io.zig).
     tests.root_module.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
-    // TLS 1.3: the handshake (vendor/tls.zig, ianic/tls.zig), its keys to kTLS.
+    // TLS 1.3: the handshake (vendor/tls.zig, ianic/tls.zig), its keys to
+    // kTLS; its curves on s2n-bignum (src/curves.zig).
+    const test_curves = curves_module(b, target, test_optimize);
     tests.root_module.addImport("tls", b.createModule(.{
         .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
         .target = target,
         .optimize = test_optimize,
+        .imports = &.{.{ .name = "curves", .module = test_curves }},
     }));
+    // The curves are a module of their own (tls.zig imports them), so their
+    // tests are an artifact of their own.
+    const curves_tests = b.addTest(.{
+        .root_module = test_curves,
+        .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
+    });
     // Programs over the port (fourneau-static) have tests too.
     tests.root_module.addImport("zig_io_evented", b.createModule(.{
         .root_source_file = b.path("vendor/zig-io-evented/Uring.zig"),
@@ -49,9 +92,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     // For programs that embed fourneau (fourneau-dragrace's competitors):
     // the server and our port of Evented, in the importer's mode and target.
-    // The server needs tls.zig, so the module carries it: importers add nothing.
+    // The server needs tls.zig, so the module carries it (and tls.zig its
+    // curves, with their assembly): importers add nothing.
+    const exported_curves = b.addModule("curves", .{
+        .root_source_file = b.path("src/curves.zig"),
+    });
+    add_curves_assembly(b, exported_curves);
     const exported_tls = b.addModule("tls", .{
         .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
+        .imports = &.{.{ .name = "curves", .module = exported_curves }},
     });
     const exported_dictionary = b.addModule("brotli_dictionary", .{
         .root_source_file = b.path("vendor/brotli/dictionary.zig"),
@@ -85,10 +134,12 @@ pub fn build(b: *std.Build) void {
     });
     // Our context switch, which the port and the simulator share.
     zig_io_evented.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
+    const curves = curves_module(b, target, optimize);
     const tls = b.createModule(.{
         .root_source_file = b.path("vendor/tls.zig/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "curves", .module = curves }},
     });
     const brotli_dictionary = b.createModule(.{
         .root_source_file = b.path("vendor/brotli/dictionary.zig"),
@@ -198,11 +249,32 @@ pub fn build(b: *std.Build) void {
     run_sim.addPassthruArgs();
     b.step("sim", "Run the simulator (-- --seed N, or -- --seeds COUNT)").dependOn(&run_sim.step);
 
+    // Writes src/curves_p256_base.bin, the table curves.zig embeds.
+    const curves_table = b.addExecutable(.{
+        .name = "fourneau-curves-table",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/curves_table.zig"),
+            .target = target,
+            .optimize = .safe,
+            .imports = &.{.{ .name = "curves", .module = curves_module(b, target, .safe) }},
+        }),
+    });
+    const run_curves_table = b.addRunArtifact(curves_table);
+    run_curves_table.setCwd(b.path("."));
+    run_curves_table.has_side_effects = true;
+    b.step(
+        "curves-table",
+        "Write src/curves_p256_base.bin, the P-256 table src/curves.zig embeds",
+    ).dependOn(&run_curves_table.step);
+
+    const run_curves_tests = b.addRunArtifact(curves_tests);
     const run_tests = b.addRunArtifact(tests);
     run_tests.setCwd(b.path(".")); // tidy reads the source trees
     // ...which the build system cannot see: without this, a change to a file
     // no test imports left the test binary as it was, the cached run was
     // reused, and tidy never looked.
     run_tests.has_side_effects = true;
-    b.step("test", "Run the fast tests (-Dfilter=AREA for one area)").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run the fast tests (-Dfilter=AREA for one area)");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_curves_tests.step);
 }
