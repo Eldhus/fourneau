@@ -11,6 +11,51 @@ const Sha512 = crypto.hash.sha2.Sha512;
 
 const HashTag = @import("cipher.zig").CipherSuite.HashTag;
 
+/// fourneau's patch: HKDF-Expand-Label (RFC 8446 §7.1) from an HMAC keyed
+/// once, for a secret that derives several labels: `Hmac.init` hashes the
+/// key's block, a SHA-256 compression each time, and a handshake's key
+/// schedule derives two or three labels from most secrets. Each output fits
+/// one HMAC (`len` at most the hash's length), so Expand is one HMAC of the
+/// label and the counter 1, as std's `Hkdf.expand` computes it and with the
+/// label laid out as std's `hkdfExpandLabel` lays it; the tests check each
+/// against std's.
+pub fn KeyedLabels(comptime Hmac: type) type {
+    return struct {
+        const Self = @This();
+
+        hmac: Hmac,
+
+        pub fn init(secret: [Hmac.mac_length]u8) Self {
+            return .{ .hmac = Hmac.init(&secret) };
+        }
+
+        pub fn expand(
+            keyed: *const Self,
+            label: []const u8,
+            context: []const u8,
+            comptime len: usize,
+        ) [len]u8 {
+            comptime std.debug.assert(len > 0 and len <= Hmac.mac_length);
+            const tls13 = "tls13 ";
+            std.debug.assert(tls13.len + label.len <= 255);
+            std.debug.assert(context.len <= 255);
+            var hmac = keyed.hmac;
+            var head: [3]u8 = undefined;
+            std.mem.writeInt(u16, head[0..2], len, .big);
+            head[2] = @intCast(tls13.len + label.len);
+            hmac.update(&head);
+            hmac.update(tls13);
+            hmac.update(label);
+            hmac.update(&[1]u8{@intCast(context.len)});
+            hmac.update(context);
+            hmac.update(&[1]u8{1});
+            var out: [Hmac.mac_length]u8 = undefined;
+            hmac.final(&out);
+            return out[0..len].*;
+        }
+    };
+}
+
 // Transcript holds hash of all handshake message.
 //
 // Until the server hello is parsed we don't know which hash (sha256, sha384,
@@ -227,6 +272,23 @@ fn TranscriptT(comptime Hash: type) type {
         const Hmac = crypto.auth.hmac.Hmac(Hash);
         const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
         const hash_length = Hash.digest_length; // Hmac.mac_length == Hmac.key_length == Hash.digest_length
+        const Labels = KeyedLabels(Hmac);
+
+        /// fourneau's patch: with no pre-shared key, the secret the
+        /// handshake secret is extracted with is Derive-Secret(
+        /// HKDF-Extract(0, 0), "derived", "") (RFC 8446 §7.1), the same for
+        /// every handshake: computed at compile time, not with eight
+        /// compressions a handshake. With std's own SHA-256, as fourneau's
+        /// asks `cpuid`, which compile time cannot.
+        const derived_without_psk: [hash_length]u8 = derived: {
+            @setEvalBranchQuota(1_000_000);
+            const ComptimeHash = if (Hash == Sha256) crypto.hash.sha2.Sha256 else Hash;
+            const ComptimeHkdf = crypto.kdf.hkdf.Hkdf(crypto.auth.hmac.Hmac(ComptimeHash));
+            const zeroes: [hash_length]u8 = @splat(0);
+            const early_secret = ComptimeHkdf.extract(&[1]u8{0}, &zeroes);
+            const empty_hash = tls.emptyHash(ComptimeHash);
+            break :derived hkdfExpandLabel(ComptimeHkdf, early_secret, "derived", &empty_hash, hash_length);
+        };
 
         hash: Hash,
         handshake_secret: ?[hash_length]u8 = null,
@@ -351,14 +413,18 @@ fn TranscriptT(comptime Hash: type) type {
             const hello_hash = self.hash.peek();
 
             const empty_hash = tls.emptyHash(Hash);
-            const zeroes: [hash_length]u8 = @splat(0);
-            const early_secret = if (self.handshake_secret) |hs| hs else Hkdf.extract(&[1]u8{0}, &zeroes);
-            const hs_derived_secret = hkdfExpandLabel(Hkdf, early_secret, "derived", &empty_hash, hash_length);
+            // fourneau's patch: the constant without a pre-shared key, and
+            // the secret keyed once for its two labels.
+            const hs_derived_secret = if (self.handshake_secret) |early_secret|
+                hkdfExpandLabel(Hkdf, early_secret, "derived", &empty_hash, hash_length)
+            else
+                derived_without_psk;
 
             const secret = Hkdf.extract(&hs_derived_secret, shared_key);
             self.handshake_secret = secret;
-            const client_secret = hkdfExpandLabel(Hkdf, secret, "c hs traffic", &hello_hash, hash_length);
-            const server_secret = hkdfExpandLabel(Hkdf, secret, "s hs traffic", &hello_hash, hash_length);
+            const labels: Labels = .init(secret);
+            const client_secret = labels.expand("c hs traffic", &hello_hash, hash_length);
+            const server_secret = labels.expand("s hs traffic", &hello_hash, hash_length);
 
             self.server_finished_key = hkdfExpandLabel(Hkdf, server_secret, "finished", "", hash_length);
             self.client_finished_key = hkdfExpandLabel(Hkdf, client_secret, "finished", "", hash_length);
@@ -379,8 +445,10 @@ fn TranscriptT(comptime Hash: type) type {
             const ap_derived_secret = hkdfExpandLabel(Hkdf, self.handshake_secret.?, "derived", &empty_hash, hash_length);
             const master_secret = Hkdf.extract(&ap_derived_secret, &zeroes);
 
-            self.buffer[0..hash_length].* = hkdfExpandLabel(Hkdf, master_secret, "c ap traffic", &handshake_hash, hash_length);
-            self.buffer[hash_length .. 2 * hash_length].* = hkdfExpandLabel(Hkdf, master_secret, "s ap traffic", &handshake_hash, hash_length);
+            // fourneau's patch: the master secret keyed once for its two labels.
+            const labels: Labels = .init(master_secret);
+            self.buffer[0..hash_length].* = labels.expand("c ap traffic", &handshake_hash, hash_length);
+            self.buffer[hash_length .. 2 * hash_length].* = labels.expand("s ap traffic", &handshake_hash, hash_length);
             return .{
                 .client = self.buffer[0..hash_length],
                 .server = self.buffer[hash_length .. 2 * hash_length],
@@ -483,4 +551,48 @@ test pskBinder_ {
         &expected_binder,
         &binder,
     );
+}
+
+// fourneau's patch: the compile-time secret is RFC 8448's (§3, "derive
+// secret for handshake \"tls13 derived\"") and, for each hash, what the
+// handshake computed before.
+test "derived secret without a pre-shared key" {
+    const expected = hexToBytes("6f 26 15 a1 08 c7 02 c5 67 8f 54 fc 9d ba b6 97 16 c0 76 18 9c 48 25 0c eb ea c3 57 6c 36 11 ba");
+    try std.testing.expectEqualSlices(u8, &expected, &TranscriptT(Sha256).derived_without_psk);
+    inline for (.{ Sha256, Sha384, Sha512 }) |Hash| {
+        const Hkdf = crypto.kdf.hkdf.Hkdf(crypto.auth.hmac.Hmac(Hash));
+        const zeroes: [Hash.digest_length]u8 = @splat(0);
+        const early_secret = Hkdf.extract(&[1]u8{0}, &zeroes);
+        const empty_hash = tls.emptyHash(Hash);
+        const derived = hkdfExpandLabel(Hkdf, early_secret, "derived", &empty_hash, Hash.digest_length);
+        try std.testing.expectEqualSlices(u8, &derived, &TranscriptT(Hash).derived_without_psk);
+    }
+}
+
+// fourneau's patch: a keyed secret's labels are std's, for every hash, the
+// lengths tls.zig asks (an iv, the AES keys, a whole secret) and labels and
+// contexts that carry the HMAC's input across a block, to the longest.
+test KeyedLabels {
+    const long_label: [255 - 6]u8 = @splat('l');
+    const long_context: [255]u8 = @splat('c');
+    const hash_context: [32]u8 = @splat(0x5a);
+    const hash384_context: [48]u8 = @splat(0xa5);
+    const labels = [_][]const u8{ "key", "iv", "c hs traffic", "finished", &long_label };
+    const contexts = [_][]const u8{ "", &hash_context, &hash384_context, &long_context };
+    inline for (.{ Sha256, Sha384, Sha512 }) |Hash| {
+        const Hmac = crypto.auth.hmac.Hmac(Hash);
+        const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
+        var secret: [Hash.digest_length]u8 = undefined;
+        for (&secret, 0..) |*byte, index| byte.* = @truncate(index *% 7 +% 1);
+        const keyed: KeyedLabels(Hmac) = .init(secret);
+        inline for (.{ 12, 16, 32, Hash.digest_length }) |len| {
+            for (labels) |label| for (contexts) |context| {
+                try std.testing.expectEqualSlices(
+                    u8,
+                    &hkdfExpandLabel(Hkdf, secret, label, context, len),
+                    &keyed.expand(label, context, len),
+                );
+            };
+        }
+    }
 }

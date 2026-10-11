@@ -121,7 +121,12 @@ pub fn build(b: *std.Build) void {
     const test_tls = tls_modules(b, target, test_optimize, false);
     tests.root_module.addImport("tls", test_tls.tls);
     // The curves and SHA-256 are modules of their own (tls.zig imports
-    // them), so their tests are artifacts of their own.
+    // them), so their tests are artifacts of their own; so are tls.zig's,
+    // which check its patch (RFC 8448's key schedule among them).
+    const tls_tests = b.addTest(.{
+        .root_module = test_tls.tls,
+        .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
+    });
     const curves_tests = b.addTest(.{
         .root_module = test_tls.curves,
         .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
@@ -311,6 +316,7 @@ pub fn build(b: *std.Build) void {
 
     const run_curves_tests = b.addRunArtifact(curves_tests);
     const run_sha256_tests = b.addRunArtifact(sha256_tests);
+    const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_tests = b.addRunArtifact(tests);
     run_tests.setCwd(b.path(".")); // tidy reads the source trees
     // ...which the build system cannot see: without this, a change to a file
@@ -321,4 +327,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_curves_tests.step);
     test_step.dependOn(&run_sha256_tests.step);
+    test_step.dependOn(&run_tls_tests.step);
 }

@@ -11,6 +11,7 @@ const Sha384 = crypto.hash.sha2.Sha384;
 const record = @import("record.zig");
 const Record = record.Record;
 const Transcript = @import("transcript.zig").Transcript;
+const KeyedLabels = @import("transcript.zig").KeyedLabels; // fourneau's patch
 const proto = @import("protocol.zig");
 
 // tls 1.2 cbc cipher types
@@ -455,11 +456,15 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             return self;
         }
 
+        // fourneau's patch: each secret keyed once for its key and iv.
         fn keyGenerate(self: *Self) void {
-            self.encrypt_key = hkdfExpandLabel(Hkdf, self.encrypt_secret, "key", "", key_len);
-            self.decrypt_key = hkdfExpandLabel(Hkdf, self.decrypt_secret, "key", "", key_len);
-            self.encrypt_iv = hkdfExpandLabel(Hkdf, self.encrypt_secret, "iv", "", nonce_len);
-            self.decrypt_iv = hkdfExpandLabel(Hkdf, self.decrypt_secret, "iv", "", nonce_len);
+            const Labels = KeyedLabels(Hmac);
+            const encrypt_labels: Labels = .init(self.encrypt_secret);
+            const decrypt_labels: Labels = .init(self.decrypt_secret);
+            self.encrypt_key = encrypt_labels.expand("key", "", key_len);
+            self.decrypt_key = decrypt_labels.expand("key", "", key_len);
+            self.encrypt_iv = encrypt_labels.expand("iv", "", nonce_len);
+            self.decrypt_iv = decrypt_labels.expand("iv", "", nonce_len);
         }
 
         // Key updates touch only their own direction's fields; the other
