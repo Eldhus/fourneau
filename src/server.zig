@@ -15,12 +15,11 @@
 //!   so N connections are N strides through flat arrays, and nothing is
 //!   allocated per request.
 //! - Deadlines are separate arrays of `u32` ticks (connections', and
-//!   HTTP/2 streams'), scanned by one
-//!   timekeeper fiber a tick at a time: the scan touches one cache-friendly
-//!   array, not N connection records; no connection keeps a timer, and no
-//!   request reads the clock (the tick is the time).
-//! - The protocol is the sans-IO parsers of M1, unchanged: a fiber only
-//!   decides when to read more.
+//!   HTTP/2 streams'), scanned by the timekeeper a tick at a time: the
+//!   scan touches flat arrays, not N connection records; no connection
+//!   keeps a timer, and no request reads the clock (the tick is the time).
+//! - The protocols are sans-IO state machines (http1_*, hpack, http2): a
+//!   fiber only decides when to read more.
 //!
 //! A connection's life: accepted into a free slot, requests one after
 //! another (head, the application, the response), then closed and its slot

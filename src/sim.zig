@@ -13,8 +13,8 @@
 //!
 //! Exit codes, so a sweep sorts its failures: 0 passed, 128 liveness,
 //! 129 correctness; a crash is a panic (an assertion), which aborts
-//! (SIGABRT). `--canary` makes
-//! the application answer one request wrongly; the sweep must catch it.
+//! (SIGABRT). `--canary` makes the application answer one request
+//! wrongly; the sweep must catch it.
 
 const std = @import("std");
 const assert = std.debug.assert;
