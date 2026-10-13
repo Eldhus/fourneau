@@ -24,6 +24,7 @@ test {
     _ = @import("fourneau.zig");
     _ = @import("listen.zig");
     _ = @import("load.zig");
+    _ = @import("port_tests.zig");
     _ = @import("prng.zig");
     _ = @import("server.zig");
     _ = @import("sim.zig");

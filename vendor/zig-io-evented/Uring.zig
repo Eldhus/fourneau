@@ -2238,11 +2238,24 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
                 break :r .{ error.NetworkDown, 0 }; // TODO
             },
         },
-        .net_read => |o| .{ .net_read = netReadStream(ev, o) catch |err| switch (err) {
+        // fourneau: the streams' operations, in this function's cancel
+        // region as the others are, never one of their own nested in it:
+        // the inner one, taking a cancel left pending, left the fiber
+        // marked as awaiting the ring, and the outer's end asserts it is
+        // not (src/port_tests.zig).
+        .net_read => |o| .{ .net_read = netReadStream(
+            ev,
+            &maybe_sync.cancel_region,
+            o,
+        ) catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => |e| e,
         } },
-        .net_write => |o| .{ .net_write = netWriteStream(ev, o) catch |err| switch (err) {
+        .net_write => |o| .{ .net_write = netWriteStream(
+            ev,
+            &maybe_sync.cancel_region,
+            o,
+        ) catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => |e| e,
         } },
@@ -6351,7 +6364,11 @@ pub fn sendThenReceive(
     };
 }
 
-fn netReadStream(ev: *Evented, o: Io.Operation.NetRead) (Io.Operation.NetRead.Error || Io.Cancelable)!net.Stream.ReadResult {
+fn netReadStream(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    o: Io.Operation.NetRead,
+) (Io.Operation.NetRead.Error || Io.Cancelable)!net.Stream.ReadResult {
     var iovecs: [stream_iovecs_max]iovec = undefined;
     var count: usize = 0;
     for (o.data) |buffer| {
@@ -6370,8 +6387,6 @@ fn netReadStream(ev: *Evented, o: Io.Operation.NetRead) (Io.Operation.NetRead.Er
         .controllen = 0,
         .flags = 0,
     };
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
     while (true) {
         const thread = try cancel_region.awaitIoUring();
         const sqe = thread.enqueue();
@@ -6400,7 +6415,11 @@ fn netReadStream(ev: *Evented, o: Io.Operation.NetRead) (Io.Operation.NetRead.Er
     }
 }
 
-fn netWriteStream(ev: *Evented, o: Io.Operation.NetWrite) (Io.Operation.NetWrite.Error || Io.Cancelable)!usize {
+fn netWriteStream(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    o: Io.Operation.NetWrite,
+) (Io.Operation.NetWrite.Error || Io.Cancelable)!usize {
     var iovecs: [stream_iovecs_max]iovec_const = undefined;
     var count: usize = 0;
     if (o.header.len > 0) {
@@ -6426,8 +6445,6 @@ fn netWriteStream(ev: *Evented, o: Io.Operation.NetWrite) (Io.Operation.NetWrite
         .controllen = 0,
         .flags = 0,
     };
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
     while (true) {
         const thread = try cancel_region.awaitIoUring();
         const sqe = thread.enqueue();
