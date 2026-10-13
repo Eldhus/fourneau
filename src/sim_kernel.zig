@@ -23,6 +23,10 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const Io = std.Io;
 const Prng = @import("prng.zig").Prng;
+const sim_network = @import("sim_network.zig");
+
+pub const Network = sim_network.Network;
+pub const listener_fd = sim_network.listener_fd;
 
 pub const Options = struct {
     tick_ns: u64,
@@ -30,6 +34,7 @@ pub const Options = struct {
     latency_ticks_max: u32,
     /// Operations in flight at once.
     operations_max: u32,
+    network: sim_network.Options,
     /// The ring's submission queue, at most; the completion queue is twice
     /// it, as the kernel makes it.
     ring_entries_max: u16 = 4096,
@@ -49,16 +54,31 @@ const runs_without_wait_max = 1 << 20;
 var running: ?*Kernel = null;
 
 const Operation = struct {
-    state: enum { free, pending } = .free,
+    /// `linked`: behind another (IOSQE_IO_LINK), started when it succeeds.
+    state: enum { free, pending, linked } = .free,
     opcode: linux.IORING_OP = .NOP,
     flags: u8 = 0,
     user_data: u64 = 0,
     /// What it cancels (ASYNC_CANCEL), or posts (MSG_RING).
     target: u64 = 0,
     message_result: i32 = 0,
+    /// Not before this tick; a socket's operation then waits for its
+    /// socket too.
     due_tick: u64 = 0,
-    /// The result posted when it is due, unless canceled first.
+    /// The result posted when it is done, unless canceled first.
     result: i32 = 0,
+    fd: linux.fd_t = -1,
+    /// The buffer (RECV, SEND), the msghdr (RECVMSG, SENDMSG), or the
+    /// address and its length (ACCEPT, `addr2` in `off`), in the process.
+    addr: u64 = 0,
+    addr2: u64 = 0,
+    len: u32 = 0,
+    /// The MSG_ flags: MSG_WAITALL sends until every byte is sent.
+    message_flags: u32 = 0,
+    /// Bytes moved so far (a send with MSG_WAITALL).
+    moved: u32 = 0,
+    /// The operation linked behind this one.
+    next: ?u32 = null,
 };
 
 pub const Stats = struct {
@@ -85,6 +105,7 @@ pub const Kernel = struct {
     ring_open: bool = false,
     ring_entries: u16 = 0,
     process: Process,
+    network: Network,
     stats: Stats = .{},
 
     pub fn init(gpa: std.mem.Allocator, seed: u64, options: Options) !Kernel {
@@ -101,6 +122,8 @@ pub const Kernel = struct {
         errdefer gpa.free(submissions);
         const completions = try gpa.alloc(linux.io_uring_cqe, 2 * entries_max);
         errdefer gpa.free(completions);
+        var network: Network = try .init(gpa, options.network);
+        errdefer network.deinit(gpa);
         return .{
             .options = options,
             .prng = Prng.init(seed),
@@ -109,11 +132,13 @@ pub const Kernel = struct {
             .submissions = submissions,
             .completions = completions,
             .process = try .map(options.process_stack_bytes),
+            .network = network,
         };
     }
 
     pub fn deinit(kernel: *Kernel, gpa: std.mem.Allocator) void {
         assert(running == null);
+        kernel.network.deinit(gpa);
         kernel.process.unmap();
         gpa.free(kernel.operations);
         gpa.free(kernel.due);
@@ -210,29 +235,48 @@ pub const Kernel = struct {
         return sqe;
     }
 
-    /// The submission queue taken in, in order, as `io_uring_enter` does.
+    /// The submission queue taken in, in order, as `io_uring_enter` does. A
+    /// submission flagged IO_LINK has the next one wait behind it.
     fn take_submissions(kernel: *Kernel) u32 {
         const count = kernel.submissions_count;
-        for (kernel.submissions[0..count]) |*sqe| kernel.submit_one(sqe);
+        var linking: ?u32 = null;
+        for (kernel.submissions[0..count]) |*sqe| {
+            const index = kernel.submit_one(sqe);
+            if (linking) |before| {
+                kernel.operations[before].next = index;
+                kernel.operations[index].state = .linked;
+            }
+            linking = if (sqe.flags & linux.IOSQE_IO_LINK != 0) index else null;
+        }
+        assert(linking == null); // a link's last submission ends it
         kernel.submissions_count = 0;
         kernel.stats.submissions += count;
         return count;
     }
 
-    fn submit_one(kernel: *Kernel, sqe: *const linux.io_uring_sqe) void {
-        const flags_known: u8 = linux.IOSQE_CQE_SKIP_SUCCESS;
+    fn submit_one(kernel: *Kernel, sqe: *const linux.io_uring_sqe) u32 {
+        const flags_known: u8 = linux.IOSQE_CQE_SKIP_SUCCESS | linux.IOSQE_IO_LINK;
         if (sqe.flags & ~flags_known != 0) unsimulated("a submission flag", sqe.flags);
-        const operation = kernel.free_operation();
-        const latency = kernel.prng.int_at_most(u64, 0, kernel.options.latency_ticks_max);
+        const index = kernel.free_operation();
+        const operation = &kernel.operations[index];
         operation.* = .{
             .state = .pending,
             .opcode = sqe.opcode,
             .flags = sqe.flags,
             .user_data = sqe.user_data,
-            .due_tick = kernel.tick + latency,
+            .due_tick = kernel.tick + kernel.latency(),
+            .fd = sqe.fd,
+            .addr = sqe.addr,
+            .len = sqe.len,
         };
         switch (sqe.opcode) {
-            .NOP => {},
+            .NOP, .CLOSE => {},
+            .RECV, .SEND, .RECVMSG, .SENDMSG => {
+                const known: u32 = linux.MSG.NOSIGNAL | linux.MSG.WAITALL;
+                if (sqe.rw_flags & ~known != 0) unsimulated("a MSG_ flag", sqe.rw_flags);
+                operation.message_flags = sqe.rw_flags;
+            },
+            .ACCEPT => operation.addr2 = sqe.off,
             .TIMEOUT => kernel.submit_timeout(operation, sqe),
             .ASYNC_CANCEL => {
                 assert(sqe.rw_flags == 0); // by user_data, the first match
@@ -246,6 +290,11 @@ pub const Kernel = struct {
             },
             else => unsimulated("an opcode", @backingInt(sqe.opcode)),
         }
+        return index;
+    }
+
+    fn latency(kernel: *Kernel) u64 {
+        return kernel.prng.int_at_most(u64, 0, kernel.options.latency_ticks_max);
     }
 
     /// A timer: its count (`off`) is 0, so it ends only by time: -ETIME.
@@ -268,14 +317,14 @@ pub const Kernel = struct {
         // Its tick: the first at or after the time asked, then the latency.
         const tick_ns = kernel.options.tick_ns;
         const until_tick = until_ns / tick_ns + @intFromBool(until_ns % tick_ns != 0);
-        const latency = operation.due_tick - kernel.tick;
-        operation.due_tick = @max(kernel.tick, until_tick) +| latency;
+        const late = operation.due_tick - kernel.tick;
+        operation.due_tick = @max(kernel.tick, until_tick) +| late;
         operation.result = -@as(i32, @backingInt(linux.E.TIME));
     }
 
-    fn free_operation(kernel: *Kernel) *Operation {
-        for (kernel.operations) |*operation| {
-            if (operation.state == .free) return operation;
+    fn free_operation(kernel: *Kernel) u32 {
+        for (kernel.operations, 0..) |*operation, index| {
+            if (operation.state == .free) return @intCast(index);
         }
         @panic("sim_kernel: operations_max in flight");
     }
@@ -301,53 +350,146 @@ pub const Kernel = struct {
         for (kernel.due[0..count]) |index| {
             const operation = &kernel.operations[index];
             if (operation.state != .pending) continue; // canceled by one before it
-            if (kernel.completions_count + 2 > kernel.completions.len) break; // full: later
-            kernel.complete(operation);
-            completed += 1;
+            // Room for what it posts: itself, a canceled or messaged one, and
+            // what a failure cancels behind it.
+            if (kernel.completions_count + 3 > kernel.completions.len) break; // full: later
+            if (kernel.complete(index)) completed += 1;
         }
         return completed;
     }
 
-    /// What the operation does when it is due, then its completion.
-    fn complete(kernel: *Kernel, operation: *Operation) void {
+    /// What the operation does when it is due. False: its socket cannot
+    /// proceed yet, and it stays pending.
+    fn complete(kernel: *Kernel, index: u32) bool {
+        const operation = &kernel.operations[index];
         assert(operation.state == .pending);
         switch (operation.opcode) {
-            // The first pending operation with that `user_data` ends at once,
+            // The first operation with that `user_data` ends at once,
             // -ECANCELED. None: -ENOENT (it completed already, or never was).
             .ASYNC_CANCEL => if (kernel.find(operation.target)) |victim| {
-                victim.result = -@as(i32, @backingInt(linux.E.CANCELED));
+                kernel.unlink(victim);
+                kernel.operations[victim].state = .pending;
+                kernel.operations[victim].result = errno(.CANCELED);
                 kernel.finish(victim);
                 kernel.stats.canceled += 1;
                 operation.result = 0;
             } else {
-                operation.result = -@as(i32, @backingInt(linux.E.NOENT));
+                operation.result = errno(.NOENT);
             },
             .MSG_RING => kernel.post(operation.target, operation.message_result, 0),
+            .ACCEPT, .RECV, .SEND, .RECVMSG, .SENDMSG, .CLOSE => {
+                operation.result = kernel.attempt(operation) orelse return false;
+            },
             else => {},
         }
-        kernel.finish(operation);
+        kernel.finish(index);
+        return true;
     }
 
-    fn find(kernel: *Kernel, user_data: u64) ?*Operation {
-        for (kernel.operations) |*operation| {
-            if (operation.state != .pending or operation.user_data != user_data) continue;
+    /// A socket's operation, tried now: its result, or null when its socket
+    /// cannot proceed yet.
+    fn attempt(kernel: *Kernel, operation: *Operation) ?i32 {
+        const network = &kernel.network;
+        switch (operation.opcode) {
+            .CLOSE => return if (network.close(operation.fd)) 0 else errno(.BADF),
+            .ACCEPT => return kernel.attempt_accept(operation),
+            .RECV, .RECVMSG => {
+                const index = network.connection_of(operation.fd) orelse return errno(.BADF);
+                const buffer = receive_buffer(operation);
+                assert(buffer.len > 0);
+                return switch (network.receive(index, buffer, &kernel.prng)) {
+                    .bytes => |count| @intCast(count),
+                    .end => 0,
+                    .reset => errno(.CONNRESET),
+                    .would_block => null,
+                };
+            },
+            .SEND, .SENDMSG => return kernel.attempt_send(operation),
+            else => unreachable,
+        }
+    }
+
+    fn attempt_accept(kernel: *Kernel, operation: *Operation) ?i32 {
+        const network = &kernel.network;
+        if (operation.fd != listener_fd) return errno(.NOTSOCK);
+        if (network.listener_closed) return errno(.INVAL);
+        const fd = network.accept() orelse return null;
+        if (operation.addr != 0) {
+            const address: *linux.sockaddr.in = @ptrFromInt(operation.addr);
+            const length: *linux.socklen_t = @ptrFromInt(operation.addr2);
+            assert(length.* >= @sizeOf(linux.sockaddr.in));
+            address.* = .{
+                .port = std.mem.nativeToBig(u16, 1),
+                .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+            };
+            length.* = @sizeOf(linux.sockaddr.in);
+        }
+        return fd;
+    }
+
+    /// Some bytes sent; with MSG_WAITALL it stays pending until all are.
+    fn attempt_send(kernel: *Kernel, operation: *Operation) ?i32 {
+        const network = &kernel.network;
+        const index = network.connection_of(operation.fd) orelse return errno(.BADF);
+        var parts_buffer: [iovecs_max][]const u8 = undefined;
+        const total = send_parts(operation, &parts_buffer);
+        const parts = parts_buffer[0..total.count];
+        switch (network.send(index, parts, &kernel.prng)) {
+            .broken => return errno(.PIPE),
+            .would_block => return null,
+            .bytes => |count| {
+                operation.moved += count;
+                const all = operation.message_flags & linux.MSG.WAITALL != 0;
+                if (all and operation.moved < total.bytes) return null;
+                return @intCast(operation.moved);
+            },
+        }
+    }
+
+    /// An operation not yet complete, pending or linked, by `user_data`.
+    fn find(kernel: *const Kernel, user_data: u64) ?u32 {
+        for (kernel.operations, 0..) |*operation, index| {
+            if (operation.state == .free or operation.user_data != user_data) continue;
             if (operation.opcode == .ASYNC_CANCEL) continue;
-            return operation;
+            return @intCast(index);
         }
         return null;
     }
 
-    /// Freed, and its completion posted unless the process asked not to
-    /// see a success.
-    fn finish(kernel: *Kernel, operation: *Operation) void {
-        assert(operation.state == .pending);
-        operation.state = .free;
-        const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
-        if (skip and operation.result >= 0) {
-            kernel.stats.skipped += 1;
-            return;
+    /// A linked operation canceled before it started: the one before it
+    /// no longer starts it.
+    fn unlink(kernel: *Kernel, index: u32) void {
+        if (kernel.operations[index].state != .linked) return;
+        for (kernel.operations) |*operation| {
+            if (operation.state != .free and operation.next == index) operation.next = null;
         }
-        kernel.post(operation.user_data, operation.result, 0);
+    }
+
+    /// Freed, and its completion posted unless the process asked not to
+    /// see a success. What is linked behind it starts if it succeeded,
+    /// and is canceled if it did not.
+    fn finish(kernel: *Kernel, index: u32) void {
+        var current: ?u32 = index;
+        // Bounded: a chain is at most every operation.
+        for (0..kernel.operations.len + 1) |_| {
+            const operation = &kernel.operations[current orelse return];
+            assert(operation.state == .pending);
+            operation.state = .free;
+            const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
+            if (skip and operation.result >= 0) {
+                kernel.stats.skipped += 1;
+            } else {
+                kernel.post(operation.user_data, operation.result, 0);
+            }
+            current = operation.next;
+            const next = operation.next orelse return;
+            const behind = &kernel.operations[next];
+            assert(behind.state == .linked);
+            behind.state = .pending;
+            behind.due_tick = kernel.tick + kernel.latency();
+            if (operation.result >= 0) return; // it starts, in its own time
+            behind.result = errno(.CANCELED); // and ends with this one
+        } else unreachable;
     }
 
     fn post(kernel: *Kernel, user_data: u64, result: i32, flags: u32) void {
@@ -389,6 +531,72 @@ pub const Kernel = struct {
 
 fn unsimulated(comptime what: []const u8, value: u64) noreturn {
     std.debug.panic("sim_kernel: " ++ what ++ " not simulated: {d}", .{value});
+}
+
+/// A completion's result for an error: the negated errno, as the kernel
+/// posts it.
+fn errno(err: linux.E) i32 {
+    return -@as(i32, @backingInt(err));
+}
+
+/// The most iovecs a message may have (the port's `stream_iovecs_max`).
+const iovecs_max = 16;
+
+/// Where a receive puts its bytes, in the process: its buffer, or its
+/// message's first non-empty iovec (a short read is a read).
+fn receive_buffer(operation: *const Operation) []u8 {
+    if (operation.opcode == .RECV) {
+        const buffer: [*]u8 = @ptrFromInt(operation.addr);
+        return buffer[0..operation.len];
+    }
+    const message: *const linux.msghdr = @ptrFromInt(operation.addr);
+    assert(message.iovlen <= iovecs_max);
+    for (message.iov[0..message.iovlen]) |iovec| {
+        if (iovec.len > 0) return iovec.base[0..iovec.len];
+    }
+    unreachable; // the port never receives into nothing
+}
+
+/// What a send has left to send, as slices of the process's memory past
+/// the bytes it has moved, and how many bytes it had in all.
+fn send_parts(
+    operation: *const Operation,
+    out: *[iovecs_max][]const u8,
+) struct { count: u32, bytes: u32 } {
+    var whole: [iovecs_max][]const u8 = undefined;
+    var whole_count: u32 = 0;
+    if (operation.opcode == .SEND) {
+        const buffer: [*]const u8 = @ptrFromInt(operation.addr);
+        whole[0] = buffer[0..operation.len];
+        whole_count = 1;
+    } else {
+        const message: *const linux.msghdr_const = @ptrFromInt(operation.addr);
+        assert(message.iovlen <= iovecs_max);
+        for (message.iov[0..message.iovlen]) |iovec| {
+            whole[whole_count] = iovec.base[0..iovec.len];
+            whole_count += 1;
+        }
+    }
+    var bytes: u32 = 0;
+    var skip = operation.moved;
+    var count: u32 = 0;
+    for (whole[0..whole_count]) |part| {
+        bytes += @intCast(part.len);
+        const skipped = @min(skip, part.len);
+        skip -= @intCast(skipped);
+        if (part.len - skipped == 0) continue;
+        out[count] = part[skipped..];
+        count += 1;
+    }
+    assert(skip == 0);
+    return .{ .count = count, .bytes = bytes };
+}
+
+/// The timekeeper's way to end a socket's wait (src/kernel.zig).
+pub fn shutdown(fd: linux.fd_t, how: i32) usize {
+    const kernel = running.?;
+    if (kernel.network.shutdown(fd, how)) return 0;
+    return @bitCast(@as(isize, errno(.BADF)));
 }
 
 /// The ring, as the port holds it: `std.os.linux.IoUring`'s declarations
@@ -526,6 +734,8 @@ const test_options: Options = .{
     .tick_ns = std.time.ns_per_ms,
     .latency_ticks_max = 3,
     .operations_max = 64,
+    // A window of a few bytes: every read and write is cut short somewhere.
+    .network = .{ .connections_max = 2, .backlog_max = 2, .window_bytes = 5 },
     .process_stack_bytes = 1024 * 1024,
 };
 
@@ -654,5 +864,202 @@ test "sim_kernel: a cancel cuts a sleep short, and the next wait takes it" {
         try testing.expectError(error.Canceled, cut.second);
         try testing.expect(cut.first_ended_ns < std.time.ns_per_s);
         try testing.expect(kernel.stats.canceled >= 1);
+    }
+}
+
+// --- tests: sockets -----------------------------------------------------
+
+fn accept_one(io: Io) !Io.net.Stream {
+    var listener: Io.net.Server = .{
+        .socket = .{
+            .handle = listener_fd,
+            .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
+        },
+        .options = {},
+    };
+    return listener.accept(io);
+}
+
+fn read_some(io: Io, socket: linux.fd_t, buffer: []u8) !usize {
+    var parts = [_][]u8{buffer};
+    const result = try io.operate(.{ .net_read = .{ .socket_handle = socket, .data = &parts } });
+    return (try result.net_read).data_len;
+}
+
+fn write_some(io: Io, socket: linux.fd_t, bytes: []const u8) !usize {
+    const result = try io.operate(.{ .net_write = .{
+        .socket_handle = socket,
+        .data = &.{bytes},
+    } });
+    return result.net_write;
+}
+
+/// A client in the test's own loop: it connects, sends `request`, and
+/// keeps what comes back; it closes once it has `expected_bytes`.
+const TestClient = struct {
+    request: []const u8,
+    expected_bytes: u32,
+    connection: ?u32 = null,
+    sent: u32 = 0,
+    received: [64]u8 = undefined,
+    received_count: u32 = 0,
+    closed: bool = false,
+
+    fn step(client: *TestClient, network: *Network) void {
+        if (client.closed) return;
+        const connection = client.connection orelse {
+            client.connection = network.client_connect();
+            return;
+        };
+        if (client.sent < client.request.len) {
+            client.sent += network.client_send(connection, client.request[client.sent..]);
+        }
+        const room = client.received[client.received_count..];
+        client.received_count += network.client_receive(connection, room);
+        if (client.received_count >= client.expected_bytes) {
+            network.client_close(connection);
+            client.closed = true;
+        }
+    }
+};
+
+/// Steps the client and the kernel until the process exits.
+fn run_with_client(kernel: *Kernel, client: *TestClient, ticks_max: u64) !void {
+    for (0..ticks_max) |_| {
+        if (kernel.exited()) return;
+        client.step(&kernel.network);
+        kernel.step();
+    }
+    return error.TestProcessNeverExited;
+}
+
+const Echo = struct { echoed: u32 = 0 };
+
+fn echo_main(echo: *Echo) void {
+    echo_run(echo) catch |err| std.debug.panic("echo: {t}", .{err});
+}
+
+/// Echoes what one client sends until it closes.
+fn echo_run(echo: *Echo) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 1);
+    defer runtime.deinit();
+    const io = runtime.io();
+    const stream = try accept_one(io);
+    defer stream.close(io);
+    const socket = stream.socket.handle;
+    var buffer: [7]u8 = undefined;
+    for (0..1000) |_| {
+        const got = try read_some(io, socket, &buffer);
+        if (got == 0) return; // the client closed
+        var sent: usize = 0;
+        for (0..got) |_| {
+            if (sent == got) break;
+            sent += try write_some(io, socket, buffer[sent..got]);
+        }
+        assert(sent == got);
+        echo.echoed += @intCast(got);
+    }
+    return error.TestTooManyReads;
+}
+
+test "sim_kernel: a connection accepted, read and written through a small window" {
+    const request = "the quick brown fox jumps over the lazy dog";
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        _ = kernel.network.listen();
+        var echo: Echo = .{};
+        var client: TestClient = .{ .request = request, .expected_bytes = request.len };
+        kernel.start(echo_main, &echo);
+        try run_with_client(&kernel, &client, 10_000);
+        try testing.expectEqual(request.len, echo.echoed);
+        try testing.expectEqualStrings(request, client.received[0..client.received_count]);
+    }
+}
+
+const Linked = struct { got: [4]u8 = @splat(0), count: usize = 0 };
+
+fn linked_main(linked: *Linked) void {
+    linked_run(linked) catch |err| std.debug.panic("linked: {t}", .{err});
+}
+
+/// The server's turn as one submission: all of a response sent, then the
+/// next request read (`sendThenReceive`: SEND with MSG_WAITALL, linked).
+fn linked_run(linked: *Linked) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 1);
+    defer runtime.deinit();
+    const io = runtime.io();
+    const stream = try accept_one(io);
+    defer stream.close(io);
+    const reply = "a response longer than the window";
+    linked.count = try Evented.sendThenReceive(io, stream.socket.handle, reply, &linked.got);
+}
+
+test "sim_kernel: a send with MSG_WAITALL, then the receive linked behind it" {
+    const reply = "a response longer than the window";
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        _ = kernel.network.listen();
+        var linked: Linked = .{};
+        // It answers only once the whole response is in, so the receive
+        // returns only what was sent after the send completed. It never
+        // has all it expects, so it never closes.
+        var client: TestClient = .{ .request = "", .expected_bytes = 64 };
+        kernel.start(linked_main, &linked);
+        for (0..10_000) |_| {
+            if (kernel.exited()) break;
+            if (client.received_count == reply.len and client.sent == 0) {
+                client.sent = kernel.network.client_send(client.connection.?, "next");
+                assert(client.sent == 4);
+            }
+            client.step(&kernel.network);
+            kernel.step();
+        } else return error.TestProcessNeverExited;
+        try testing.expectEqualStrings(reply, client.received[0..client.received_count]);
+        try testing.expect(linked.count > 0);
+        try testing.expectEqualStrings("next"[0..linked.count], linked.got[0..linked.count]);
+    }
+}
+
+const Dropped = struct { written: Io.Cancelable!usize = 0 };
+
+fn dropped_main(dropped: *Dropped) void {
+    dropped_run(dropped) catch |err| std.debug.panic("dropped: {t}", .{err});
+}
+
+fn dropped_run(dropped: *Dropped) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 1);
+    defer runtime.deinit();
+    const io = runtime.io();
+    const stream = try accept_one(io);
+    defer stream.close(io);
+    var future = try io.concurrent(sleep_then_write, .{ io, stream.socket.handle });
+    try io.sleep(.fromMilliseconds(5), .awake);
+    dropped.written = future.cancel(io);
+}
+
+fn sleep_then_write(io: Io, socket: linux.fd_t) Io.Cancelable!usize {
+    io.sleep(.fromSeconds(60), .awake) catch {}; // as `Sleep.millis!` does
+    const result = try io.operate(.{ .net_write = .{ .socket_handle = socket, .data = &.{"x"} } });
+    return result.net_write catch unreachable; // the window has room
+}
+
+// Under a seed: the drain's cancel, dropped by a
+// sleep, taken by the stream's next write (port_tests.zig has it on a
+// real ring). Before the fix, the port's write asserted here.
+test "sim_kernel: a stream write takes the cancel its fiber's sleep left" {
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        _ = kernel.network.listen();
+        var dropped: Dropped = .{};
+        var client: TestClient = .{ .request = "", .expected_bytes = 1 };
+        kernel.start(dropped_main, &dropped);
+        try run_with_client(&kernel, &client, 100_000);
+        try testing.expectError(error.Canceled, dropped.written);
     }
 }
