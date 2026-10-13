@@ -1,0 +1,658 @@
+//! A simulated Linux: as much of it as one shard reaches, and nothing
+//! else. Our port of Evented runs on it unchanged (simulator.zig gives it
+//! to the port as its `kernel`), so every line above the system calls runs
+//! under a seed: the port, the server, the application.
+//!
+//! - The process (the port, and all that runs on it) is a coroutine on a
+//!   stack of its own. It runs until it waits on its ring with nothing to
+//!   reap, then switches back to the simulator, whose loop is the world:
+//!   each `step` is a tick, which completes what is due and resumes the
+//!   process when it has something to reap.
+//! - The ring is the ABI's: submissions in, completions out, matched by
+//!   `user_data`, with the flags the port sets. Each operation's latency
+//!   is drawn from the seed, and the completions due in one tick are
+//!   posted in an order drawn from it: the kernel's own nondeterminism
+//!   (what completes when), and nothing else. A cancel lands at its own
+//!   time, so it races its target as the kernel's does.
+//! - The clock is ticks; `clock_gettime` reads them.
+//! - An opcode or flag not simulated panics with its name: nothing in the
+//!   process reaches the real kernel by accident through the ring.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const Io = std.Io;
+const Prng = @import("prng.zig").Prng;
+
+pub const Options = struct {
+    tick_ns: u64,
+    /// The most ticks an operation takes beyond what it waits for.
+    latency_ticks_max: u32,
+    /// Operations in flight at once.
+    operations_max: u32,
+    /// The ring's submission queue, at most; the completion queue is twice
+    /// it, as the kernel makes it.
+    ring_entries_max: u16 = 4096,
+    process_stack_bytes: u32 = 8 * 1024 * 1024,
+};
+
+/// What the process's `clock_gettime(REALTIME)` starts at: 2026-01-01.
+const realtime_epoch_ns: u64 = 1_767_225_600 * std.time.ns_per_s;
+/// The ring's descriptor, as the process sees it: never a real one.
+const ring_fd: linux.fd_t = 1 << 20;
+const page_bytes = std.heap.page_size_min;
+/// Times the process may run without waiting before it is called stuck.
+const runs_without_wait_max = 1 << 20;
+
+/// The kernel the process is running on: set by `step` while it runs, so
+/// the ring's functions (which the port calls with no context) find it.
+var running: ?*Kernel = null;
+
+const Operation = struct {
+    state: enum { free, pending } = .free,
+    opcode: linux.IORING_OP = .NOP,
+    flags: u8 = 0,
+    user_data: u64 = 0,
+    /// What it cancels (ASYNC_CANCEL), or posts (MSG_RING).
+    target: u64 = 0,
+    message_result: i32 = 0,
+    due_tick: u64 = 0,
+    /// The result posted when it is due, unless canceled first.
+    result: i32 = 0,
+};
+
+pub const Stats = struct {
+    submissions: u64 = 0,
+    completions: u64 = 0,
+    /// Completions the process asked not to see (CQE_SKIP_SUCCESS).
+    skipped: u64 = 0,
+    canceled: u64 = 0,
+    resumes: u64 = 0,
+};
+
+pub const Kernel = struct {
+    options: Options,
+    prng: Prng,
+    tick: u64 = 0,
+    operations: []Operation,
+    /// Indices of the operations due this tick, in the order drawn.
+    due: []u32,
+    submissions: []linux.io_uring_sqe,
+    submissions_count: u32 = 0,
+    completions: []linux.io_uring_cqe,
+    completions_head: u32 = 0,
+    completions_count: u32 = 0,
+    ring_open: bool = false,
+    ring_entries: u16 = 0,
+    process: Process,
+    stats: Stats = .{},
+
+    pub fn init(gpa: std.mem.Allocator, seed: u64, options: Options) !Kernel {
+        assert(options.tick_ns > 0);
+        assert(options.operations_max > 0);
+        assert(options.process_stack_bytes % page_bytes == 0);
+        const entries_max: u32 = options.ring_entries_max;
+        const operations = try gpa.alloc(Operation, options.operations_max);
+        errdefer gpa.free(operations);
+        @memset(operations, .{});
+        const due = try gpa.alloc(u32, options.operations_max);
+        errdefer gpa.free(due);
+        const submissions = try gpa.alloc(linux.io_uring_sqe, entries_max);
+        errdefer gpa.free(submissions);
+        const completions = try gpa.alloc(linux.io_uring_cqe, 2 * entries_max);
+        errdefer gpa.free(completions);
+        return .{
+            .options = options,
+            .prng = Prng.init(seed),
+            .operations = operations,
+            .due = due,
+            .submissions = submissions,
+            .completions = completions,
+            .process = try .map(options.process_stack_bytes),
+        };
+    }
+
+    pub fn deinit(kernel: *Kernel, gpa: std.mem.Allocator) void {
+        assert(running == null);
+        kernel.process.unmap();
+        gpa.free(kernel.operations);
+        gpa.free(kernel.due);
+        gpa.free(kernel.submissions);
+        gpa.free(kernel.completions);
+        kernel.* = undefined;
+    }
+
+    pub fn now_ns(kernel: *const Kernel) u64 {
+        return kernel.tick * kernel.options.tick_ns;
+    }
+
+    /// Start the process: `main(args)`, on its own stack, at the next step.
+    pub fn start(kernel: *Kernel, comptime main: anytype, args: anytype) void {
+        const process = &kernel.process;
+        assert(process.state == .none);
+        const Entry = ProcessEntry(main, @TypeOf(args));
+        // The closure sits at the top of the stack, 16-aligned; the stub
+        // finds it 8 bytes above the stack pointer it starts with.
+        const top = @intFromPtr(process.stack.ptr) + process.stack.len;
+        const address = std.mem.alignBackward(usize, top - @sizeOf(Entry.Closure), 16);
+        const closure: *Entry.Closure = @ptrFromInt(address);
+        closure.* = .{ .kernel = kernel, .args = args };
+        process.context = .{ .rsp = address - 8, .rbp = 0, .rip = @intFromPtr(&Entry.stub) };
+        process.state = .ready;
+    }
+
+    /// From the process, when its main returns: it never runs again.
+    fn exit_process(kernel: *Kernel) noreturn {
+        assert(running == kernel);
+        kernel.process.state = .exited;
+        context_switch(&kernel.process.context, &kernel.process.kernel_context);
+        unreachable; // an exited process is never resumed
+    }
+
+    pub fn exited(kernel: *const Kernel) bool {
+        return kernel.process.state == .exited;
+    }
+
+    /// One tick: complete what is due, in an order drawn from the seed, and
+    /// run the process while it has something to reap. Then the clock moves.
+    pub fn step(kernel: *Kernel) void {
+        assert(running == null);
+        if (kernel.process.state == .ready) kernel.resume_process();
+        // Bounded: each pass completes an operation or ends the tick.
+        for (0..kernel.operations.len + 1) |_| {
+            const completed = kernel.complete_due();
+            if (kernel.process.state == .waiting and kernel.reapable()) {
+                kernel.resume_process();
+            } else if (completed == 0) break;
+        } else unreachable;
+        kernel.tick += 1;
+    }
+
+    fn reapable(kernel: *const Kernel) bool {
+        return kernel.completions_count >= @max(1, kernel.process.wait_completions);
+    }
+
+    fn resume_process(kernel: *Kernel) void {
+        assert(kernel.process.state == .ready or kernel.process.state == .waiting);
+        kernel.process.state = .running;
+        kernel.process.runs_without_wait = 0;
+        kernel.stats.resumes += 1;
+        running = kernel;
+        context_switch(&kernel.process.kernel_context, &kernel.process.context);
+        running = null;
+        assert(kernel.process.state == .waiting or kernel.process.state == .exited);
+    }
+
+    // --- the ring, from the process -------------------------------------
+
+    fn open_ring(kernel: *Kernel, entries: u16, flags: u32) Ring {
+        assert(!kernel.ring_open); // a shard has one ring
+        assert(entries > 0 and entries <= kernel.options.ring_entries_max);
+        assert(std.math.isPowerOfTwo(entries));
+        const known = linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER;
+        if (flags & ~@as(u32, known) != 0) unsimulated("a ring setup flag", flags);
+        kernel.ring_open = true;
+        kernel.ring_entries = entries;
+        return .{ .fd = ring_fd };
+    }
+
+    fn close_ring(kernel: *Kernel) void {
+        assert(kernel.ring_open);
+        kernel.ring_open = false;
+    }
+
+    fn next_submission(kernel: *Kernel) ?*linux.io_uring_sqe {
+        assert(kernel.ring_open);
+        if (kernel.submissions_count == kernel.ring_entries) return null;
+        const sqe = &kernel.submissions[kernel.submissions_count];
+        kernel.submissions_count += 1;
+        sqe.* = std.mem.zeroes(linux.io_uring_sqe);
+        return sqe;
+    }
+
+    /// The submission queue taken in, in order, as `io_uring_enter` does.
+    fn take_submissions(kernel: *Kernel) u32 {
+        const count = kernel.submissions_count;
+        for (kernel.submissions[0..count]) |*sqe| kernel.submit_one(sqe);
+        kernel.submissions_count = 0;
+        kernel.stats.submissions += count;
+        return count;
+    }
+
+    fn submit_one(kernel: *Kernel, sqe: *const linux.io_uring_sqe) void {
+        const flags_known: u8 = linux.IOSQE_CQE_SKIP_SUCCESS;
+        if (sqe.flags & ~flags_known != 0) unsimulated("a submission flag", sqe.flags);
+        const operation = kernel.free_operation();
+        const latency = kernel.prng.int_at_most(u64, 0, kernel.options.latency_ticks_max);
+        operation.* = .{
+            .state = .pending,
+            .opcode = sqe.opcode,
+            .flags = sqe.flags,
+            .user_data = sqe.user_data,
+            .due_tick = kernel.tick + latency,
+        };
+        switch (sqe.opcode) {
+            .NOP => {},
+            .TIMEOUT => kernel.submit_timeout(operation, sqe),
+            .ASYNC_CANCEL => {
+                assert(sqe.rw_flags == 0); // by user_data, the first match
+                operation.target = sqe.addr;
+            },
+            .MSG_RING => {
+                assert(sqe.fd == ring_fd); // to itself: one ring
+                assert(sqe.addr == @backingInt(linux.IORING_MSG_RING_COMMAND.DATA));
+                operation.target = sqe.off;
+                operation.message_result = @bitCast(sqe.len);
+            },
+            else => unsimulated("an opcode", @backingInt(sqe.opcode)),
+        }
+    }
+
+    /// A timer: its count (`off`) is 0, so it ends only by time: -ETIME.
+    fn submit_timeout(kernel: *Kernel, operation: *Operation, sqe: *const linux.io_uring_sqe) void {
+        assert(sqe.off == 0);
+        assert(sqe.len == 1);
+        const known = linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_CLOCK_MASK;
+        if (sqe.rw_flags & ~@as(u32, known) != 0) unsimulated("a timeout flag", sqe.rw_flags);
+        const timespec: *const linux.kernel_timespec = @ptrFromInt(sqe.addr);
+        assert(timespec.sec >= 0 and timespec.nsec >= 0);
+        const ns = std.math.mul(u64, @intCast(timespec.sec), std.time.ns_per_s) catch
+            std.math.maxInt(u64);
+        const given = ns +| @as(u64, @intCast(timespec.nsec));
+        const realtime = sqe.rw_flags & linux.IORING_TIMEOUT_REALTIME != 0;
+        const base: u64 = if (realtime) realtime_epoch_ns else 0;
+        const until_ns = if (sqe.rw_flags & linux.IORING_TIMEOUT_ABS != 0)
+            given -| base
+        else
+            kernel.now_ns() +| given;
+        // Its tick: the first at or after the time asked, then the latency.
+        const tick_ns = kernel.options.tick_ns;
+        const until_tick = until_ns / tick_ns + @intFromBool(until_ns % tick_ns != 0);
+        const latency = operation.due_tick - kernel.tick;
+        operation.due_tick = @max(kernel.tick, until_tick) +| latency;
+        operation.result = -@as(i32, @backingInt(linux.E.TIME));
+    }
+
+    fn free_operation(kernel: *Kernel) *Operation {
+        for (kernel.operations) |*operation| {
+            if (operation.state == .free) return operation;
+        }
+        @panic("sim_kernel: operations_max in flight");
+    }
+
+    // --- completions ----------------------------------------------------
+
+    /// Complete every operation due by now, in an order drawn from the
+    /// seed, while the completion queue has room. Returns how many.
+    fn complete_due(kernel: *Kernel) u32 {
+        var count: u32 = 0;
+        for (kernel.operations, 0..) |*operation, index| {
+            if (operation.state != .pending or operation.due_tick > kernel.tick) continue;
+            kernel.due[count] = @intCast(index);
+            count += 1;
+        }
+        // Fisher-Yates: every order of the due equally likely.
+        var left = count;
+        while (left > 1) : (left -= 1) {
+            const pick = kernel.prng.int_less_than(u32, left);
+            std.mem.swap(u32, &kernel.due[pick], &kernel.due[left - 1]);
+        }
+        var completed: u32 = 0;
+        for (kernel.due[0..count]) |index| {
+            const operation = &kernel.operations[index];
+            if (operation.state != .pending) continue; // canceled by one before it
+            if (kernel.completions_count + 2 > kernel.completions.len) break; // full: later
+            kernel.complete(operation);
+            completed += 1;
+        }
+        return completed;
+    }
+
+    /// What the operation does when it is due, then its completion.
+    fn complete(kernel: *Kernel, operation: *Operation) void {
+        assert(operation.state == .pending);
+        switch (operation.opcode) {
+            // The first pending operation with that `user_data` ends at once,
+            // -ECANCELED. None: -ENOENT (it completed already, or never was).
+            .ASYNC_CANCEL => if (kernel.find(operation.target)) |victim| {
+                victim.result = -@as(i32, @backingInt(linux.E.CANCELED));
+                kernel.finish(victim);
+                kernel.stats.canceled += 1;
+                operation.result = 0;
+            } else {
+                operation.result = -@as(i32, @backingInt(linux.E.NOENT));
+            },
+            .MSG_RING => kernel.post(operation.target, operation.message_result, 0),
+            else => {},
+        }
+        kernel.finish(operation);
+    }
+
+    fn find(kernel: *Kernel, user_data: u64) ?*Operation {
+        for (kernel.operations) |*operation| {
+            if (operation.state != .pending or operation.user_data != user_data) continue;
+            if (operation.opcode == .ASYNC_CANCEL) continue;
+            return operation;
+        }
+        return null;
+    }
+
+    /// Freed, and its completion posted unless the process asked not to
+    /// see a success.
+    fn finish(kernel: *Kernel, operation: *Operation) void {
+        assert(operation.state == .pending);
+        operation.state = .free;
+        const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
+        if (skip and operation.result >= 0) {
+            kernel.stats.skipped += 1;
+            return;
+        }
+        kernel.post(operation.user_data, operation.result, 0);
+    }
+
+    fn post(kernel: *Kernel, user_data: u64, result: i32, flags: u32) void {
+        assert(kernel.completions_count < kernel.completions.len);
+        const capacity: u32 = @intCast(kernel.completions.len);
+        const slot = (kernel.completions_head + kernel.completions_count) % capacity;
+        kernel.completions[slot] = .{ .user_data = user_data, .res = result, .flags = flags };
+        kernel.completions_count += 1;
+        kernel.stats.completions += 1;
+    }
+
+    fn reap(kernel: *Kernel, out: []linux.io_uring_cqe) u32 {
+        const count: u32 = @intCast(@min(out.len, kernel.completions_count));
+        const capacity: u32 = @intCast(kernel.completions.len);
+        for (out[0..count], 0..) |*cqe, offset| {
+            cqe.* = kernel.completions[(kernel.completions_head + offset) % capacity];
+        }
+        kernel.completions_head = (kernel.completions_head + count) % capacity;
+        kernel.completions_count -= count;
+        return count;
+    }
+
+    /// From the process: wait until `count` completions can be reaped.
+    fn wait(kernel: *Kernel, count: u32) void {
+        assert(running == kernel);
+        assert(kernel.process.state == .running);
+        kernel.process.runs_without_wait += 1;
+        if (kernel.process.runs_without_wait > runs_without_wait_max) {
+            @panic("sim_kernel: the process submits without ever waiting");
+        }
+        if (count == 0 or kernel.completions_count >= count) return;
+        kernel.process.state = .waiting;
+        kernel.process.wait_completions = count;
+        context_switch(&kernel.process.context, &kernel.process.kernel_context);
+        assert(kernel.process.state == .running);
+        assert(kernel.completions_count > 0);
+    }
+};
+
+fn unsimulated(comptime what: []const u8, value: u64) noreturn {
+    std.debug.panic("sim_kernel: " ++ what ++ " not simulated: {d}", .{value});
+}
+
+/// The ring, as the port holds it: `std.os.linux.IoUring`'s declarations
+/// that the port uses, on the running kernel.
+pub const Ring = struct {
+    fd: linux.fd_t,
+
+    /// What `io_uring_enter` may fail with, as std's ring says; the
+    /// simulated one never does.
+    pub const EnterError = error{ SignalInterrupt, SystemResources };
+
+    pub fn init(entries: u16, flags: u32) error{SystemResources}!Ring {
+        return running.?.open_ring(entries, flags);
+    }
+
+    /// A worker thread's ring: a shard has none.
+    pub fn init_params(entries: u16, params: *linux.io_uring_params) error{SystemResources}!Ring {
+        _ = entries;
+        _ = params;
+        @panic("sim_kernel: a second ring (a shard is one thread)");
+    }
+
+    pub fn deinit(ring: *Ring) void {
+        assert(ring.fd == ring_fd);
+        running.?.close_ring();
+        ring.* = undefined;
+    }
+
+    pub fn get_sqe(ring: *Ring) error{SubmissionQueueFull}!*linux.io_uring_sqe {
+        assert(ring.fd == ring_fd);
+        return running.?.next_submission() orelse error.SubmissionQueueFull;
+    }
+
+    pub fn submit(ring: *Ring) EnterError!u32 {
+        return ring.submit_and_wait(0);
+    }
+
+    pub fn submit_and_wait(ring: *Ring, wait_count: u32) EnterError!u32 {
+        assert(ring.fd == ring_fd);
+        const kernel = running.?;
+        const submitted = kernel.take_submissions();
+        kernel.wait(wait_count);
+        return submitted;
+    }
+
+    pub fn copy_cqes(ring: *Ring, cqes: []linux.io_uring_cqe, wait_count: u32) EnterError!u32 {
+        assert(ring.fd == ring_fd);
+        assert(cqes.len > 0);
+        const kernel = running.?;
+        kernel.wait(wait_count);
+        return kernel.reap(cqes);
+    }
+};
+
+/// `Io.now`'s clock: the ticks, in nanoseconds; REALTIME from 2026.
+pub fn clock_gettime(clock: linux.clockid_t, timespec: *linux.timespec) usize {
+    const kernel = running.?;
+    const base: u64 = switch (clock) {
+        .REALTIME, .REALTIME_COARSE => realtime_epoch_ns,
+        .MONOTONIC, .MONOTONIC_COARSE, .MONOTONIC_RAW, .BOOTTIME => 0,
+        else => unsimulated("a clock", @backingInt(clock)),
+    };
+    const ns = base + kernel.now_ns();
+    timespec.* = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    return 0;
+}
+
+/// The process: a coroutine on a stack of its own, a guard page below it.
+const Process = struct {
+    state: enum { none, ready, running, waiting, exited } = .none,
+    mapping: []align(page_bytes) u8,
+    stack: []u8,
+    context: Io.fiber.Context = undefined,
+    /// Where the kernel's loop waits while the process runs.
+    kernel_context: Io.fiber.Context = undefined,
+    wait_completions: u32 = 0,
+    runs_without_wait: u32 = 0,
+
+    fn map(stack_bytes: u32) !Process {
+        const bytes = stack_bytes + page_bytes;
+        const prot: linux.PROT = .{ .READ = true, .WRITE = true };
+        const flags: linux.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true };
+        const address = linux.mmap(null, bytes, prot, flags, -1, 0);
+        if (linux.errno(address) != .SUCCESS) return error.OutOfMemory;
+        const mapping: [*]align(page_bytes) u8 = @ptrFromInt(address);
+        const guarded = linux.mprotect(mapping, page_bytes, .{});
+        assert(linux.errno(guarded) == .SUCCESS);
+        return .{ .mapping = mapping[0..bytes], .stack = mapping[page_bytes..bytes] };
+    }
+
+    fn unmap(process: *Process) void {
+        _ = linux.munmap(process.mapping.ptr, process.mapping.len);
+    }
+};
+
+/// The process's first frame, for one `main`: chosen at comptime, so the
+/// kernel holds no function pointer.
+fn ProcessEntry(comptime main: anytype, comptime Args: type) type {
+    return struct {
+        const Closure = struct { kernel: *Kernel, args: Args };
+
+        fn stub() callconv(.naked) void {
+            asm volatile (
+                \\ leaq 8(%%rsp), %%rdi
+                \\ jmp %[call:P]
+                :
+                : [call] "X" (&call),
+            );
+        }
+
+        fn call(closure: *Closure) callconv(.withStackAlign(.c, @alignOf(Closure))) noreturn {
+            main(closure.args);
+            closure.kernel.exit_process();
+        }
+    };
+}
+
+/// context_switch_x86_64.S, shared with the port.
+extern fn fourneau_context_switch(s: *const Io.fiber.Switch) callconv(.c) *const Io.fiber.Switch;
+
+fn context_switch(old: *Io.fiber.Context, new: *const Io.fiber.Context) void {
+    const message: Io.fiber.Switch = .{ .old = old, .new = @constCast(new) };
+    _ = fourneau_context_switch(&message);
+}
+
+// --- tests: the real port, on the simulated kernel ---------------------
+
+const Evented = @import("zig_io_evented");
+const testing = std.testing;
+
+const test_options: Options = .{
+    .tick_ns = std.time.ns_per_ms,
+    .latency_ticks_max = 3,
+    .operations_max = 64,
+    .process_stack_bytes = 1024 * 1024,
+};
+
+/// Run the process to its exit: every test's own loop, bounded.
+fn run_to_exit(kernel: *Kernel, ticks_max: u64) !void {
+    for (0..ticks_max) |_| {
+        if (kernel.exited()) return;
+        kernel.step();
+    }
+    return error.TestProcessNeverExited;
+}
+
+fn process_init(runtime: *Evented, fibers_max: u32) !void {
+    try runtime.init(testing.allocator, .{ .thread_limit = 0, .fibers_max = fibers_max });
+}
+
+const Sleeps = struct {
+    durations_ms: [3]u32 = .{ 30, 10, 20 },
+    woke_ns: [3]u64 = @splat(0),
+    order: [3]u32 = @splat(0),
+    woken: u32 = 0,
+};
+
+fn sleeps_main(sleeps: *Sleeps) void {
+    sleeps_run(sleeps) catch |err| std.debug.panic("sleeps: {t}", .{err});
+}
+
+fn sleeps_run(sleeps: *Sleeps) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 3);
+    defer runtime.deinit();
+    const io = runtime.io();
+    var group: Io.Group = .init;
+    for (0..sleeps.durations_ms.len) |index| {
+        try group.concurrent(io, sleep_one, .{ io, sleeps, @as(u32, @intCast(index)) });
+    }
+    try group.await(io);
+}
+
+fn sleep_one(io: Io, sleeps: *Sleeps, index: u32) Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(sleeps.durations_ms[index]), .awake);
+    sleeps.woke_ns[index] = @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
+    sleeps.order[sleeps.woken] = index;
+    sleeps.woken += 1;
+}
+
+test "sim_kernel: the port's fibers sleep on simulated time, in order" {
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        var sleeps: Sleeps = .{};
+        kernel.start(sleeps_main, &sleeps);
+        try run_to_exit(&kernel, 1000);
+        try testing.expectEqual(3, sleeps.woken);
+        try testing.expectEqual([3]u32{ 1, 2, 0 }, sleeps.order);
+        for (sleeps.durations_ms, sleeps.woke_ns) |ms, ns| {
+            // Never early; late by at most the latencies on the way.
+            const latest_ms = ms + 4 * (test_options.latency_ticks_max + 1);
+            try testing.expect(ns >= ms * std.time.ns_per_ms);
+            try testing.expect(ns <= latest_ms * std.time.ns_per_ms);
+        }
+    }
+}
+
+test "sim_kernel: a seed replays exactly; seeds differ" {
+    var ticks: [2]u64 = undefined;
+    var stats: [2]Stats = undefined;
+    for (0..2) |run| {
+        var kernel = try Kernel.init(testing.allocator, 7, test_options);
+        defer kernel.deinit(testing.allocator);
+        var sleeps: Sleeps = .{};
+        kernel.start(sleeps_main, &sleeps);
+        try run_to_exit(&kernel, 1000);
+        ticks[run] = kernel.tick;
+        stats[run] = kernel.stats;
+    }
+    try testing.expectEqual(ticks[0], ticks[1]);
+    try testing.expectEqual(stats[0], stats[1]);
+    // The latencies are drawn: some seed ends on another tick.
+    const different = for (8..40) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        var sleeps: Sleeps = .{};
+        kernel.start(sleeps_main, &sleeps);
+        try run_to_exit(&kernel, 1000);
+        if (kernel.tick != ticks[0]) break true;
+    } else false;
+    try testing.expect(different);
+}
+
+const Cut = struct {
+    /// The second sleep's verdict, and when the first one ended.
+    second: Io.Cancelable!void = {},
+    first_ended_ns: u64 = 0,
+};
+
+fn cut_main(cut: *Cut) void {
+    cut_run(cut) catch |err| std.debug.panic("cut: {t}", .{err});
+}
+
+fn cut_run(cut: *Cut) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 1);
+    defer runtime.deinit();
+    const io = runtime.io();
+    var future = try io.concurrent(sleep_then_sleep, .{ io, cut });
+    try io.sleep(.fromMilliseconds(5), .awake);
+    future.cancel(io);
+}
+
+fn sleep_then_sleep(io: Io, cut: *Cut) void {
+    io.sleep(.fromSeconds(60), .awake) catch {}; // dropped, as roux's `Sleep.millis!` does
+    cut.first_ended_ns = @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
+    cut.second = io.sleep(.fromSeconds(1), .awake);
+}
+
+// The port's sleep returns when a cancel reaches it, without saying so;
+// the cancel stays pending for the fiber's next wait.
+test "sim_kernel: a cancel cuts a sleep short, and the next wait takes it" {
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        var cut: Cut = .{};
+        kernel.start(cut_main, &cut);
+        try run_to_exit(&kernel, 100_000);
+        try testing.expectError(error.Canceled, cut.second);
+        try testing.expect(cut.first_ended_ns < std.time.ns_per_s);
+        try testing.expect(kernel.stats.canceled >= 1);
+    }
+}

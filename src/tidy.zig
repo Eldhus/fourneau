@@ -22,7 +22,8 @@ pub const Tree = struct {
     /// Files the test root need not import (their tests are an artifact of
     /// their own, or they cannot build in a test).
     untested: []const []const u8,
-    /// Generated files: not ours to format or lint.
+    /// Generated or vendored files: not ours to format or lint. Their
+    /// identifiers still count as uses of the other trees' names.
     generated: []const []const u8,
     /// Files that implement an interface of `std`'s or an ABI (see
     /// `banned`): indirection is their design. Each says why where listed.
@@ -35,18 +36,32 @@ const trees = [_]Tree{
         // curves.zig, sha256.zig: modules of their own (tls.zig imports
         // them), their tests artifacts of their own; curves_table.zig: `zig
         // build curves-table`; sha256_shani.zig: an object of its own target;
-        // kernel.zig: the port's `kernel` module (vendor imports it), no tests.
+        // kernel.zig: the port's `kernel` module (vendor imports it), no tests;
+        // simulator.zig: the simulator's compilation, the port's kernel there,
+        // whose tests (sim_kernel.zig's) are that compilation's.
         .roots = &.{
             "tests.zig",        "curves.zig",       "sha256.zig",
             "curves_table.zig", "sha256_shani.zig", "kernel.zig",
+            "simulator.zig",
         },
         .untested = &.{
             "tests.zig",        "curves.zig",       "sha256.zig",
             "curves_table.zig", "sha256_shani.zig", "kernel.zig",
+            "simulator.zig",    "sim_kernel.zig",
         },
         .generated = &.{},
         // sim_io.zig: a deterministic std.Io, so a vtable of its own.
         .interfaces = &.{"sim_io.zig"},
+    },
+    .{
+        // Our port of Evented: upstream's file, our patches marked in it
+        // (its README), so not linted here; read, because it is what calls
+        // the kernels' declarations (sim_kernel.zig's ring).
+        .dir = "vendor/zig-io-evented",
+        .roots = &.{"Uring.zig"},
+        .untested = &.{"Uring.zig"},
+        .generated = &.{"Uring.zig"},
+        .interfaces = &.{},
     },
 };
 

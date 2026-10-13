@@ -333,4 +333,35 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_curves_tests.step);
     test_step.dependOn(&run_sha256_tests.step);
     test_step.dependOn(&run_tls_tests.step);
+    const simulator_tests = b.addTest(.{
+        .root_module = simulator_module(b, target, test_optimize),
+        .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
+    });
+    test_step.dependOn(&b.addRunArtifact(simulator_tests).step);
+}
+
+/// The simulator's own compilation (src/simulator.zig): the port built
+/// again, its `kernel` the simulator's root, which imports the port back.
+/// A file belongs to one module per compilation, so this port cannot share
+/// a compilation with the suite's, which calls Linux.
+fn simulator_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const root = b.createModule(.{
+        .root_source_file = b.path("src/simulator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const port = b.createModule(.{
+        .root_source_file = b.path("vendor/zig-io-evented/Uring.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "kernel", .module = root }},
+    });
+    root.addImport("zig_io_evented", port);
+    // The context switch the port and the simulated kernel share.
+    root.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
+    return root;
 }
