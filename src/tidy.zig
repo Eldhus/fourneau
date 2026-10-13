@@ -34,14 +34,15 @@ const trees = [_]Tree{
         .dir = "src",
         // curves.zig, sha256.zig: modules of their own (tls.zig imports
         // them), their tests artifacts of their own; curves_table.zig: `zig
-        // build curves-table`; sha256_shani.zig: an object of its own target.
+        // build curves-table`; sha256_shani.zig: an object of its own target;
+        // kernel.zig: the port's `kernel` module (vendor imports it), no tests.
         .roots = &.{
             "tests.zig",        "curves.zig",       "sha256.zig",
-            "curves_table.zig", "sha256_shani.zig",
+            "curves_table.zig", "sha256_shani.zig", "kernel.zig",
         },
         .untested = &.{
             "tests.zig",        "curves.zig",       "sha256.zig",
-            "curves_table.zig", "sha256_shani.zig",
+            "curves_table.zig", "sha256_shani.zig", "kernel.zig",
         },
         .generated = &.{},
         // sim_io.zig: a deterministic std.Io, so a vtable of its own.

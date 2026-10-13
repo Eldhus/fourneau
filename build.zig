@@ -132,11 +132,15 @@ pub fn build(b: *std.Build) void {
         .root_module = test_tls.sha256,
         .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
     });
+    // The kernel the port calls: Linux's, for every build of it but the
+    // simulator's (src/kernel.zig).
+    const kernel = b.createModule(.{ .root_source_file = b.path("src/kernel.zig") });
     // Programs over the port (fourneau-static) have tests too.
     tests.root_module.addImport("zig_io_evented", b.createModule(.{
         .root_source_file = b.path("vendor/zig-io-evented/Uring.zig"),
         .target = target,
         .optimize = test_optimize,
+        .imports = &.{.{ .name = "kernel", .module = kernel }},
     }));
     // Brotli's static dictionary (vendor/brotli: data the format fixes).
     tests.root_module.addImport("brotli_dictionary", b.createModule(.{
@@ -165,6 +169,7 @@ pub fn build(b: *std.Build) void {
     _ = b.addModule("tidy", .{ .root_source_file = b.path("src/tidy.zig") });
     const exported_port = b.addModule("zig_io_evented", .{
         .root_source_file = b.path("vendor/zig-io-evented/Uring.zig"),
+        .imports = &.{.{ .name = "kernel", .module = kernel }},
     });
     exported_port.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
     // ThreadSanitizer for fourneau-hello and the port under it (the port
@@ -180,6 +185,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .imports = &.{.{ .name = "kernel", .module = kernel }},
     });
     // Our context switch, which the port and the simulator share.
     zig_io_evented.addAssemblyFile(b.path("src/context_switch_x86_64.S"));

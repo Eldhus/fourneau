@@ -17,7 +17,10 @@ const fallbackSeed = Io.Threaded.fallbackSeed;
 const fd_t = linux.fd_t;
 const File = Io.File;
 const Io = std.Io;
-const IoUring = linux.IoUring;
+// fourneau: the kernel is an import (src/kernel.zig: Linux's own), so the
+// simulator can give the port a simulated one (src/sim_kernel.zig).
+const kernel = @import("kernel");
+const IoUring = kernel.IoUring;
 const iovec = std.posix.iovec;
 const iovec_const = std.posix.iovec_const;
 const linux = std.os.linux;
@@ -5011,7 +5014,8 @@ fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     var tp: linux.timespec = undefined;
-    switch (linux.errno(linux.clock_gettime(clockToPosix(clock), &tp))) {
+    // fourneau: the kernel's clock, simulated in the simulator.
+    switch (linux.errno(kernel.clock_gettime(clockToPosix(clock), &tp))) {
         .SUCCESS => return timestampFromPosix(&tp),
         else => return .zero,
     }
@@ -5340,7 +5344,8 @@ fn netShutdown(
         .send => linux.SHUT.WR,
         .both => linux.SHUT.RDWR,
     };
-    switch (linux.errno(linux.shutdown(handle, flags))) {
+    // fourneau: the kernel's, simulated in the simulator.
+    switch (linux.errno(kernel.shutdown(handle, flags))) {
         .SUCCESS => return,
         .BADF, .NOTSOCK, .INVAL => |err| return errnoBug(err),
         .NOTCONN => return error.SocketUnconnected,
