@@ -10,29 +10,6 @@ pub fn maybe(ok: bool) void {
     assert(ok or !ok);
 }
 
-/// ASCII lower case of one byte (header names compare case-insensitively).
-pub fn lower(byte: u8) u8 {
-    return if (byte >= 'A' and byte <= 'Z') byte | 0x20 else byte;
-}
-
-/// Case-insensitive equality of ASCII text, as header names compare.
-pub fn equal_ignoring_case(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (lower(x) != lower(y)) return false;
-    }
-    return true;
-}
-
-test "stdx: equal_ignoring_case" {
-    try std.testing.expect(equal_ignoring_case("Content-Length", "content-length"));
-    try std.testing.expect(!equal_ignoring_case("Content-Length", "content-lengt"));
-    try std.testing.expect(!equal_ignoring_case("a", "b"));
-    // Only ASCII letters fold: '@' (0x40) and '`' (0x60) differ by the same bit.
-    try std.testing.expect(!equal_ignoring_case("@", "`"));
-    maybe(equal_ignoring_case("a", "A"));
-}
-
 /// `count` items, their pages untouched until first written. Not
 /// `alloc`: in a safe build it writes `undefined` (0xAA) over all it
 /// gives, and `free` over all it takes back, which made all of a server's

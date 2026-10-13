@@ -946,7 +946,7 @@ pub const Connection = struct {
         }
         if (host) |value| {
             if (pseudo[2] == null) head.authority = value;
-            if (!stdx.equal_ignoring_case(value, head.authority)) return null;
+            if (!std.ascii.eqlIgnoreCase(value, head.authority)) return null;
         }
         if (end_stream) if (head.content_length) |length| if (length != 0) return null;
         head.headers = if (cookies > 1) connection.join_cookies(regular) else regular;
@@ -1078,8 +1078,7 @@ const BlockWriter = struct {
         }
         for (head.headers) |header| {
             var lower: [response_name_bytes_max]u8 = undefined;
-            for (header.name, 0..) |byte, index| lower[index] = stdx.lower(byte);
-            writer.field(lower[0..header.name.len], header.value);
+            writer.field(std.ascii.lowerString(&lower, header.name), header.value);
         }
     }
 

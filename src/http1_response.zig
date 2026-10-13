@@ -9,7 +9,6 @@
 //! caller answers 500 instead, and the application's bug is visible.
 
 const std = @import("std");
-const stdx = @import("stdx.zig");
 const http_date = @import("http_date.zig");
 const Prng = @import("prng.zig").Prng;
 const assert = std.debug.assert;
@@ -199,10 +198,10 @@ pub fn header_refusal(header: Header) ?Refusal {
     }
     // Every reserved name starts with one of these letters: most headers
     // (Content-Type, Cache-Control, ...) skip the comparisons on the second.
-    const first = stdx.lower(header.name[0]);
+    const first = std.ascii.toLower(header.name[0]);
     if (!reserved_first_table[first]) return null;
     for (reserved_names) |name| {
-        if (stdx.equal_ignoring_case(header.name, name)) return .header_reserved;
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return .header_reserved;
     }
     return null;
 }

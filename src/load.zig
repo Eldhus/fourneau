@@ -25,7 +25,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const http1_chunked = @import("http1_chunked.zig");
-const stdx = @import("stdx.zig");
 
 const Options = struct {
     port: u16 = 8080,
@@ -403,8 +402,8 @@ fn is_event_stream_head(head: []const u8) bool {
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (stdx.equal_ignoring_case(line[0..colon], "transfer-encoding")) {
-            chunked = stdx.equal_ignoring_case(value, "chunked");
+        if (std.ascii.eqlIgnoreCase(line[0..colon], "transfer-encoding")) {
+            chunked = std.ascii.eqlIgnoreCase(value, "chunked");
         }
     }
     return chunked;

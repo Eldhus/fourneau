@@ -360,9 +360,7 @@ fn parse_target(method: Method, target: []const u8) TargetResult {
 fn scheme_end(target: []const u8) ?usize {
     const schemes = [_][]const u8{ "http://", "https://" };
     for (schemes) |scheme| {
-        if (target.len >= scheme.len and stdx.equal_ignoring_case(target[0..scheme.len], scheme)) {
-            return scheme.len;
-        }
+        if (std.ascii.startsWithIgnoreCase(target, scheme)) return scheme.len;
     }
     return null;
 }
@@ -398,30 +396,30 @@ fn field_semantics(version: Version, headers: []const Header) SemanticsResult {
     var transfer_encoding_seen = false;
     for (headers) |header| {
         const name = header.name;
-        if (stdx.equal_ignoring_case(name, "host")) {
+        if (std.ascii.eqlIgnoreCase(name, "host")) {
             if (semantics.host_count > 0) return .{ .refusal = .bad_request };
             if (!valid_host(header.value)) return .{ .refusal = .bad_request };
             semantics.host = header.value;
             semantics.host_count += 1;
-        } else if (stdx.equal_ignoring_case(name, "content-length")) {
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             // Duplicates, even equal ones, are refused: a list or a second
             // field is how two parsers come to disagree on a length.
             if (semantics.content_length != null) return .{ .refusal = .bad_request };
             semantics.content_length = parse_length(header.value) orelse
                 return .{ .refusal = .bad_request };
-        } else if (stdx.equal_ignoring_case(name, "transfer-encoding")) {
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
             if (transfer_encoding_seen) return .{ .refusal = .not_implemented };
             transfer_encoding_seen = true;
             // Only `chunked`, alone: any other coding is one we do not
             // implement (RFC 9112 §6.1: 501).
-            if (!stdx.equal_ignoring_case(header.value, "chunked")) {
+            if (!std.ascii.eqlIgnoreCase(header.value, "chunked")) {
                 return .{ .refusal = .not_implemented };
             }
             semantics.chunked = true;
-        } else if (stdx.equal_ignoring_case(name, "connection")) {
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             connection_options(&semantics, header.value);
-        } else if (stdx.equal_ignoring_case(name, "expect")) {
-            if (!stdx.equal_ignoring_case(header.value, "100-continue")) {
+        } else if (std.ascii.eqlIgnoreCase(name, "expect")) {
+            if (!std.ascii.eqlIgnoreCase(header.value, "100-continue")) {
                 return .{ .refusal = .expectation_failed };
             }
             semantics.expect_continue = true;
@@ -436,11 +434,11 @@ fn connection_options(semantics: *Semantics, value: []const u8) void {
     var options = std.mem.splitScalar(u8, value, ',');
     while (options.next()) |option_raw| {
         const option = std.mem.trim(u8, option_raw, " \t");
-        if (stdx.equal_ignoring_case(option, "close")) {
+        if (std.ascii.eqlIgnoreCase(option, "close")) {
             semantics.keep_alive = false;
             return;
         }
-        if (stdx.equal_ignoring_case(option, "keep-alive")) semantics.keep_alive = true;
+        if (std.ascii.eqlIgnoreCase(option, "keep-alive")) semantics.keep_alive = true;
     }
 }
 
