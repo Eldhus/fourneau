@@ -140,7 +140,6 @@ pub const SendError = error{
 };
 
 pub const Counters = struct {
-    requests: u64 = 0,
     /// Streams refused for want of room (REFUSED_STREAM).
     refused: u64 = 0,
     /// Requests malformed (§8.1.1), reset with PROTOCOL_ERROR.
@@ -467,7 +466,6 @@ pub const Connection = struct {
         };
         const index = connection.open(block.id, head);
         connection.bytes_useful += block.block.len;
-        connection.counters.requests += 1;
         return .{ .request = .{ .index = index, .id = block.id, .head = head } };
     }
 

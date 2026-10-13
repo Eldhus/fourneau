@@ -4,8 +4,7 @@
 //!
 //! xoshiro256++ (Blackman and Vigna), seeded through SplitMix64. Integers
 //! only: probabilities are ratios, ranges are exact (rejection sampling,
-//! not a biased modulo), and the bell curve is Irwin-Hall (a sum of twelve
-//! uniforms), so nothing depends on how a platform computes `log` or `cos`.
+//! not a biased modulo), so nothing depends on a platform's floating point.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -85,19 +84,6 @@ pub const Prng = struct {
         assert(r.numerator <= r.denominator);
         return p.int_less_than(u64, r.denominator) < r.numerator;
     }
-
-    /// A bell curve centred on `mean` with standard deviation `sigma`,
-    /// within six sigma: Irwin-Hall, twelve uniforms summed, in integers.
-    pub fn normal(p: *Prng, mean: i64, sigma: i64) i64 {
-        assert(sigma >= 0);
-        const unit: i64 = 1 << 16;
-        var sum: i64 = 0;
-        for (0..12) |_| sum += @intCast(p.int_less_than(u64, unit));
-        // twelve uniforms on [0, 1) have mean 6 and variance 1
-        const z = sum - 6 * unit;
-        assert(@abs(z) <= 6 * unit);
-        return mean + @divFloor(z * sigma, unit);
-    }
 };
 
 fn split_mix(x: *u64) u64 {
@@ -125,7 +111,7 @@ test "prng: a seed's sequence never changes" {
     try testing.expectEqual(@as(u64, 0x53175d61490b23df), got[0]);
 }
 
-test "prng: ranges are exact and inclusive; chance and normal are calibrated" {
+test "prng: ranges are exact and inclusive; chance is calibrated" {
     var p = Prng.init(42);
     var seen: [7]u32 = @splat(0);
     for (0..70_000) |_| {
@@ -138,18 +124,6 @@ test "prng: ranges are exact and inclusive; chance and normal are calibrated" {
     var hits: u32 = 0;
     for (0..100_000) |_| hits += @intFromBool(p.chance(ratio(35, 100)));
     try testing.expect(hits > 34_000 and hits < 36_000);
-    var sum: i64 = 0;
-    var sum_sq: i64 = 0;
-    const n = 20_000;
-    for (0..n) |_| {
-        const x = p.normal(1000, 100);
-        try testing.expect(x >= 400 and x <= 1600);
-        sum += x;
-        sum_sq += (x - 1000) * (x - 1000);
-    }
-    try testing.expect(@abs(@divTrunc(sum, n) - 1000) <= 3);
-    const variance = @divTrunc(sum_sq, n);
-    try testing.expect(variance > 9_000 and variance < 11_000); // sigma about 100
 }
 
 test "prng: boolean is fair" {

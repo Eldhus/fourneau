@@ -10,27 +10,6 @@ pub fn maybe(ok: bool) void {
     assert(ok or !ok);
 }
 
-/// Copy `source` into the start of `target`, which must not overlap it.
-/// `.exact` asserts the lengths are equal; `.inexact` that the target is
-/// at least as long. The call site says which.
-pub fn copy_disjoint(
-    comptime mode: enum { exact, inexact },
-    comptime T: type,
-    target: []T,
-    source: []const T,
-) void {
-    switch (mode) {
-        .exact => assert(target.len == source.len),
-        .inexact => assert(target.len >= source.len),
-    }
-    if (source.len == 0) return;
-    const target_start = @intFromPtr(target.ptr);
-    const source_start = @intFromPtr(source.ptr);
-    const bytes = source.len * @sizeOf(T);
-    assert(target_start + bytes <= source_start or source_start + bytes <= target_start);
-    @memcpy(target[0..source.len], source);
-}
-
 /// ASCII lower case of one byte (header names compare case-insensitively).
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte | 0x20 else byte;
@@ -52,14 +31,6 @@ test "stdx: equal_ignoring_case" {
     // Only ASCII letters fold: '@' (0x40) and '`' (0x60) differ by the same bit.
     try std.testing.expect(!equal_ignoring_case("@", "`"));
     maybe(equal_ignoring_case("a", "A"));
-}
-
-test "stdx: copy_disjoint" {
-    var target: [4]u8 = undefined;
-    copy_disjoint(.exact, u8, &target, "abcd");
-    try std.testing.expectEqualStrings("abcd", &target);
-    copy_disjoint(.inexact, u8, &target, "xy");
-    try std.testing.expectEqualStrings("xycd", &target);
 }
 
 /// `count` items, their pages untouched until first written. Not

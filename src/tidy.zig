@@ -2,8 +2,7 @@
 //!
 //! Every Zig source file of every tree is parsed with `std.zig.Ast`,
 //! so function lengths and declarations come from the real syntax tree,
-//! not from guessing at text. A rule enters with its violations fixed, or
-//! ratcheted: a table of the old offenders that may only shrink.
+//! not from guessing at text. A rule enters with its violations fixed.
 //! (Adapted from TigerBeetle's tidy.)
 
 const std = @import("std");
@@ -20,7 +19,8 @@ pub const Tree = struct {
     dir: []const u8,
     /// Files no other file imports: entry points and the test root.
     roots: []const []const u8,
-    /// Files the test root need not import (they cannot build in a test).
+    /// Files the test root need not import (their tests are an artifact of
+    /// their own, or they cannot build in a test).
     untested: []const []const u8,
     /// Generated files: not ours to format or lint.
     generated: []const []const u8,
@@ -36,12 +36,12 @@ const trees = [_]Tree{
         // them), their tests artifacts of their own; curves_table.zig: `zig
         // build curves-table`; sha256_shani.zig: an object of its own target.
         .roots = &.{
-            "tests.zig",  "hello.zig",        "load.zig",         "curves.zig",
-            "sha256.zig", "curves_table.zig", "sha256_shani.zig",
+            "tests.zig",        "curves.zig",       "sha256.zig",
+            "curves_table.zig", "sha256_shani.zig",
         },
         .untested = &.{
-            "tests.zig",  "hello.zig",        "curves.zig",
-            "sha256.zig", "curves_table.zig", "sha256_shani.zig",
+            "tests.zig",        "curves.zig",       "sha256.zig",
+            "curves_table.zig", "sha256_shani.zig",
         },
         .generated = &.{},
         // sim_io.zig: a deterministic std.Io, so a vtable of its own.
@@ -56,12 +56,6 @@ const function_lines_max = 70;
 const file_bytes_max = 1 << 22;
 /// Files per tree: a bound for the directory walk.
 const files_per_tree_max = 512;
-
-/// Functions over `function_lines_max` lines, with their length when they
-/// were entered. A ratchet (TigerBeetle's): no function may grow past the
-/// limit or past its entry here; one that shrinks lowers its entry, and
-/// leaves the table once it fits.
-const long_functions = [_]struct { file: []const u8, name: []const u8, lines: u32 }{};
 
 /// Text that must not appear in the code, and why. Assembled so that this
 /// file does not match itself.
@@ -226,7 +220,7 @@ fn is_defer(trimmed: []const u8) bool {
         std.mem.startsWith(u8, trimmed, "errdefer ");
 }
 
-/// No function grows past `function_lines_max`, or past its ratchet entry.
+/// No function grows past `function_lines_max`.
 fn check_functions(f: File) u32 {
     var problems: u32 = 0;
     const ast = &f.ast;
@@ -235,23 +229,12 @@ fn check_functions(f: File) u32 {
         if (ast.nodeTag(node) != .fn_decl) continue;
         const first = line_of(ast, ast.firstToken(node));
         const lines: u32 = @intCast(line_of(ast, ast.lastToken(node)) - first + 1);
-        const name = fn_name(ast, node);
         // A function returning a type is a namespace (`ServerType`), not
         // code to fit on a screen: its functions are checked one by one.
         if (returns_type(ast, node)) continue;
-        if (ratchet_entry(f.name, name)) |entry| {
-            if (lines > entry) {
-                problems += problem(f, first, "fn {s} grew to {} lines; the ratchet says {}", .{
-                    name, lines, entry,
-                });
-            } else if (lines < entry) {
-                problems += problem(f, first, "fn {s} shrank to {} lines: lower its entry", .{
-                    name, lines,
-                });
-            }
-        } else if (lines > function_lines_max) {
+        if (lines > function_lines_max) {
             problems += problem(f, first, "fn {s} is {} lines, over {}", .{
-                name, lines, function_lines_max,
+                fn_name(ast, node), lines, function_lines_max,
             });
         }
     }
@@ -270,14 +253,6 @@ fn fn_name(ast: *const Ast, node: Ast.Node.Index) []const u8 {
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = ast.fullFnProto(&buffer, node).?;
     return if (proto.name_token) |t| ast.tokenSlice(t) else "(anonymous)";
-}
-
-fn ratchet_entry(file: []const u8, name: []const u8) ?u32 {
-    for (long_functions) |entry| {
-        const match = std.mem.eql(u8, entry.file, file) and std.mem.eql(u8, entry.name, name);
-        if (match) return entry.lines;
-    }
-    return null;
 }
 
 /// The 1-based line of a token.
