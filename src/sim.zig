@@ -11,8 +11,9 @@
 //! in an order drawn from the seed. The server's invariants are checked
 //! between ticks; the clients check every response against the model.
 //!
-//! Exit codes, so a sweep sorts its failures: 0 passed, 127 crash (a
-//! panic: an assertion), 128 liveness, 129 correctness. `--canary` makes
+//! Exit codes, so a sweep sorts its failures: 0 passed, 128 liveness,
+//! 129 correctness; a crash is a panic (an assertion), which aborts
+//! (SIGABRT). `--canary` makes
 //! the application answer one request wrongly; the sweep must catch it.
 
 const std = @import("std");

@@ -11,10 +11,11 @@
 //!
 //! Data-oriented, after Kelley and Muratori:
 //! - Every byte a connection uses is carved at startup from one allocation
-//!   per kind (receive buffers, header tables, response heads, response
-//!   scratch), so N connections are N strides through flat arrays, and
-//!   nothing is allocated per request.
-//! - Deadlines are a separate array of `u32` ticks, scanned by one
+//!   per kind (receive buffers, header tables, send buffers, scratch),
+//!   so N connections are N strides through flat arrays, and nothing is
+//!   allocated per request.
+//! - Deadlines are separate arrays of `u32` ticks (connections', and
+//!   HTTP/2 streams'), scanned by one
 //!   timekeeper fiber a tick at a time: the scan touches one cache-friendly
 //!   array, not N connection records; no connection keeps a timer, and no
 //!   request reads the clock (the tick is the time).
@@ -123,8 +124,8 @@ pub const Config = struct {
     }
 
     /// The fibers a server runs at once, at most: one per connection slot,
-    /// one per HTTP/2 stream slot, and the timekeeper (accepting runs on
-    /// `run`'s caller). A slot is given back as its fiber's last act, so a
+    /// one per HTTP/2 stream slot, and the acceptor (the timekeeper runs
+    /// on `run`'s caller). A slot is given back as its fiber's last act, so a
     /// new connection or stream never needs a fiber before the last one is
     /// free. An `Io`'s fiber pool is the sum of what runs on it.
     pub fn fibers_max(config: Config) u32 {
@@ -382,7 +383,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         group: Io.Group = .init,
         /// The slabs every connection takes its strides of.
         recv_slab: []align(slab_align) u8 = &.{},
-        heads_slab: []align(slab_align) u8 = &.{},
+        send_slab: []align(slab_align) u8 = &.{},
         scratch_slab: []align(slab_align) u8 = &.{},
         headers_slab: []align(slab_align) Header = &.{},
         stats: Stats = .{},
@@ -984,7 +985,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             );
             server.ticks_max = server.ticks_for(timeout_ms_max);
             const recv = try slab_alloc(gpa, u8, count * config.recv_bytes());
-            const heads = try slab_alloc(gpa, u8, count * config.send_bytes_max);
+            const send = try slab_alloc(gpa, u8, count * config.send_bytes_max);
             const scratch = try slab_alloc(gpa, u8, count * config.scratch_bytes_max);
             const headers = try slab_alloc(gpa, Header, count * config.headers_max);
             for (server.connections, 0..) |*connection, index_usize| {
@@ -992,7 +993,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 connection.* = undefined;
                 connection.open = false;
                 connection.recv = stride(u8, recv, config.recv_bytes(), index);
-                connection.send = stride(u8, heads, config.send_bytes_max, index);
+                connection.send = stride(u8, send, config.send_bytes_max, index);
                 connection.scratch = stride(u8, scratch, config.scratch_bytes_max, index);
                 assert(std.mem.isAligned(@intFromPtr(connection.scratch.ptr), scratch_align));
                 const table = stride(Header, headers, config.headers_max, index);
@@ -1002,7 +1003,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 server.free[index] = count - 1 - index; // slot 0 is used first
             }
             server.recv_slab = recv;
-            server.heads_slab = heads;
+            server.send_slab = send;
             server.scratch_slab = scratch;
             server.headers_slab = headers;
             if (config.http2) |options| try server.init_http2(gpa, options);
@@ -1070,7 +1071,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             gpa.free(server.idle_since);
             gpa.free(server.free);
             slab_free(gpa, u8, server.recv_slab);
-            slab_free(gpa, u8, server.heads_slab);
+            slab_free(gpa, u8, server.send_slab);
             slab_free(gpa, u8, server.scratch_slab);
             slab_free(gpa, Header, server.headers_slab);
             if (server.h2.len > 0) {
