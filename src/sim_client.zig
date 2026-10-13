@@ -7,10 +7,9 @@
 //! application's echo of it.
 //!
 //! The rules for what may happen besides the expected response are few and
-//! written down in `on_end`: a request with a body may be refused 503 when
-//! the server's body buffers are all taken; a slow client may be timed out;
-//! a keep-alive connection that is idle may be closed, and its next request
-//! is then retried on a new connection (as real clients do).
+//! written down in `on_end`: a slow client may be timed out; a keep-alive
+//! connection that is idle may be closed, and its next request is then
+//! retried on a new connection (as real clients do).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -439,8 +438,6 @@ pub const Expectation = struct {
     head: bool,
     /// The server closes after it.
     closes: bool,
-    /// A 503 (and close) is also correct: the body buffers were all taken.
-    may_be_unavailable: bool,
     /// Streamed: `Transfer-Encoding: chunked`, a chunk per non-empty piece.
     chunked: bool,
     chunk_sizes: [stream_pieces_max]u32,
@@ -456,9 +453,6 @@ pub fn expect(spec: *const Spec, out: []u8) Expectation {
         .body = "",
         .head = false,
         .closes = true,
-        // A bad chunk is found only while reading the body, which needs
-        // a body buffer first: without one, 503 comes before the 400.
-        .may_be_unavailable = spec.kind == .bad_chunk_size,
         .chunked = false,
         .chunk_sizes = @splat(0),
         .chunk_count = 0,
@@ -472,7 +466,6 @@ pub fn expect(spec: *const Spec, out: []u8) Expectation {
     expectation.body = result.body;
     expectation.head = spec.method == .HEAD;
     expectation.closes = spec.close;
-    expectation.may_be_unavailable = spec.has_body();
     // An event stream's expectation is its first round.
     const target = stream_target(path) orelse return expectation;
     const aborted = target.kind == .abort;
@@ -647,8 +640,8 @@ pub fn parse_cut_short(bytes: []const u8, decoded: []u8) ?Response {
 
 /// An event stream's first round: a chunked head, then `round` whole
 /// chunks; what follows is more events, not read. It never ends: a last
-/// chunk is malformed. A head that is not chunked is no stream (a 503
-/// refusing the request's body), to be read as an ordinary response.
+/// chunk is malformed. A head that is not chunked is no stream, to be read
+/// as an ordinary response (which the model then judges).
 pub fn parse_events_round(
     bytes: []const u8,
     decoded: []u8,
@@ -874,7 +867,6 @@ pub const Client = struct {
 
     pub const Stats = struct {
         responses: u32 = 0,
-        unavailable: u32 = 0,
         retries: u32 = 0,
         timed_out: u32 = 0,
         reconnects: u32 = 0,
@@ -1102,12 +1094,6 @@ pub const Client = struct {
 
     fn check_against(client: *Client, response: Response, expected: Expectation) void {
         if (!response.has_date) return client.fail(.response_malformed);
-        if (response.status == 503 and expected.may_be_unavailable) {
-            // The body buffers were all taken: allowed, and it must close.
-            if (!response.closes) return client.fail(.response_wrong);
-            client.stats.unavailable += 1;
-            return;
-        }
         if (response.status != expected.status) return client.fail(.response_wrong);
         // A draining server closes after every response: it may say so
         // where it otherwise would not, never the other way round.
