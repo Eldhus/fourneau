@@ -8,9 +8,8 @@
 //!
 //! The challenge is http-01: while an order is validated, a small blocking
 //! responder answers `/.well-known/acme-challenge/<token>` on port 80 and
-//! nothing else. (tls-alpn-01 was planned; http-01 needs no
-//! certificate switch inside the TLS handshake, and port 80 is open
-//! anyway, to redirect browsers.)
+//! nothing else. http-01 needs no certificate switch inside the TLS
+//! handshake, and port 80 is open anyway, to redirect browsers.
 //!
 //! State directory: `account.key` (the account's P-256 secret, 0600),
 //! `cert.pem` (the chain), `key.pem` (the certificate's key, SEC1, 0600),
@@ -36,7 +35,8 @@ pub const Options = struct {
     /// "shortlived"); null for the CA's default.
     profile: ?[]const u8 = null,
     state_dir: []const u8,
-    /// Where the CA connects for http-01: 80, or Pebble's 5002 in tests.
+    /// Where the CA connects for http-01: 80, or Pebble's 5002 when testing
+    /// against Pebble by hand.
     http_port: u16 = 80,
     /// A socket already listening there (systemd's, held across restarts:
     /// listen.zig): the responder accepts on a copy of it, never binds,

@@ -1,4 +1,5 @@
-//! fourneau-hello on fibers, one shard per CPU.
+//! fourneau-hello: HTTP/1.1 and h2c (prior knowledge) on one port, on
+//! fibers, one shard per CPU.
 //!
 //!   fourneau-hello [--port P] [--address A] [--shards N] [--connections N]
 //!                  [--counts on]
@@ -134,7 +135,8 @@ fn run_shards(options: Options, stop: *const std.atomic.Value(bool)) !void {
     for (threads[1..options.shards]) |*thread| {
         thread.* = try std.Thread.spawn(.{}, run_shard, .{ options, stop });
     }
-    std.debug.print("fourneau-hello on http://127.0.0.1:{d} ({d} shards)\n", .{
+    std.debug.print("fourneau-hello on http://{s}:{d} ({d} shards)\n", .{
+        options.address,
         options.port,
         options.shards,
     });
@@ -291,7 +293,7 @@ const DrainClient = struct {
     }
 };
 
-test "a stopped server drains: the request in flight is answered and closed" {
+test "hello: a stopped server drains:the request in flight is answered and closed" {
     const gpa = std.testing.allocator;
     var stop: std.atomic.Value(bool) = .init(false);
     const config: server_module.Config = .{
@@ -493,7 +495,7 @@ const Http2Load = struct {
     }
 };
 
-test "HTTP/2 under load: streams kept in flight, every slot given back" {
+test "hello: HTTP/2 under load:streams kept in flight, every slot given back" {
     const gpa = std.testing.allocator;
     var stop: std.atomic.Value(bool) = .init(false);
     const clients = 4;
@@ -539,7 +541,7 @@ fn stop_after(threads: []std.Thread, stop: *std.atomic.Value(bool)) void {
     stop.store(true, .release);
 }
 
-test "HTTP/2 by prior knowledge: two streams on one connection, then a drain" {
+test "hello: HTTP/2 by prior knowledge:two streams on one connection, then a drain" {
     const gpa = std.testing.allocator;
     var stop: std.atomic.Value(bool) = .init(false);
     const config: server_module.Config = .{
@@ -573,7 +575,7 @@ test "HTTP/2 by prior knowledge: two streams on one connection, then a drain" {
     try std.testing.expectEqual(2, server.stats.http2_streams);
 }
 
-test "the port's fibers: a pool mapped at init, refused beyond it, reused" {
+test "hello: the port's fibers:a pool mapped at init, refused beyond it, reused" {
     const gpa = std.testing.allocator;
     var runtime: Evented = undefined;
     try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = 2 });

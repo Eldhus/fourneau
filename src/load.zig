@@ -5,7 +5,7 @@
 //!                 [--seconds S] [--pipeline K] [--format text|json]
 //!                 [--mode requests|events]
 //!
-//! Built as the server is: each thread owns an io_uring and a fixed array
+//! Built as fourneau-floor is: each thread owns an io_uring and a fixed array
 //! of connections, each a small state machine (send K requests, read K
 //! responses); nothing is allocated while it runs. Responses are parsed
 //! only as far as framing needs (the head's end and Content-Length).

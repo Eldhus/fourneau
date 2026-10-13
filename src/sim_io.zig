@@ -1,6 +1,6 @@
 //! A deterministic `std.Io`: real fibers on one OS thread, scheduled from a
 //! seed, over a simulated network. Code written against `std.Io` (the
-//! evented server, and later Roc handlers) runs here unchanged, and one
+//! server, and any App's handlers) runs here unchanged, and one
 //! seed replays one run exactly: TigerBeetle's simulator, for Zig's `Io`.
 //!
 //! - Fibers are real stacks, switched by `fourneau_context_switch`
@@ -14,8 +14,8 @@
 //!   Which ready fiber runs next is drawn from the PRNG: every interleaving
 //!   the seed picks, and nothing else.
 //! - Time is ticks, advanced by the simulator. `now` and `sleep` use them.
-//! - The network is byte queues, as the first simulator's were: a read returns any
-//!   number of the waiting bytes, a write any number that fits the window,
+//! - The network is byte queues: a read returns any number of the waiting
+//!   bytes, a write any number that fits the window,
 //!   and each blocking operation is held back a random number of ticks.
 //!
 //! The vtable is `Io.failing`'s with the operations we simulate replaced,

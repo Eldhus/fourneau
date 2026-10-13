@@ -1,6 +1,7 @@
 //! Writes `src/curves_p256_base.bin`, the P-256 table `curves.zig` embeds
-//! for `p256_scalarmulbase`: `zig build curves-table`. Its test checks the
-//! file against the table built again, so a stale file fails the suite.
+//! for `p256_scalarmulbase`: `zig build curves-table`. curves.zig's test
+//! checks 20 of its entries (one in each end block) against the points std
+//! computes; in full, `zig build curves-table` must leave `git diff` clean.
 
 const std = @import("std");
 const assert = std.debug.assert;

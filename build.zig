@@ -1,7 +1,4 @@
 //! One build for the repository: fourneau, its tests and tools.
-//!
-//!   zig build test                  every fast test, tidy included
-//!   zig build test -Dfilter=http1   only tests whose name contains "http1"
 
 const std = @import("std");
 
@@ -148,7 +145,7 @@ pub fn build(b: *std.Build) void {
         .optimize = test_optimize,
     }));
     const optimize = b.standardOptimizeOption(.{});
-    // For programs that embed fourneau (fourneau-dragrace's competitors):
+    // For programs that embed fourneau (roux's host, the dragrace's fourneau-zig):
     // the server and our port of Evented, in the importer's mode and target.
     // The server needs tls.zig, so the module carries it (and tls.zig its
     // curves and SHA-256, with their assembly and object): importers add
@@ -208,9 +205,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(hello);
     const run_hello = b.addRunArtifact(hello);
     run_hello.addPassthruArgs();
-    b.step("hello", "Run fourneau-hello (--port P --threads N)").dependOn(&run_hello.step);
+    b.step("hello", "Run fourneau-hello (-- --port P --shards N)").dependOn(&run_hello.step);
 
-    // A directory served from memory: fourneau-dragrace's results site.
+    // fourneau-static: a directory served from memory (site.zig) over
+    // HTTP/1.1, HTTP/2 and HTTPS; an example, h2spec's TLS target, and the
+    // static differential's.
     const static = b.addExecutable(.{
         .name = "fourneau-static",
         .root_module = b.createModule(.{
@@ -267,8 +266,8 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(floor);
 
-    // The hybrid: state-machine I/O, handlers inline or on pooled
-    // fibers.
+    // fourneau-hybrid: the state-machine I/O, handlers inline or
+    // on pooled fibers.
     const hybrid = b.addExecutable(.{
         .name = "fourneau-hybrid",
         .root_module = b.createModule(.{

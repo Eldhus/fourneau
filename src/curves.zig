@@ -14,8 +14,8 @@
 //! asked once (`form`), as aws-lc does: the race builds for a CPU level
 //! without ADX, which every droplet has anyway.
 //!
-//! A module of its own because tls.zig imports it (vendor/tls.zig, the one
-//! patch); its tests run as their own artifact (build.zig).
+//! A module of its own because tls.zig imports it (vendor/tls.zig's patch;
+//! its README lists the places); its tests run as their own artifact (build.zig).
 
 const std = @import("std");
 const builtin = @import("builtin");

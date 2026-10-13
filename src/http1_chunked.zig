@@ -264,9 +264,8 @@ fn decode_in(input: []const u8, piece_bytes: usize, room: usize, body: []u8) Dec
     } else unreachable;
 }
 
-/// Decode every way (whole, every two-piece     for (1..(input.len, 1)) |split| {
-// Two reads, a byte at a time, one
-/// byte of output room at a time) and require the same answer.
+/// Decode every way (whole; a byte of input at a time; a byte of output
+/// room at a time; both; every two-piece split) and require the same answer.
 fn decode_every_way(input: []const u8, body: []u8) Decoded {
     const whole = decode_in(input, input.len, body.len, body);
     var other_body: [128]u8 = undefined;
