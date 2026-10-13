@@ -4,9 +4,10 @@
 //! as plain HTTP, and Linux encrypts and decrypts.
 //!
 //! The handshake borrows the connection's memory: before its first request
-//! the receive buffer and the response scratch are unused, and each is
-//! larger than tls.zig needs (asserted at comptime by the server). Nothing
-//! is allocated per connection.
+//! the scratch is unused, and its two halves are tls.zig's input and output
+//! buffers (the server's `Config.assert_valid` checks the size). The
+//! decrypted early bytes go into the receive buffer. Nothing is allocated
+//! per connection.
 //!
 //! What a client sends right behind its Finished (usually its first
 //! request) may already sit, encrypted, in the handshake's input buffer.

@@ -108,9 +108,10 @@ pub const Config = struct {
         // Every connection's scratch starts aligned (`scratch_align`).
         assert(config.scratch_bytes_max % scratch_align == 0);
         if (config.tls != null) {
-            // The handshake borrows the scratch (both of tls.zig's buffers)
-            // and receives the client's early bytes into `recv`.
-            assert(config.scratch_bytes_max >= tls.input_bytes_min + tls.output_bytes_min);
+            // The handshake borrows the scratch, a half for each of
+            // tls.zig's buffers, and receives the client's early bytes
+            // into `recv`.
+            assert(config.scratch_bytes_max / 2 >= @max(tls.input_bytes_min, tls.output_bytes_min));
         }
         if (config.http2) |options| {
             assert(config.http2_streams() > 0);
