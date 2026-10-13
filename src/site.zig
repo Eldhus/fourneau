@@ -39,7 +39,8 @@ const File = struct {
     brotli: ?Variant = null,
 
     /// The copy this request should have: of the codings it accepts, the
-    /// one it weights highest (RFC 9110 §12.5.3), the smaller on a tie.
+    /// one it weights highest (RFC 9110 §12.5.3); on a tie, a compressed
+    /// copy over identity and brotli over gzip.
     fn variant(file: *const File, headers: []const http1_head.Header) *const Variant {
         const weights = Weights.of(headers);
         var best = &file.identity;
@@ -76,18 +77,10 @@ pub const Site = struct {
     routes: std.StringHashMapUnmanaged(File) = .empty,
     not_found: ?File = null,
 
-    /// Every file under `root`, routed under `mount` ("" for the root of
-    /// the URL space, or a prefix such as "/static").
-    pub fn load(
-        gpa: Allocator,
-        io: std.Io,
-        root: []const u8,
-        mount: []const u8,
-        options: LoadOptions,
-    ) !Site {
-        assert(mount.len == 0 or (mount[0] == '/' and mount[mount.len - 1] != '/'));
+    /// Every file under `root`, routed from "/".
+    pub fn load(gpa: Allocator, io: std.Io, root: []const u8, options: LoadOptions) !Site {
         var site: Site = .{};
-        try load_into(gpa, io, root, mount, options, &site);
+        try load_into(gpa, io, root, options, &site);
         return site;
     }
 
@@ -309,7 +302,7 @@ fn make_variant(
     try headers.append(gpa, .{ .name = "Cache-Control", .value = "no-cache" });
     try headers.append(gpa, .{ .name = "ETag", .value = etag });
     try headers.append(gpa, .{ .name = "X-Content-Type-Options", .value = "nosniff" });
-    // Ranges are cut from the uncompressed copy (App.partial).
+    // Ranges are cut from the uncompressed copy (`partial`).
     if (encoding == null) try headers.append(gpa, .{ .name = "Accept-Ranges", .value = "bytes" });
     if (encoding) |coding| {
         try headers.append(gpa, .{ .name = "Content-Encoding", .value = coding });
@@ -484,7 +477,6 @@ fn load_into(
     gpa: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
-    mount: []const u8,
     options: LoadOptions,
     site: *Site,
 ) !void {
@@ -506,8 +498,7 @@ fn load_into(
         site_bytes += body.len;
         if (site_bytes > site_bytes_max) return error.SiteTooLarge;
         const file = try make_file(gpa, entry.basename, body, options);
-        const route = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ mount, entry.path });
-        try add_routes(gpa, site, route[1..], file);
+        try add_routes(gpa, site, entry.path, file);
     } else return error.TooManyEntries;
 }
 

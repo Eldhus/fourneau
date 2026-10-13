@@ -5,15 +5,19 @@
 //!                   [--acme-directory URL --acme-identifier IP-OR-NAME
 //!                    --acme-state DIR [--acme-profile P] [--acme-http-port N]
 //!                    [--acme-ca BUNDLE.pem]]
+//!                   [--redirect-port N [--https-host HOST]]
 //!
 //! With a certificate and key, every connection is HTTPS (TLS 1.3, the
 //! keys then the kernel's: server.zig, tls.zig). With ACME, the server
 //! obtains its certificate itself at startup when it has none fresh
-//! (acme.zig), then serves HTTPS with it.
+//! (acme.zig), then serves HTTPS with it. With --redirect-port, plain HTTP
+//! on N redirects to https://HOST (default: the ACME identifier; needs
+//! --cert/--key or ACME). HTTP/2: h2 by ALPN over TLS, h2c by prior
+//! knowledge when plain.
 //!
 //! The files are site.zig's: read once at startup into one table, which
-//! the shards share read-only. A new site is a restart: fourneau-dragrace's
-//! host restarts the service when a deploy lands.
+//! the shards share read-only. A new site is a restart; under systemd's
+//! socket activation (`https`, `http`; listen.zig) no client is refused.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -109,7 +113,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Loading is a startup step: blocking reads on this thread, before any
     // shard exists.
     const io = std.Io.Threaded.global_single_threaded.io();
-    const site = try site_module.Site.load(gpa, io, options.root.?, "", .{});
+    const site = try site_module.Site.load(gpa, io, options.root.?, .{});
     if (site.routes.count() == 0) return error.EmptySite;
     // The certificate, loaded once and shared read-only by every shard;
     // ACME answers on systemd's port-80 socket when it holds one.
