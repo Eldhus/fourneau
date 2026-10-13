@@ -136,27 +136,9 @@ pub fn RedirectType(comptime server_options: server_module.Options) type {
             response.* = undefined;
         }
 
-        /// The redirect's server on `port`, beside a shard's HTTPS one, and
-        /// stopped with it (`Config.stop`).
-        pub fn listen(
-            redirect: *Redirect,
-            gpa: Allocator,
-            io: Io,
-            address: []const u8,
-            port: u16,
-            stop: *const std.atomic.Value(bool),
-        ) !Server {
-            const plain = try std.Io.net.IpAddress.parse(address, port);
-            const listen_options: Io.net.IpAddress.ListenOptions = .{
-                .reuse_address = true,
-                .kernel_backlog = 1024,
-            };
-            const listener = try plain.listen(io, listen_options);
-            return redirect.server_on(gpa, io, listener, stop);
-        }
-
-        /// As `listen`, on a socket already listening: one systemd passed
-        /// (listen.zig), kept across a restart.
+        /// The redirect's server on a socket already listening (bound by
+        /// the caller, or systemd's: listen.zig), beside a shard's HTTPS
+        /// one, and stopped with it (`Config.stop`).
         pub fn server_on(
             redirect: *Redirect,
             gpa: Allocator,
