@@ -176,11 +176,17 @@ pub fn generate_spec(prng: *Prng, limits: Limits) Spec {
     else
         .valid;
     const method = generate_method(prng);
+    // The fields every request may have: Host, Connection, its framing and
+    // Expect; `both_lengths` frames twice. The rest are extras, so an
+    // invalid request breaks its own rule and not the field count too (a
+    // 431 where a 400 is due).
+    const fields_fixed: u16 = if (kind == .both_lengths) 5 else 4;
+    const extra_headers_max: u8 = @intCast(@min(limits.headers_max - fields_fixed, 8));
     var spec: Spec = .{
         .kind = kind,
         .method = method,
         .target = generate_target(prng, limits),
-        .extra_headers = prng.int_at_most(u8, 0, @intCast(@min(limits.headers_max - 4, 8))),
+        .extra_headers = prng.int_at_most(u8, 0, extra_headers_max),
         .body_bytes = 0,
         .chunked = false,
         .expect_continue = false,
@@ -1147,6 +1153,18 @@ pub const Client = struct {
         return true;
     }
 
+    /// What a truncation cut, for the person replaying the seed.
+    fn report_truncated(client: *const Client) void {
+        if (client.receive_index < client.specs_count) {
+            report_request(&client.specs[client.receive_index]);
+        }
+        std.debug.print("  received {d} bytes, the first at tick {d}, the last at {d}; " ++
+            "slow={} draining={} (since tick {d})\n", .{
+            client.response_bytes, client.first_byte_tick, client.last_byte_tick,
+            client.behavior.slow,  client.server_draining, client.drain_tick,
+        });
+    }
+
     /// The server closed the connection and everything it sent is read.
     fn on_end(client: *Client, io: anytype) void {
         if (client.response_bytes > 0 and client.drained_event_stream()) {
@@ -1155,10 +1173,23 @@ pub const Client = struct {
             client.stats.streams_drained += 1;
             client.response_bytes = 0;
         }
+        if (client.response_bytes > 0 and client.behavior.slow and client.server_draining) {
+            // A slow client, cut where the drain's deadline found it: in
+            // the middle of a response too, for its sends take turns of the
+            // ring (the drain's bound promises only fast clients theirs).
+            client.stats.timed_out += 1;
+            client.disconnect(io);
+            client.state = .done;
+            return;
+        }
         if (client.response_bytes > 0) {
             // A stream the application gave up on: what it sent, then the
             // end, is its response. Anything else left over is truncation.
-            if (!client.take_cut_short()) return client.fail(.response_truncated);
+            if (!client.take_cut_short()) {
+                client.fail(.response_truncated);
+                if (client.report_failures) client.report_truncated();
+                return;
+            }
             if (client.failure != .none) return;
         }
         const outstanding = client.receive_index < client.send_index or
@@ -1278,11 +1309,7 @@ pub const Client = struct {
 
 /// What a failed check saw, for the person replaying the seed.
 fn report(spec: *const Spec, response: Response, expected: Expectation) void {
-    std.debug.print("  request: {s} {s} {any} body={d} chunked={} expect={} close={}\n", .{
-        @tagName(spec.kind), @tagName(spec.method), spec.target,
-        spec.body_bytes,     spec.chunked,          spec.expect_continue,
-        spec.close,
-    });
+    report_request(spec);
     const expected_body = expected.body[0..@min(expected.body.len, 80)];
     std.debug.print("  expected: status={d} closes={} head={} body({d})={s}\n", .{
         expected.status, expected.closes, expected.head, expected.body.len, expected_body,
@@ -1295,5 +1322,13 @@ fn report(spec: *const Spec, response: Response, expected: Expectation) void {
         "got {d} {any} cut_short={}\n", .{
         expected.chunk_count, expected.chunk_sizes[0..expected.chunk_count], expected.cut_short,
         response.chunk_count, response.chunk_sizes[0..response.chunk_count], response.cut_short,
+    });
+}
+
+fn report_request(spec: *const Spec) void {
+    std.debug.print("  request: {s} {s} {any} body={d} chunked={} expect={} close={}\n", .{
+        @tagName(spec.kind), @tagName(spec.method), spec.target,
+        spec.body_bytes,     spec.chunked,          spec.expect_continue,
+        spec.close,
     });
 }
