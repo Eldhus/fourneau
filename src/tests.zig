@@ -28,7 +28,6 @@ test {
     _ = @import("prng.zig");
     _ = @import("server.zig");
     _ = @import("sim_client.zig");
-    _ = @import("sim_io.zig");
     _ = @import("static.zig");
     _ = @import("stdx.zig");
     _ = @import("stop.zig");

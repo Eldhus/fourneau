@@ -1,6 +1,5 @@
 //! The root of the simulator's own compilation: the real server and our
-//! port of Evented over a simulated kernel (being built, beside
-//! `sim_io`'s simulator until it replaces it).
+//! port of Evented over a simulated kernel.
 //!
 //! It is its own compilation because the port takes its kernel by import,
 //! and a file belongs to one module per compilation: the suite's port

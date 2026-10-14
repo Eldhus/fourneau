@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
     });
-    // The simulator's fiber switch (src/sim_io.zig).
+    // The port's fiber switch (its real-ring tests: port_tests.zig, hello.zig).
     tests.root_module.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
     // TLS 1.3: the handshake (vendor/tls.zig, ianic/tls.zig), its keys to
     // kTLS; its curves on s2n-bignum (src/curves.zig), its SHA-256 with the

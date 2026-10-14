@@ -52,8 +52,7 @@ const trees = [_]Tree{
             "sim.zig",
         },
         .generated = &.{},
-        // sim_io.zig: a deterministic std.Io, so a vtable of its own.
-        .interfaces = &.{"sim_io.zig"},
+        .interfaces = &.{},
     },
     .{
         // Our port of Evented: upstream's file, our patches marked in it

@@ -48,7 +48,7 @@ const ring_fd: linux.fd_t = 1 << 20;
 const page_bytes = std.heap.page_size_min;
 /// Times the process may run without waiting before it is called stuck.
 const runs_without_wait_max = 1 << 20;
-/// A tick's passes, far beyond any real tick's work (sim_io's bound).
+/// A tick's passes, far beyond any real tick's work.
 const passes_per_tick_max = 1_000_000;
 
 /// The kernel the process is running on: set by `step` while it runs, so

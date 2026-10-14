@@ -3,8 +3,7 @@
 //! connection's ends can be in. The server's side never blocks: it says
 //! whether an operation can proceed, and the kernel keeps the operation
 //! pending until it can (sim_kernel.zig). The clients' side is what the
-//! simulator's clients call (sim_client.zig), the same as `sim_io`'s, so
-//! they run on either.
+//! simulator's clients call (sim_client.zig).
 //!
 //! How much a read or a write moves is drawn from the seed: any number of
 //! the waiting bytes, any number that fits the window, never none.
