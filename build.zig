@@ -273,7 +273,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(floor);
 
     // fourneau-hybrid: the state-machine I/O, handlers inline or
-    // on pooled fibers; kept building for the runtime decision.
+    // on pooled fibers; kept building for the runtime decision (README, The road).
     const hybrid = b.addExecutable(.{
         .name = "fourneau-hybrid",
         .root_module = b.createModule(.{
