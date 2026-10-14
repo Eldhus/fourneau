@@ -1313,7 +1313,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             _ = server.write_response(connection, .{ .status = 400, .body = body });
         }
 
-        // --- HTTP/2 ----------------------------------------------------------
+        // --- HTTP/2 -----------------------------------------------------------
 
         /// A client that opens with HTTP/2's preface (prior knowledge):
         /// read until it can tell. What was read stays in `recv` for

@@ -1,7 +1,7 @@
 //! The kernel our port of Evented calls (vendor/zig-io-evented imports it
 //! as `kernel`): Linux's own. The simulator gives the port another with the
 //! same declarations (`sim_kernel.zig`), so the port runs under a seed
-//! unchanged: the simulator's edge is the kernel. What a
+//! unchanged. What a
 //! shard's serving path reaches is here; the rest of the port calls Linux
 //! itself, and fails loudly in the simulator if it is ever reached there.
 

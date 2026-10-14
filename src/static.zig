@@ -199,7 +199,7 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     var runtime: Evented = undefined;
     try listen.runtime_init(Evented, &runtime, gpa, .{
         .thread_limit = 0, // this thread only
-        .log2_ring_entries = 12, // not the default 8
+        .log2_ring_entries = 12, // not the default 8: queues overflowed
         .fibers_max = config.fibers_max() +
             if (options.https.redirect_port != null) Redirect.fibers_max else 0,
     });

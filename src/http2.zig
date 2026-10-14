@@ -1,7 +1,6 @@
 //! HTTP/2 connections (RFC 9113), sans-IO: the state machine between the
-//! frames a client sends and the server's handlers.
-//! No socket and no clock: bytes in, events out, and the
-//! frames to send in one send buffer.
+//! frames a client sends and the server's handlers. No socket and no
+//! clock: bytes in, events out, and the frames to send in one send buffer.
 //!
 //! The server calls `receive` with the bytes read so far; it consumes
 //! whole frames and stops at the first one that needs the server (a

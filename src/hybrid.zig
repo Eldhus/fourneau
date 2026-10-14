@@ -1,4 +1,4 @@
-//! fourneau-hybrid: the hybrid, as an instrument.
+//! fourneau-hybrid: a state-machine hybrid, as an instrument.
 //!
 //! The I/O is a state machine on raw io_uring, as on fourneau-floor (each
 //! turn a send linked to the next receive), but the HTTP is fourneau's: the
@@ -17,8 +17,8 @@
 //! its bytes are in, by the shard's one parser into the shard's one header
 //! table, and a head that arrives in pieces is parsed again from its start.
 //!
-//! Knows only `GET /` (hello) and 404; no bodies, no timeouts. An instrument
-//! an instrument, not a server.
+//! Knows only `GET /` (hello) and 404; no bodies, no timeouts. An
+//! instrument, not a server.
 
 const std = @import("std");
 const assert = std.debug.assert;

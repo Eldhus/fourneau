@@ -74,8 +74,8 @@ const Options = struct {
     /// Zero: one per CPU in the affinity mask.
     shards: u32 = 0,
     connections: u32 = 1024,
-    /// Print each shard's ring activity per 100 requests every 2 s
-    /// what the kernel is asked, request by request.
+    /// Print each shard's ring activity per 100 requests every 2 s: what
+    /// the kernel is asked, request by request.
     counts: bool = false,
     /// systemd's socket `http`, when it holds one across restarts.
     activation: listen.Activation = .{ .pid = null, .fds = null, .names = null },
