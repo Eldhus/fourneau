@@ -285,16 +285,18 @@ pub fn build(b: *std.Build) void {
     hybrid.root_module.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
     b.installArtifact(hybrid);
 
+    // The server compiles with tls.zig; the simulator uses none of it.
+    // Sweeps run ReleaseSafe; a failing seed reads better in Debug, whose
+    // traces are not folded by inlining (`-Dsim-optimize=Debug`).
+    const sim_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "sim-optimize",
+        "The simulator's build mode (default ReleaseSafe)",
+    ) orelse .safe;
     const sim = b.addExecutable(.{
         .name = "fourneau-sim",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/sim.zig"),
-            .target = target,
-            .optimize = .safe,
-        }),
+        .root_module = simulator_module(b, target, sim_optimize, tls),
     });
-    sim.root_module.addAssemblyFile(b.path("src/context_switch_x86_64.S"));
-    sim.root_module.addImport("tls", tls); // the server compiles with it; the simulator uses none
     b.installArtifact(sim);
     const run_sim = b.addRunArtifact(sim);
     run_sim.addPassthruArgs();
@@ -334,7 +336,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sha256_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     const simulator_tests = b.addTest(.{
-        .root_module = simulator_module(b, target, test_optimize),
+        .root_module = simulator_module(b, target, test_optimize, test_tls.tls),
         .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
     });
     test_step.dependOn(&b.addRunArtifact(simulator_tests).step);
@@ -348,11 +350,13 @@ fn simulator_module(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    tls: *std.Build.Module,
 ) *std.Build.Module {
     const root = b.createModule(.{
         .root_source_file = b.path("src/simulator.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "tls", .module = tls }},
     });
     const port = b.createModule(.{
         .root_source_file = b.path("vendor/zig-io-evented/Uring.zig"),

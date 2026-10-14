@@ -62,9 +62,16 @@ const Connection = struct {
     to_client: ByteQueue,
     client_closed: bool = false,
     reset: bool = false,
+    /// SHUT_RDWR (a timeout, a drain): reads take what is queued, then see
+    /// the end; data the client sends after, Linux answers with a reset.
     server_shutdown: bool = false,
-    /// Shut for reading only (eviction): reads see the end, writes go on.
+    /// SHUT_RD only (eviction, a drain's idle close): reads take what is
+    /// queued, then see the end, never block; what the client sends after
+    /// is still received and read; writes go on. Measured on Linux 7.2
+    /// shutting reads ends nothing but empty reads.
     server_read_shut: bool = false,
+    /// The client sent after a SHUT_RDWR: the kernel reset the connection.
+    reset_by_server: bool = false,
     server_closed: bool = false,
 };
 
@@ -163,13 +170,15 @@ pub const Network = struct {
     pub fn receive(network: *Network, index: u32, out: []u8, prng: *Prng) Receive {
         assert(out.len > 0);
         const connection = &network.connections[index];
-        if (connection.reset) return .reset;
-        if (connection.server_shutdown or connection.server_read_shut) return .end;
+        if (connection.reset or connection.reset_by_server) return .reset;
+        // Queued bytes are read even once the server has shut its reading
+        // side; only an empty read sees the end then.
         if (connection.to_server.count > 0) {
             const available = @min(out.len, connection.to_server.count);
             const wanted = prng.int_at_most(usize, 1, available);
             return .{ .bytes = connection.to_server.pop(out[0..wanted]) };
         }
+        if (connection.server_shutdown or connection.server_read_shut) return .end;
         if (connection.client_closed) return .end;
         return .would_block;
     }
@@ -267,10 +276,15 @@ pub const Network = struct {
         const connection = &network.connections[index];
         assert(connection.state != .free);
         assert(!connection.client_closed);
-        const gone = connection.server_closed or connection.server_shutdown;
-        if (connection.reset or gone or connection.server_read_shut) {
+        if (connection.reset or connection.server_closed) {
             return @intCast(bytes.len); // into the void, as a real socket would
         }
+        if (connection.server_shutdown) {
+            // Linux answers data after a SHUT_RDWR with a reset.
+            if (bytes.len > 0) connection.reset_by_server = true;
+            return @intCast(bytes.len);
+        }
+        // Shut for reading only, the server's kernel still takes it.
         return connection.to_server.push(bytes);
     }
 

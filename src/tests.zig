@@ -27,7 +27,6 @@ test {
     _ = @import("port_tests.zig");
     _ = @import("prng.zig");
     _ = @import("server.zig");
-    _ = @import("sim.zig");
     _ = @import("sim_client.zig");
     _ = @import("sim_io.zig");
     _ = @import("static.zig");

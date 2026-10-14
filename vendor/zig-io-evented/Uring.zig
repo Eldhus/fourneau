@@ -144,6 +144,18 @@ const Thread = struct {
         };
     }
 
+    /// fourneau: room for a chain's `count` entries in one submission,
+    /// submitting what waits first if there is not. The kernel ends a
+    /// chain (IOSQE_IO_LINK) with its submission, so an `enqueue` that
+    /// found the queue full in the middle of one submitted its head alone,
+    /// and the rest started unlinked: a receive that did not wait for its
+    /// send, a timeout that timed nothing (the simulator, ring of 8).
+    fn reserve(thread: *Thread, count: u32) void {
+        assert(count > 1);
+        if (kernel.sq_space_left(&thread.io_uring) < count) thread.submit();
+        assert(kernel.sq_space_left(&thread.io_uring) >= count);
+    }
+
     fn submit(thread: *Thread) void {
         thread.counts.enters += 1;
         _ = thread.io_uring.submit() catch |err| switch (err) {
@@ -2088,6 +2100,8 @@ fn futexWait(
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
     const thread = try cancel_region.awaitIoUring();
+    // fourneau: the wait and its timeout are one chain: one submission.
+    if (timespec != null) thread.reserve(2);
     thread.enqueue().* = .{
         .opcode = .FUTEX_WAIT,
         .flags = if (timespec) |_| linux.IOSQE_IO_LINK else 0,
@@ -6350,6 +6364,7 @@ pub fn sendThenReceive(
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
     const thread = try cancel_region.awaitIoUring();
+    thread.reserve(2); // the pair is one chain: one submission
     const send = thread.enqueue();
     send.prep_send(socket_handle, bytes, linux.MSG.NOSIGNAL | linux.MSG.WAITALL);
     send.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;

@@ -1,15 +1,19 @@
-//! The simulator: the evented server, unchanged, on a deterministic
-//! `std.Io` (sim_io.zig), from one seed.
+//! The simulator: the server and our port of Evented, unchanged, on a
+//! simulated kernel (sim_kernel.zig), from one seed: every line fourneau
+//! runs above the system calls.
 //!
 //!   fourneau-sim --seed N              one run, replayed exactly
 //!   fourneau-sim --seeds COUNT [--start N] [--canary]
 //!
 //! The seed picks the configuration (swarm testing: slot counts, limits,
-//! timeouts, window sizes, latencies), the clients' scripts, every network
-//! choice and every scheduling choice between fibers. Each tick (one
-//! simulated millisecond), clients act, then every fiber that can run does,
-//! in an order drawn from the seed. The server's invariants are checked
-//! between ticks; the clients check every response against the model.
+//! timeouts, window sizes, latencies, the ring's size), the clients'
+//! scripts, and every choice the kernel makes: how late each operation
+//! completes, in what order, how many bytes it moves. Each tick (one
+//! simulated millisecond), clients act, then the kernel completes what is
+//! due and runs the process while it has completions to reap. The server's
+//! invariants are checked between ticks; the clients check every response
+//! against the model. Every run ends with the server stopped and returned:
+//! told to by the plan, or, once its clients are done, by the simulator.
 //!
 //! Exit codes, so a sweep sorts its failures: 0 passed, 128 liveness,
 //! 129 correctness; a crash is a panic (an assertion), which aborts
@@ -19,27 +23,32 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Prng = @import("prng.zig").Prng;
-const sim_io = @import("sim_io.zig");
+const sim_kernel = @import("sim_kernel.zig");
 const server_module = @import("server.zig");
 const sim_client = @import("sim_client.zig");
 const http1_response = @import("http1_response.zig");
+const Evented = @import("zig_io_evented");
 
 pub const exit_liveness: u8 = 128;
 pub const exit_correctness: u8 = 129;
 
 const tick_ns = std.time.ns_per_ms;
-/// Fiber switches allowed in one tick: far beyond any real tick's work, so
-/// reaching it means fibers wake each other without end (a livelock).
-const runs_per_tick_max = 1_000_000;
+/// Ticks a server whose clients are done may take to drain and return
+/// once the simulator tells it to stop: nothing is left to wait for but
+/// its next tick and the closes.
+const finish_ticks_max = 1000;
 
 /// Everything a seed decides before the run.
 pub const Setup = struct {
     server: server_module.Config,
-    network: sim_io.Options,
+    kernel: sim_kernel.Options,
+    /// The ring: production's 4,096 entries, or Evented's default of 8,
+    /// where submissions overflow and the port must submit to make room.
+    log2_ring_entries: u4,
     limits: sim_client.Limits,
     clients_count: u32,
     /// Both of the server's ways to finish a turn: a write then a read, or
-    /// the model of the port's linked send-then-receive.
+    /// the port's linked send-then-receive (production's, without kTLS).
     linked: bool,
     /// Clients start at random ticks up to this one.
     start_ticks_max: u32,
@@ -80,20 +89,24 @@ pub fn setup(prng: *Prng) Setup {
         .tick_ms = tick_ms,
         .tcp_nodelay = false,
     };
+    const backlog_max = prng.int_at_most(u32, 1, 64);
+    const realtime_seconds_start = 1_791_072_000 + prng.int_less_than(u64, 1_000_000);
     var plan: Setup = .{
         .server = server,
-        .network = .{
-            // The server's own count, and the fiber `run` itself runs on:
-            // exact, so every interleaving tests the count.
-            .fibers_max = server.fibers_max() + 1,
-            .stack_bytes = 512 * 1024,
-            .connections_max = 64,
-            .window_bytes = window_bytes,
-            .latency_ticks_max = latency_ticks_max,
-            .backlog_max = prng.int_at_most(u32, 1, 64),
+        .kernel = .{
             .tick_ns = tick_ns,
-            .realtime_seconds_start = 1_791_072_000 + prng.int_less_than(u64, 1_000_000),
+            .latency_ticks_max = latency_ticks_max,
+            // Each fiber waits on at most a linked pair, and the port's
+            // closes and cancels are in flight beside them.
+            .operations_max = 4 * server.fibers_max() + 16,
+            .network = .{
+                .connections_max = 64,
+                .backlog_max = backlog_max,
+                .window_bytes = window_bytes,
+            },
+            .realtime_start_ns = realtime_seconds_start * std.time.ns_per_s,
         },
+        .log2_ring_entries = 12,
         .limits = client_limits(prng, server, latency_ticks_max),
         .clients_count = prng.int_at_most(u32, 1, 32),
         .linked = prng.boolean(),
@@ -102,7 +115,8 @@ pub fn setup(prng: *Prng) Setup {
         .stop_tick = null,
         .drain_ticks_max = 0,
     };
-    if (prng.boolean()) plan_stop(prng, &plan, latency_ticks_max); // last: see there
+    if (prng.boolean()) plan_stop(prng, &plan, latency_ticks_max); // see there
+    if (prng.boolean()) plan.log2_ring_entries = 3;
     return plan;
 }
 
@@ -133,21 +147,31 @@ fn client_limits(
 }
 
 /// When the server is told to stop, and how long its drain may take. Drawn
-/// after everything else, so a seed that does not stop replays as before.
+/// after everything but the ring's size, so adding it changed no other
+/// draw.
 fn plan_stop(prng: *Prng, plan: *Setup, latency_ticks_max: u32) void {
     const server = &plan.server;
     plan.stop_tick = prng.int_at_most(u64, 0, plan.start_ticks_max + 4000);
     // Never shorter than a fast client's longest wait, so the drain's
-    // deadline cuts only slow clients, never a fast one's response.
+    // deadline cuts only slow clients, never a fast one's response. The
+    // longest is the largest response through the window: a send per
+    // window, each a ring operation with its latency, then the client's
+    // turn (on the real port every send waits for its completion).
+    const window_bytes = plan.kernel.network.window_bytes;
+    const response_ms = (App.answer_bytes_max / window_bytes + 4) * (latency_ticks_max + 1) * 4;
     const waits_ms_max = @max(
         @max(server.head_timeout_ms, server.body_timeout_ms),
-        server.send_timeout_ms,
+        @max(server.send_timeout_ms, response_ms),
     );
     server.drain_timeout_ms = waits_ms_max + prng.int_at_most(u32, 0, 500);
     // Noticed at the next tick; then the deadline; then the closes, each a
-    // few network turns late at most.
-    plan.drain_ticks_max = 6 * server.tick_ms + server.drain_timeout_ms +
-        (latency_ticks_max + 1) * 8;
+    // few network turns late at most. The server counts the deadline in its
+    // own ticks, each a sleep that wakes as late as the kernel makes it: a
+    // tick lasts up to `tick_ms` and a latency (its timer's completion,
+    // then its wake), so the deadline stretches by as much per tick.
+    const server_ticks = server.drain_timeout_ms / server.tick_ms + 2 + 6;
+    const tick_ticks_max = server.tick_ms + latency_ticks_max + 1;
+    plan.drain_ticks_max = server_ticks * tick_ticks_max + (latency_ticks_max + 1) * 8;
 }
 
 /// The simulated application: it reads every request body (the model
@@ -284,7 +308,9 @@ const App = struct {
 };
 
 const ServerPlain = server_module.ServerType(App, .{});
-const ServerLinked = server_module.ServerType(App, .{ .send_then_receive = send_then_receive });
+const ServerLinked = server_module.ServerType(App, .{
+    .send_then_receive = Evented.sendThenReceive,
+});
 
 pub const Outcome = struct {
     exit_code: u8,
@@ -311,40 +337,102 @@ pub fn run(gpa: std.mem.Allocator, seed: u64, canary: bool) !Outcome {
     // reshuffle the others.
     var root = Prng.init(seed);
     var setup_prng = Prng.init(root.next());
-    const network_seed = root.next();
+    const kernel_seed = root.next();
     const clients_seed = root.next();
     const plan = setup(&setup_prng);
 
-    var sim = try sim_io.Sim.init(gpa, network_seed, plan.network);
-    defer sim.deinit(gpa);
-    var app: App = .{ .canary = canary, .io = sim.io() };
+    var kernel = try sim_kernel.Kernel.init(gpa, kernel_seed, plan.kernel);
+    defer kernel.deinit(gpa);
     const listener: std.Io.net.Server = .{
         .socket = .{
-            .handle = sim_io.listener_fd,
+            .handle = kernel.network.listen(),
             .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
         },
         .options = {},
     };
-    if (plan.linked) return run_server(ServerLinked, gpa, &sim, &app, listener, plan, clients_seed);
-    return run_server(ServerPlain, gpa, &sim, &app, listener, plan, clients_seed);
+    // The application's `Io` is the process's, set once the port is up.
+    var app: App = .{ .canary = canary, .io = undefined };
+    if (plan.linked) {
+        return run_shard(ServerLinked, gpa, &kernel, &app, listener, plan, clients_seed);
+    }
+    return run_shard(ServerPlain, gpa, &kernel, &app, listener, plan, clients_seed);
 }
 
-fn run_server(
+/// The server's process on the simulated kernel: the port, then the server
+/// on it, as a program runs a shard (static.zig).
+fn Shard(comptime Server: type) type {
+    return struct {
+        const Process = @This();
+
+        gpa: std.mem.Allocator,
+        plan: *const Setup,
+        app: *App,
+        listener: std.Io.net.Server,
+        stop: *std.atomic.Value(bool),
+        /// While it runs: the server, on the process's stack.
+        server: ?*Server = null,
+        /// What it left when `run` returned.
+        report: Report = .{},
+
+        fn main(shard: *Process) void {
+            shard.run() catch |err| std.debug.panic("shard: {t}", .{err});
+        }
+
+        fn run(shard: *Process) !void {
+            var runtime: Evented = undefined;
+            try runtime.init(shard.gpa, .{
+                .thread_limit = 0, // one shard, one thread
+                .fibers_max = shard.plan.server.fibers_max(),
+                .log2_ring_entries = shard.plan.log2_ring_entries,
+            });
+            defer runtime.deinit();
+            const io = runtime.io();
+            shard.app.io = io;
+            var config = shard.plan.server;
+            config.stop = shard.stop;
+            var server = try Server.init(shard.gpa, io, shard.app, shard.listener, config);
+            defer server.deinit(shard.gpa);
+            shard.server = &server;
+            defer shard.server = null;
+            try server.run();
+            shard.report = .{
+                .stats = server.stats,
+                .draining = server.draining,
+                .returned = true,
+            };
+        }
+
+        /// The server's account, live or as it returned.
+        fn now(shard: *const Process) Report {
+            const server = shard.server orelse return shard.report;
+            return .{ .stats = server.stats, .draining = server.draining, .returned = false };
+        }
+    };
+}
+
+const Report = struct {
+    stats: server_module.Stats = .{},
+    draining: bool = false,
+    returned: bool = false,
+};
+
+fn run_shard(
     comptime Server: type,
     gpa: std.mem.Allocator,
-    sim: *sim_io.Sim,
+    kernel: *sim_kernel.Kernel,
     app: *App,
     listener: std.Io.net.Server,
     plan: Setup,
     clients_seed: u64,
 ) !Outcome {
-    const io = sim.io();
     var stop: std.atomic.Value(bool) = .init(false);
-    var config = plan.server;
-    config.stop = &stop;
-    var server = try Server.init(gpa, io, app, listener, config);
-    defer server.deinit(gpa);
-
+    var shard: Shard(Server) = .{
+        .gpa = gpa,
+        .plan = &plan,
+        .app = app,
+        .listener = listener,
+        .stop = &stop,
+    };
     const clients = try gpa.alloc(sim_client.Client, plan.clients_count);
     defer gpa.free(clients);
     var clients_prng = Prng.init(clients_seed);
@@ -354,73 +442,105 @@ fn run_server(
         client.report_failures = !app.canary;
     }
 
-    // The server runs on a fiber; this loop is the simulator's own. Its
-    // future is never awaited: the simulator's loop is no fiber. A run
-    // ends when the clients do, or, told to stop, when the server returns.
-    const running = try io.concurrent(Server.run, .{&server});
-    const run_task = running.any_future.?;
-    const ticks = loop(sim, &server, clients, plan, &stop, run_task);
-    var result = outcome(&server, clients, ticks, plan.ticks_max);
-    if (result.exit_code == 0 and plan.stop_tick != null) {
-        const stop_tick = plan.stop_tick.?;
-        // Told to stop, it must return within the drain's bound.
-        if (!sim.finished(run_task) or ticks > stop_tick + plan.drain_ticks_max) {
-            std.debug.print("server: not drained by tick {d} (stopped at {d})\n", .{
-                stop_tick + plan.drain_ticks_max, stop_tick,
-            });
-            result.exit_code = exit_liveness;
-        } else if (sim.backlog_count != 0) {
-            // Refused at once, or answered: never left queued.
-            std.debug.print("server: drained, {d} clients left queued\n", .{sim.backlog_count});
-            result.exit_code = exit_correctness;
-        }
+    kernel.start(Shard(Server).main, &shard);
+    const ending = loop(kernel, &shard, clients, plan, &stop);
+    var result = outcome(shard.now(), clients, ending.tick, &plan);
+    // A run cut short (a failure, the canary) still ends its server, so
+    // the process frees what it holds.
+    defer if (!kernel.exited()) wind_down(kernel, &stop, plan);
+    if (result.exit_code != 0) return result;
+    const stop_tick = ending.stop_tick orelse {
+        std.debug.print("server: never told to stop by tick {d}\n", .{ending.tick});
+        result.exit_code = exit_liveness;
+        return result;
+    };
+    // Told to stop, it must return within its bound.
+    const bound = if (plan.stop_tick != null) plan.drain_ticks_max else finish_ticks_max;
+    if (!kernel.exited() or ending.tick > stop_tick + bound) {
+        std.debug.print("server: not returned by tick {d} (stopped at {d})\n", .{
+            stop_tick + bound, stop_tick,
+        });
+        print_state(kernel, shard.now());
+        result.exit_code = exit_liveness;
+    } else if (kernel.network.backlog_count != 0) {
+        // Refused at once, or answered: never left queued.
+        const queued = kernel.network.backlog_count;
+        std.debug.print("server: drained, {d} clients left queued\n", .{queued});
+        result.exit_code = exit_correctness;
     }
     return result;
+}
+
+/// For a run that did not end: what the server counted, and what still
+/// waits in the kernel.
+fn print_state(kernel: *const sim_kernel.Kernel, report: Report) void {
+    const stats = report.stats;
+    std.debug.print("server: accepted {d} closed {d} draining {} returned {}\n", .{
+        stats.accepted, stats.closed, report.draining, report.returned,
+    });
+    kernel.print_pending();
+}
+
+/// Told to stop, a server's drain ends by its deadline, when it cuts
+/// what is left: within that, a tick, and the closes.
+fn wind_down(kernel: *sim_kernel.Kernel, stop: *std.atomic.Value(bool), plan: Setup) void {
+    stop.store(true, .release);
+    const ticks_max = plan.server.drain_timeout_ms + 10 * plan.server.tick_ms + finish_ticks_max;
+    for (0..ticks_max) |_| {
+        if (kernel.exited()) return;
+        kernel.step();
+    }
+    std.debug.print("server: not returned {d} ticks after a stop, to wind down\n", .{ticks_max});
 }
 
 /// Ticks for the clients to read the last bytes of a drained server.
 const settle_ticks = 4;
 
+const Ending = struct { tick: u64, stop_tick: ?u64 };
+
 fn loop(
-    sim: *sim_io.Sim,
-    server: anytype,
+    kernel: *sim_kernel.Kernel,
+    shard: anytype,
     clients: []sim_client.Client,
     plan: Setup,
     stop: *std.atomic.Value(bool),
-    run_task: *std.Io.AnyFuture,
-) u64 {
+) Ending {
+    var stop_tick: ?u64 = null;
     var returned_tick: ?u64 = null;
     for (0..plan.ticks_max) |tick| {
-        sim.tick_now = tick;
+        assert(kernel.tick == tick);
         if (plan.stop_tick == tick) {
             stop.store(true, .release);
+            stop_tick = tick;
             for (clients) |*client| client.drain_started(tick);
         }
-        for (clients) |*client| client.step(sim, tick);
-        const runs = sim.run_ready(runs_per_tick_max);
-        assert(runs < runs_per_tick_max); // fibers woke each other without end
-        server.check_invariants();
-        if (failed(clients)) return tick;
-        if (returned_tick == null and sim.finished(run_task)) returned_tick = tick;
+        for (clients) |*client| client.step(&kernel.network, tick);
+        kernel.step();
+        if (shard.server) |server| server.check_invariants();
+        if (failed(clients)) return .{ .tick = tick, .stop_tick = stop_tick };
+        if (returned_tick == null and kernel.exited()) returned_tick = tick;
         if (returned_tick) |returned| {
-            if (tick >= returned + settle_ticks) return tick;
+            if (tick >= returned + settle_ticks) return .{ .tick = tick, .stop_tick = stop_tick };
             continue;
         }
-        // One that will be stopped runs until it returns.
-        if (plan.stop_tick == null and finished(server, clients)) return tick;
-        if (plan.stop_tick) |stop_tick| {
-            if (tick > stop_tick + plan.drain_ticks_max) return tick; // judged by the caller
+        // Its clients done, a server not told to stop by the plan is told now.
+        if (stop_tick == null and plan.stop_tick == null and finished(shard.now(), clients)) {
+            stop.store(true, .release);
+            stop_tick = tick;
+        }
+        if (stop_tick) |stopped| {
+            const bound = if (plan.stop_tick != null) plan.drain_ticks_max else finish_ticks_max;
+            if (tick > stopped + bound) return .{ .tick = tick, .stop_tick = stopped };
         }
     }
-    return plan.ticks_max;
+    return .{ .tick = plan.ticks_max, .stop_tick = stop_tick };
 }
 
-fn finished(server: anytype, clients: []const sim_client.Client) bool {
+fn finished(report: Report, clients: []const sim_client.Client) bool {
     for (clients) |*client| {
         if (client.state != .done) return false;
     }
-    const accepted = server.stats.accepted;
-    return accepted == server.stats.closed;
+    return report.stats.accepted == report.stats.closed;
 }
 
 fn failed(clients: []const sim_client.Client) bool {
@@ -431,25 +551,28 @@ fn failed(clients: []const sim_client.Client) bool {
 }
 
 fn outcome(
-    server: anytype,
+    report: Report,
     clients: []const sim_client.Client,
     ticks: u64,
-    ticks_max: u64,
+    plan: *const Setup,
 ) Outcome {
+    const stats = report.stats;
     var result: Outcome = .{
         .exit_code = 0,
         .ticks = ticks,
-        .requests = server.stats.requests,
-        .refused = server.stats.refused,
-        .timeouts = server.stats.timeouts,
+        .requests = stats.requests,
+        .refused = stats.refused,
+        .timeouts = stats.timeouts,
         .responses = 0,
         .retries = 0,
         .timed_out = 0,
         .cut_short = 0,
-        .stopped = @intFromBool(server.draining),
-        .drain_idle = server.stats.drain_idle,
-        .drain_streams = server.stats.drain_streams,
-        .drain_cut = server.stats.drain_cut,
+        // Stopped by the plan, in the middle of its work: every run ends
+        // drained, but these were cut into.
+        .stopped = @intFromBool(plan.stop_tick != null and report.draining),
+        .drain_idle = stats.drain_idle,
+        .drain_streams = stats.drain_streams,
+        .drain_cut = stats.drain_cut,
         .shut_out = 0,
     };
     for (clients, 0..) |*client, index| {
@@ -465,12 +588,12 @@ fn outcome(
             result.exit_code = exit_correctness;
         }
     }
-    // The pool is exactly what the server says it needs (`setup`).
-    if (server.stats.fiberless != 0) {
-        std.debug.print("server: {d} connections found no fiber\n", .{server.stats.fiberless});
+    // The pool is exactly what the server says it needs (`Shard.run`).
+    if (stats.fiberless != 0) {
+        std.debug.print("server: {d} connections found no fiber\n", .{stats.fiberless});
         result.exit_code = exit_correctness;
     }
-    if (result.exit_code == 0 and ticks == ticks_max) result.exit_code = exit_liveness;
+    if (result.exit_code == 0 and ticks == plan.ticks_max) result.exit_code = exit_liveness;
     return result;
 }
 
@@ -545,35 +668,4 @@ test "sim: a seed replays exactly" {
     try std.testing.expectEqual(first.ticks, second.ticks);
     try std.testing.expectEqual(first.responses, second.responses);
     try std.testing.expectEqual(first.requests, second.requests);
-}
-
-/// The model of the port's `sendThenReceive`: every byte sent, then one
-/// read; a send that cannot finish fails the pair, as the link cancels the
-/// port's receive.
-fn send_then_receive(
-    io: std.Io,
-    socket: std.Io.net.Socket.Handle,
-    bytes: []const u8,
-    buffer: []u8,
-) error{ ConnectionResetByPeer, Canceled, Unexpected }!usize {
-    assert(bytes.len > 0);
-    assert(buffer.len > 0);
-    var sent: usize = 0;
-    for (0..bytes.len + 1) |_| {
-        if (sent == bytes.len) break;
-        const result = io.operate(.{ .net_write = .{
-            .socket_handle = socket,
-            .header = bytes[sent..],
-            .data = &.{""},
-        } }) catch return error.Canceled;
-        const written = result.net_write catch return error.ConnectionResetByPeer;
-        if (written == 0) return error.ConnectionResetByPeer;
-        sent += written;
-    } else unreachable; // each pass sends a byte or fails
-    var parts = [_][]u8{buffer};
-    const result = io.operate(.{ .net_read = .{ .socket_handle = socket, .data = &parts } }) catch
-        return error.Canceled;
-    const read = result.net_read catch return error.ConnectionResetByPeer;
-    assert(read.data_len <= buffer.len);
-    return read.data_len;
 }

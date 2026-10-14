@@ -38,8 +38,8 @@ const trees = [_]Tree{
         // build curves-table`; sha256_shani.zig: an object of its own target;
         // kernel.zig: the port's `kernel` module (vendor imports it), no tests;
         // simulator.zig: the simulator's compilation, the port's kernel there,
-        // whose tests (sim_kernel.zig's, sim_network.zig's) are that
-        // compilation's.
+        // whose tests (sim_kernel.zig's, sim_network.zig's, sim.zig's) are
+        // that compilation's.
         .roots = &.{
             "tests.zig",        "curves.zig",       "sha256.zig",
             "curves_table.zig", "sha256_shani.zig", "kernel.zig",
@@ -49,6 +49,7 @@ const trees = [_]Tree{
             "tests.zig",        "curves.zig",       "sha256.zig",
             "curves_table.zig", "sha256_shani.zig", "kernel.zig",
             "simulator.zig",    "sim_kernel.zig",   "sim_network.zig",
+            "sim.zig",
         },
         .generated = &.{},
         // sim_io.zig: a deterministic std.Io, so a vtable of its own.

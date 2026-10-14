@@ -9,11 +9,17 @@
 //! calls it makes, exactly src/kernel.zig's.
 
 const sim_kernel = @import("sim_kernel.zig");
+const sim = @import("sim.zig");
 
 pub const IoUring = sim_kernel.Ring;
+pub const sq_space_left = sim_kernel.sq_space_left;
 pub const clock_gettime = sim_kernel.clock_gettime;
 pub const shutdown = sim_kernel.shutdown;
 
+/// `fourneau-sim`: the sweep (sim.zig).
+pub const main = sim.main;
+
 test {
     _ = sim_kernel;
+    _ = sim;
 }

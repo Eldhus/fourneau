@@ -39,15 +39,17 @@ pub const Options = struct {
     /// it, as the kernel makes it.
     ring_entries_max: u16 = 4096,
     process_stack_bytes: u32 = 8 * 1024 * 1024,
+    /// What `clock_gettime(REALTIME)` reads at tick 0: 2026-01-01 unless
+    /// the simulator draws another (the Date header's every day).
+    realtime_start_ns: u64 = 1_767_225_600 * std.time.ns_per_s,
 };
-
-/// What the process's `clock_gettime(REALTIME)` starts at: 2026-01-01.
-const realtime_epoch_ns: u64 = 1_767_225_600 * std.time.ns_per_s;
 /// The ring's descriptor, as the process sees it: never a real one.
 const ring_fd: linux.fd_t = 1 << 20;
 const page_bytes = std.heap.page_size_min;
 /// Times the process may run without waiting before it is called stuck.
 const runs_without_wait_max = 1 << 20;
+/// A tick's passes, far beyond any real tick's work (sim_io's bound).
+const passes_per_tick_max = 1_000_000;
 
 /// The kernel the process is running on: set by `step` while it runs, so
 /// the ring's functions (which the port calls with no context) find it.
@@ -79,6 +81,13 @@ const Operation = struct {
     moved: u32 = 0,
     /// The operation linked behind this one.
     next: ?u32 = null,
+    /// A LINK_TIMEOUT's: the operation it times, which it cancels if it
+    /// fires first.
+    guards: ?u32 = null,
+    /// A FUTEX_WAIT's: decided at submission, as the kernel issues it.
+    futex: enum { none, waiting, woken, mismatch } = .none,
+    /// The order of submission: a futex wakes its waiters oldest first.
+    sequence: u64 = 0,
 };
 
 pub const Stats = struct {
@@ -88,6 +97,10 @@ pub const Stats = struct {
     skipped: u64 = 0,
     canceled: u64 = 0,
     resumes: u64 = 0,
+    futex_woken: u64 = 0,
+    timed_out: u64 = 0,
+    /// Submissions that ended on an IO_LINK: the chain cut there.
+    chains_cut: u64 = 0,
 };
 
 pub const Kernel = struct {
@@ -106,6 +119,8 @@ pub const Kernel = struct {
     ring_entries: u16 = 0,
     process: Process,
     network: Network,
+    /// The next submission's place in the order of all of them.
+    sequence: u64 = 0,
     stats: Stats = .{},
 
     pub fn init(gpa: std.mem.Allocator, seed: u64, options: Options) !Kernel {
@@ -183,14 +198,33 @@ pub const Kernel = struct {
     pub fn step(kernel: *Kernel) void {
         assert(running == null);
         if (kernel.process.state == .ready) kernel.resume_process();
-        // Bounded: each pass completes an operation or ends the tick.
-        for (0..kernel.operations.len + 1) |_| {
+        // Each pass completes an operation or runs the process, which may
+        // submit more due this tick: a busy tick has many. Reaching the
+        // bound means completions and the process feed each other without
+        // end (a livelock).
+        for (0..passes_per_tick_max) |_| {
             const completed = kernel.complete_due();
             if (kernel.process.state == .waiting and kernel.reapable()) {
                 kernel.resume_process();
             } else if (completed == 0) break;
-        } else unreachable;
+        } else @panic("sim_kernel: a tick that never ends (a livelock)");
         kernel.tick += 1;
+    }
+
+    /// What waits in the kernel, for a run that did not end: each operation
+    /// not yet complete, and the process's state.
+    pub fn print_pending(kernel: *const Kernel) void {
+        std.debug.print("kernel at tick {d}: process {t}, {d} completions unreaped\n", .{
+            kernel.tick, kernel.process.state, kernel.completions_count,
+        });
+        for (kernel.operations, 0..) |*operation, index| {
+            if (operation.state == .free) continue;
+            std.debug.print("  op {d}: {t} {t} fd {d} due {d} user_data 0x{x} futex {t}\n", .{
+                index,           operation.state,    operation.opcode,
+                operation.fd,    operation.due_tick, operation.user_data,
+                operation.futex,
+            });
+        }
     }
 
     fn reapable(kernel: *const Kernel) bool {
@@ -236,7 +270,11 @@ pub const Kernel = struct {
     }
 
     /// The submission queue taken in, in order, as `io_uring_enter` does. A
-    /// submission flagged IO_LINK has the next one wait behind it.
+    /// submission flagged IO_LINK has the next one wait behind it; a
+    /// LINK_TIMEOUT behind it instead runs beside it, and ends it if it
+    /// fires first. As in the kernel, a chain ends with its submission: an
+    /// IO_LINK on the last entry links to nothing, and the next entry,
+    /// submitted later, starts on its own (a LINK_TIMEOUT alone: -EINVAL).
     fn take_submissions(kernel: *Kernel) u32 {
         const count = kernel.submissions_count;
         var linking: ?u32 = null;
@@ -244,11 +282,19 @@ pub const Kernel = struct {
             const index = kernel.submit_one(sqe);
             if (linking) |before| {
                 kernel.operations[before].next = index;
-                kernel.operations[index].state = .linked;
+                if (sqe.opcode == .LINK_TIMEOUT) {
+                    kernel.operations[index].guards = before;
+                } else {
+                    kernel.operations[index].state = .linked;
+                }
+            } else if (sqe.opcode == .LINK_TIMEOUT) {
+                const alone = &kernel.operations[index];
+                alone.result = errno(.INVAL);
+                alone.due_tick = kernel.tick + kernel.latency();
             }
             linking = if (sqe.flags & linux.IOSQE_IO_LINK != 0) index else null;
         }
-        assert(linking == null); // a link's last submission ends it
+        if (linking != null) kernel.stats.chains_cut += 1;
         kernel.submissions_count = 0;
         kernel.stats.submissions += count;
         return count;
@@ -268,9 +314,13 @@ pub const Kernel = struct {
             .fd = sqe.fd,
             .addr = sqe.addr,
             .len = sqe.len,
+            .sequence = kernel.sequence,
         };
+        kernel.sequence += 1;
         switch (sqe.opcode) {
             .NOP, .CLOSE => {},
+            .FUTEX_WAIT, .FUTEX_WAKE => kernel.submit_futex(operation, sqe),
+            .LINK_TIMEOUT => kernel.submit_timeout(operation, sqe),
             .RECV, .SEND, .RECVMSG, .SENDMSG => {
                 const known: u32 = linux.MSG.NOSIGNAL | linux.MSG.WAITALL;
                 if (sqe.rw_flags & ~known != 0) unsimulated("a MSG_ flag", sqe.rw_flags);
@@ -297,6 +347,48 @@ pub const Kernel = struct {
         return kernel.prng.int_at_most(u64, 0, kernel.options.latency_ticks_max);
     }
 
+    /// Futexes on 32-bit words of this process, every bit of the mask:
+    /// what the port asks for. The wait compares and the wake wakes now,
+    /// as the kernel issues them at submission; their completions come
+    /// with the latency.
+    fn submit_futex(kernel: *Kernel, operation: *Operation, sqe: *const linux.io_uring_sqe) void {
+        const flags: u32 = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true });
+        assert(@as(u32, @bitCast(sqe.fd)) == flags);
+        assert(sqe.addr3 == std.math.maxInt(u32)); // every bit
+        const word: *const u32 = @ptrFromInt(sqe.addr);
+        const value: u32 = @truncate(sqe.off);
+        if (sqe.opcode == .FUTEX_WAIT) {
+            const same = @atomicLoad(u32, word, .monotonic) == value;
+            operation.futex = if (same) .waiting else .mismatch;
+            return;
+        }
+        // The kernel takes the count as an int: `std.math.maxInt(u32)`,
+        // "all", arrives as -1, and its loop stops after the first waiter
+        // (Evented's futexWake wakes one waiter). So here too.
+        const count: i32 = @bitCast(value);
+        var woken: i32 = 0;
+        // io_uring's wake is strict: a count of 0 wakes none.
+        if (count != 0) for (0..kernel.operations.len) |_| {
+            const waiter = kernel.oldest_waiter(sqe.addr) orelse break;
+            waiter.futex = .woken;
+            waiter.due_tick = kernel.tick + kernel.latency();
+            woken += 1;
+            kernel.stats.futex_woken += 1;
+            if (woken >= count) break;
+        };
+        operation.result = woken;
+    }
+
+    fn oldest_waiter(kernel: *Kernel, address: u64) ?*Operation {
+        var oldest: ?*Operation = null;
+        for (kernel.operations) |*operation| {
+            if (operation.state != .pending or operation.futex != .waiting) continue;
+            if (operation.addr != address) continue;
+            if (oldest == null or operation.sequence < oldest.?.sequence) oldest = operation;
+        }
+        return oldest;
+    }
+
     /// A timer: its count (`off`) is 0, so it ends only by time: -ETIME.
     fn submit_timeout(kernel: *Kernel, operation: *Operation, sqe: *const linux.io_uring_sqe) void {
         assert(sqe.off == 0);
@@ -309,7 +401,7 @@ pub const Kernel = struct {
             std.math.maxInt(u64);
         const given = ns +| @as(u64, @intCast(timespec.nsec));
         const realtime = sqe.rw_flags & linux.IORING_TIMEOUT_REALTIME != 0;
-        const base: u64 = if (realtime) realtime_epoch_ns else 0;
+        const base: u64 = if (realtime) kernel.options.realtime_start_ns else 0;
         const until_ns = if (sqe.rw_flags & linux.IORING_TIMEOUT_ABS != 0)
             given -| base
         else
@@ -380,10 +472,34 @@ pub const Kernel = struct {
             .ACCEPT, .RECV, .SEND, .RECVMSG, .SENDMSG, .CLOSE => {
                 operation.result = kernel.attempt(operation) orelse return false;
             },
+            .FUTEX_WAIT => operation.result = switch (operation.futex) {
+                .waiting => return false, // until a wake, or a cancel
+                .woken => 0,
+                .mismatch => errno(.AGAIN),
+                .none => unreachable,
+            },
+            // Alone (its chain cut): -EINVAL, set at submission.
+            .LINK_TIMEOUT => if (operation.guards != null) kernel.time_out(operation),
             else => {},
         }
         kernel.finish(index);
         return true;
+    }
+
+    /// A LINK_TIMEOUT fired: what it guards ends, -ECANCELED, unless it is
+    /// already done and only its completion is on its way (a woken futex).
+    fn time_out(kernel: *Kernel, operation: *Operation) void {
+        const guarded_index = operation.guards.?;
+        const guarded = &kernel.operations[guarded_index];
+        assert(guarded.state == .pending);
+        assert(guarded.next != null);
+        guarded.next = null; // it no longer ends this timeout
+        operation.guards = null;
+        operation.result = errno(.TIME);
+        kernel.stats.timed_out += 1;
+        if (guarded.futex == .woken) return;
+        guarded.result = errno(.CANCELED);
+        kernel.finish(guarded_index);
     }
 
     /// A socket's operation, tried now: its result, or null when its socket
@@ -451,6 +567,8 @@ pub const Kernel = struct {
         for (kernel.operations, 0..) |*operation, index| {
             if (operation.state == .free or operation.user_data != user_data) continue;
             if (operation.opcode == .ASYNC_CANCEL) continue;
+            // Woken, it is done: only its completion is on its way.
+            if (operation.futex == .woken) continue;
             return @intCast(index);
         }
         return null;
@@ -472,7 +590,8 @@ pub const Kernel = struct {
         var current: ?u32 = index;
         // Bounded: a chain is at most every operation.
         for (0..kernel.operations.len + 1) |_| {
-            const operation = &kernel.operations[current orelse return];
+            const this = current orelse return;
+            const operation = &kernel.operations[this];
             assert(operation.state == .pending);
             operation.state = .free;
             const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
@@ -484,6 +603,13 @@ pub const Kernel = struct {
             current = operation.next;
             const next = operation.next orelse return;
             const behind = &kernel.operations[next];
+            if (behind.opcode == .LINK_TIMEOUT) {
+                // Done before its timeout: the timeout ends, -ECANCELED.
+                assert(behind.state == .pending and behind.guards == this);
+                behind.guards = null;
+                behind.result = errno(.CANCELED);
+                continue;
+            }
             assert(behind.state == .linked);
             behind.state = .pending;
             behind.due_tick = kernel.tick + kernel.latency();
@@ -592,6 +718,14 @@ fn send_parts(
     return .{ .count = count, .bytes = bytes };
 }
 
+/// Free entries in the submission queue (src/kernel.zig).
+pub fn sq_space_left(ring: *Ring) u32 {
+    assert(ring.fd == ring_fd);
+    const kernel = running.?;
+    assert(kernel.submissions_count <= kernel.ring_entries);
+    return kernel.ring_entries - kernel.submissions_count;
+}
+
 /// The timekeeper's way to end a socket's wait (src/kernel.zig).
 pub fn shutdown(fd: linux.fd_t, how: i32) usize {
     const kernel = running.?;
@@ -651,11 +785,11 @@ pub const Ring = struct {
     }
 };
 
-/// `Io.now`'s clock: the ticks, in nanoseconds; REALTIME from 2026.
+/// `Io.now`'s clock: the ticks, in nanoseconds; REALTIME from its start.
 pub fn clock_gettime(clock: linux.clockid_t, timespec: *linux.timespec) usize {
     const kernel = running.?;
     const base: u64 = switch (clock) {
-        .REALTIME, .REALTIME_COARSE => realtime_epoch_ns,
+        .REALTIME, .REALTIME_COARSE => kernel.options.realtime_start_ns,
         .MONOTONIC, .MONOTONIC_COARSE, .MONOTONIC_RAW, .BOOTTIME => 0,
         else => unsimulated("a clock", @backingInt(clock)),
     };
@@ -1061,5 +1195,68 @@ test "sim_kernel: a stream write takes the cancel its fiber's sleep left" {
         kernel.start(dropped_main, &dropped);
         try run_with_client(&kernel, &client, 100_000);
         try testing.expectError(error.Canceled, dropped.written);
+    }
+}
+
+const Split = struct {
+    reply: [40]u8 = "a reply that takes windows and windows!!".*,
+    got: [8]u8 = @splat(0),
+    count: usize = 0,
+};
+
+fn split_main(split: *Split) void {
+    split_run(split) catch |err| std.debug.panic("split: {t}", .{err});
+}
+
+/// Seven sleeps fill the ring of 8 (Evented's default) but one entry; then
+/// the send-then-receive pair, which must still go in as one chain. The
+/// port runs the fibers it starts newest first: the pair's is started
+/// first, so it runs last.
+fn split_run(split: *Split) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 8);
+    defer runtime.deinit();
+    const io = runtime.io();
+    const stream = try accept_one(io);
+    defer stream.close(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, send_pair, .{ io, stream.socket.handle, split });
+    for (0..7) |_| try group.concurrent(io, sleep_a_while, .{io});
+    try group.await(io);
+}
+
+fn sleep_a_while(io: Io) Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(50), .awake);
+}
+
+fn send_pair(io: Io, socket: linux.fd_t, split: *Split) Io.Cancelable!void {
+    split.count = Evented.sendThenReceive(io, socket, &split.reply, &split.got) catch |err|
+        switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ConnectionResetByPeer, error.Unexpected => unreachable,
+        };
+    // As the server does: its send buffer is free once the pair returns.
+    @memset(&split.reply, '#');
+}
+
+// The kernel ends a chain with its submission. The port's pair was split
+// when the queue filled between its two entries: the receive then ran
+// unlinked, returned while the send still read the buffer, and the
+// buffer's next use went out on the wire.
+test "sim_kernel: a send-then-receive stays one chain when the ring is nearly full" {
+    const reply = "a reply that takes windows and windows!!";
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        _ = kernel.network.listen();
+        var split: Split = .{};
+        // It sends its next request at once, so a receive that did not
+        // wait for the send would have it at once.
+        var client: TestClient = .{ .request = "next", .expected_bytes = reply.len };
+        kernel.start(split_main, &split);
+        try run_with_client(&kernel, &client, 10_000);
+        try testing.expectEqualStrings(reply, client.received[0..client.received_count]);
+        try testing.expectEqual(0, kernel.stats.chains_cut);
+        try testing.expect(split.count > 0);
     }
 }
