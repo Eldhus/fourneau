@@ -318,6 +318,9 @@ pub const Stats = struct {
     drain_idle: u64 = 0,
     drain_streams: u64 = 0,
     drain_cut: u64 = 0,
+    /// Requests that arrived as their connection was shut while idle
+    /// (eviction, a drain's start), closed unanswered (`shut_idle`).
+    shut_with_request: u64 = 0,
     /// HTTP/2: connections, and streams served and refused (the shard's
     /// stream slots all taken, or no fiber to run one on).
     http2_connections: u64 = 0,
@@ -1881,7 +1884,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 const got = connection.read_some(window, timeout) catch return false;
                 if (got == 0) return false; // closed, or timed out
                 // Shut while it waited: what it read goes unanswered.
-                if (connection.shut_idle) return false;
+                if (connection.shut_idle) {
+                    server.stats.shut_with_request += 1;
+                    return false;
+                }
                 connection.recv_used += got;
             } else unreachable; // each pass reads a byte or finishes
         }

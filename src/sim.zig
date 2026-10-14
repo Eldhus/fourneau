@@ -688,3 +688,247 @@ test "sim: a seed replays exactly" {
     try std.testing.expectEqual(first.responses, second.responses);
     try std.testing.expectEqual(first.requests, second.requests);
 }
+
+// --- regressions: one scenario forced, over seeds -----------------------
+//
+// A seed is not a regression test: it names one run of the simulator as
+// it is, and any change to what draws from it (the plan, the clients, the
+// kernel) makes it another run. A bug a sweep found stays found by a test
+// that forces its scenario with clients driven by hand, the kernel's
+// choices still drawn, over enough seeds to reach its interleaving, and
+// that says it reached it. Each was checked by putting its bug back.
+
+/// A plan not drawn, for a scenario's test: generous timeouts, a window
+/// of 64 bytes, the kernel's latencies up to 3 ticks.
+fn scripted_plan(connections_max: u32) Setup {
+    const server: server_module.Config = .{
+        .connections_max = connections_max,
+        .head_bytes_max = 1024,
+        .target_bytes_max = 256,
+        .headers_max = 16,
+        .body_bytes_max = 1024,
+        .response_head_bytes_max = 512,
+        .send_bytes_max = 1024,
+        .scratch_bytes_max = App.answer_bytes_max,
+        .head_timeout_ms = 5000,
+        .body_timeout_ms = 5000,
+        .idle_timeout_ms = 5000,
+        .send_timeout_ms = 5000,
+        .tick_ms = 10,
+        .tcp_nodelay = false,
+    };
+    return .{
+        .server = server,
+        .kernel = .{
+            .tick_ns = tick_ns,
+            .latency_ticks_max = 3,
+            .operations_max = 4 * server.fibers_max() + 16,
+            .network = .{ .connections_max = 8, .backlog_max = 8, .window_bytes = 64 },
+        },
+        .log2_ring_entries = 12,
+        .limits = undefined, // no generated clients
+        .clients_count = 0,
+        .linked = false,
+        .start_ticks_max = 0,
+        .ticks_max = 20_000,
+        .stop_tick = null,
+        .drain_ticks_max = 0,
+    };
+}
+
+/// The server on the simulated kernel, its clients the test's own, the
+/// server's invariants checked after every tick.
+const Scripted = struct {
+    plan: Setup,
+    kernel: sim_kernel.Kernel,
+    app: App,
+    stop: std.atomic.Value(bool),
+    shard: Shard(ServerPlain),
+
+    /// In place: the shard holds pointers into it.
+    fn init(scripted: *Scripted, gpa: std.mem.Allocator, seed: u64, plan: Setup) !void {
+        scripted.plan = plan;
+        scripted.kernel = try .init(gpa, seed, plan.kernel);
+        scripted.app = .{ .canary = false, .io = undefined };
+        scripted.stop = .init(false);
+        const listener: std.Io.net.Server = .{
+            .socket = .{
+                .handle = scripted.kernel.network.listen(),
+                .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
+            },
+            .options = {},
+        };
+        scripted.shard = .{
+            .gpa = gpa,
+            .plan = &scripted.plan,
+            .app = &scripted.app,
+            .listener = listener,
+            .stop = &scripted.stop,
+        };
+        scripted.kernel.start(Shard(ServerPlain).main, &scripted.shard);
+    }
+
+    fn deinit(scripted: *Scripted, gpa: std.mem.Allocator) void {
+        scripted.kernel.deinit(gpa);
+        scripted.* = undefined;
+    }
+
+    fn tick(scripted: *Scripted) void {
+        scripted.kernel.step();
+        if (scripted.shard.server) |server| server.check_invariants();
+    }
+
+    fn ticks(scripted: *Scripted, count: u32) void {
+        for (0..count) |_| scripted.tick();
+    }
+
+    /// Stop the server and run it until it returns.
+    fn finish(scripted: *Scripted) !void {
+        scripted.stop.store(true, .release);
+        for (0..scripted.plan.ticks_max) |_| {
+            if (scripted.kernel.exited()) return;
+            scripted.tick();
+        }
+        return error.TestServerNeverReturned;
+    }
+};
+
+/// A client the test drives: what it received, kept whole.
+const HandClient = struct {
+    connection: u32,
+    received: [4096]u8 = undefined,
+    received_count: u32 = 0,
+
+    fn connect(network: *sim_kernel.Network) HandClient {
+        return .{ .connection = network.client_connect().? };
+    }
+
+    fn send(client: *HandClient, network: *sim_kernel.Network, bytes: []const u8) void {
+        const sent = network.client_send(client.connection, bytes);
+        assert(sent == bytes.len); // the window has room for a test's request
+    }
+
+    fn receive(client: *HandClient, network: *sim_kernel.Network) void {
+        const room = client.received[client.received_count..];
+        client.received_count += network.client_receive(client.connection, room);
+    }
+
+    fn text(client: *const HandClient) []const u8 {
+        return client.received[0..client.received_count];
+    }
+
+    /// Ticks until `done` holds of what it received, or the end is seen.
+    fn await_until(
+        client: *HandClient,
+        scripted: *Scripted,
+        comptime done: fn ([]const u8) bool,
+    ) !void {
+        for (0..scripted.plan.ticks_max) |_| {
+            client.receive(&scripted.kernel.network);
+            if (done(client.text())) return;
+            if (scripted.kernel.network.client_sees_end(client.connection)) return;
+            scripted.tick();
+        }
+        return error.TestClientNeverAnswered;
+    }
+};
+
+/// Responses ending at their head (a 204, the only kind these tests ask
+/// for when they count them), as many as `count`.
+fn heads_at_least(comptime count: u32) fn ([]const u8) bool {
+    return struct {
+        fn done(bytes: []const u8) bool {
+            return std.mem.count(u8, bytes, "\r\n\r\n") >= count;
+        }
+    }.done;
+}
+
+// A close waits for its completion on io_uring, and other fibers run
+// meanwhile: its slot is then neither open nor free. The invariant must hold
+// through it,
+// and the test must see the window open at least once.
+test "sim: a slot whose close is in flight is counted, neither open nor free" {
+    const gpa = std.testing.allocator;
+    var windows: u32 = 0;
+    for (1..33) |seed| {
+        var scripted: Scripted = undefined;
+        try scripted.init(gpa, seed, scripted_plan(2));
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var client: HandClient = .connect(network);
+        client.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        for (0..scripted.plan.ticks_max) |_| {
+            client.receive(network);
+            if (network.client_sees_end(client.connection)) break;
+            scripted.tick();
+            const server = scripted.shard.server orelse continue;
+            windows += @intFromBool(server.closing_count > 0);
+        }
+        try std.testing.expect(std.mem.startsWith(u8, client.text(), "HTTP/1.1 204"));
+        network.client_close(client.connection);
+        try scripted.finish();
+    }
+    try std.testing.expect(windows > 0);
+}
+
+// A drain closes its idle connections before its first wait (the cancel
+// of its acceptor waits for the acceptor's end): otherwise the server runs
+// draining with an idle connection open, which its invariant forbids.
+test "sim: a drain shuts its idle connections before it waits" {
+    const gpa = std.testing.allocator;
+    for (1..33) |seed| {
+        var scripted: Scripted = undefined;
+        try scripted.init(gpa, seed, scripted_plan(2));
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var client: HandClient = .connect(network);
+        client.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
+        try client.await_until(&scripted, heads_at_least(1));
+        scripted.ticks(30); // idle, kept alive
+        try scripted.finish();
+        try std.testing.expectEqual(1, scripted.shard.report.stats.drain_idle);
+        client.receive(network);
+        try std.testing.expect(network.client_sees_end(client.connection));
+        network.client_close(client.connection);
+    }
+}
+
+// A full server evicts its longest-idle connection for a new one. On
+// io_uring the idle wait may already hold the client's next request,
+// taken by the kernel before the fiber runs: served, its body would be read
+// from a socket shut for reading, and a valid POST answered 400. It must
+// close unanswered instead, which the
+// client retries, and the test must reach that race at least once.
+test "sim: an idle connection evicted as its next request arrives closes unanswered" {
+    const gpa = std.testing.allocator;
+    var raced: u64 = 0;
+    for (1..65) |seed| {
+        var scripted: Scripted = undefined;
+        try scripted.init(gpa, seed, scripted_plan(1));
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var idle: HandClient = .connect(network);
+        idle.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
+        try idle.await_until(&scripted, heads_at_least(1));
+        scripted.ticks(20);
+        // In one tick: the idle client's next request, and a new client
+        // the full server must evict for.
+        idle.send(network, "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\n");
+        var fresh: HandClient = .connect(network);
+        fresh.send(network, "GET /s/204 HTTP/1.1\r\nHost: b\r\nConnection: close\r\n\r\n");
+        scripted.ticks(5);
+        if (!network.client_sees_end(idle.connection)) idle.send(network, "abcd");
+        try idle.await_until(&scripted, heads_at_least(2));
+        try fresh.await_until(&scripted, heads_at_least(1));
+        try std.testing.expect(std.mem.startsWith(u8, fresh.text(), "HTTP/1.1 204"));
+        // Its second answer, if any, is the POST's: never a 400.
+        const first_end = std.mem.indexOf(u8, idle.text(), "\r\n\r\n").? + 4;
+        const second = idle.text()[first_end..];
+        try std.testing.expect(second.len == 0 or std.mem.startsWith(u8, second, "HTTP/1.1 200"));
+        raced += scripted.shard.now().stats.shut_with_request;
+        network.client_close(idle.connection);
+        network.client_close(fresh.connection);
+        try scripted.finish();
+    }
+    try std.testing.expect(raced > 0);
+}
