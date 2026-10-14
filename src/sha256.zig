@@ -4,7 +4,7 @@
 //! illegal instruction on a Broadwell or a Skylake droplet. So std's code is
 //! built twice, here (the build's CPU) and in `sha256_shani.zig` (an object
 //! for x86-64-v3 with SHA), and `cpuid`, asked once, picks. 38% of a
-//! handshake's instructions were SHA-256's (measured).
+//! handshake's instructions were SHA-256's.
 //!
 //! The same interface as `std.crypto.hash.sha2.Sha256`, so std's HMAC and
 //! HKDF take it: tls.zig names it for its transcript and suites (its patch).
@@ -193,7 +193,7 @@ fn to_state(std_hash: *const StdSha256) State {
 const testing = std.testing;
 
 /// The paths this CPU can run: the SHA extensions' only where it has them
-/// (a CPU without them has that path tested on one with them).
+/// (a machine without them still tests the others).
 fn paths() []const Path {
     return if (path() == .shani) &.{ .build, .shani } else &.{.build};
 }

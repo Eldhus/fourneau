@@ -364,7 +364,7 @@ pub const Kernel = struct {
         }
         // The kernel takes the count as an int: `std.math.maxInt(u32)`,
         // "all", arrives as -1, and its loop stops after the first waiter
-        // (Evented's futexWake wakes one waiter). So here too.
+        // (upstream's too). So here too.
         const count: i32 = @bitCast(value);
         var woken: i32 = 0;
         // io_uring's wake is strict: a count of 0 wakes none.

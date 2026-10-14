@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Tests build Debug by default: every safety check is on, and Zig's own
     // backend compiles the suite in under a second where LLVM (ReleaseSafe)
-    // takes over twenty (measured). Long simulator sweeps, which
+    // takes over twenty. Long simulator sweeps, which
     // run long rather than compile often, build ReleaseSafe.
     const test_optimize = b.option(
         std.builtin.Optimize,

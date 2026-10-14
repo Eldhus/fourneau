@@ -445,7 +445,7 @@ const Http2Client = struct {
 
 /// One connection keeping `parallel` requests in flight, a new one sent as
 /// each answer ends, as a load generator does: the pattern that once held
-/// finished streams' slots behind the fiber sending (measured).
+/// finished streams' slots behind the fiber sending.
 const Http2Load = struct {
     port: u16,
     parallel: u32,

@@ -3,7 +3,7 @@
 //! pair and shared secret, and for an ECDSA P-256 signature the multiple of
 //! the base point and the inverse of the nonce. Each result equals Zig
 //! std's for the same input, which the tests check; std's took ~310 µs of a
-//! handshake on one machine, these ~40 (measured).
+//! handshake, these ~40.
 //!
 //! The rest of a signature is std's code, copied because std keeps it
 //! private: the nonce from the key and the message, and the scalar
@@ -173,7 +173,7 @@ fn all_zero(bytes: []const u8) bool {
 /// `p256_scalarmulbase`'s table: for each block i (blocksize·i <= 256) and
 /// 1 <= j <= 2^(blocksize-1), the point 2^(blocksize·i)·j·G, affine, each
 /// coordinate in Montgomery form. 5 bits a block: 52 KiB, k·G in 9 µs on
-/// one machine; 4 was 33 KiB and slower, 6 and 7 larger for little (measured).
+/// one machine; 4 was 33 KiB and slower, 6 and 7 larger for little.
 pub const p256_table_blocksize = 5;
 const p256_table_points = 1 << (p256_table_blocksize - 1);
 const p256_table_blocks = 256 / p256_table_blocksize + 1;

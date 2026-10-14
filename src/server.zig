@@ -284,8 +284,8 @@ const Signal = struct {
 
 /// Responses go out whole, so Nagle's algorithm only delays them: with
 /// pipelined requests it held each response after the first for the
-/// client's delayed ACK, 40 ms (50k requests/s at
-/// pipeline 8 before this). A plain system call: `std.Io` has no socket
+/// client's delayed ACK, 40 ms (50k requests/s at pipeline 8 before
+/// this). A plain system call: `std.Io` has no socket
 /// options, and a simulated socket has no Nagle to switch off.
 fn no_delay(fd: std.posix.socket_t) void {
     const linux = std.os.linux;

@@ -66,7 +66,7 @@ const Connection = struct {
     server_shutdown: bool = false,
     /// SHUT_RD only (eviction, a drain's idle close): reads take what is
     /// queued, then see the end, never block; what the client sends after
-    /// is still received and read; writes go on. Measured on Linux 7.2
+    /// is still received and read; writes go on. Measured on Linux 7.2:
     /// shutting reads ends nothing but empty reads.
     server_read_shut: bool = false,
     /// The client sent after a SHUT_RDWR: the kernel reset the connection.

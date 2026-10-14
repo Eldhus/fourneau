@@ -19,7 +19,8 @@
 //! blank line after a `data` field), never by searching the bytes.
 //!
 //! Why our own: on one 8-core machine, oha on two cores saturated at
-//! ~160k requests/s while a six-core server sat at 134% CPU, so it measured oha, not servers.
+//! ~160k requests/s while a six-core server sat at 134% CPU, so it
+//! measured oha, not servers.
 
 const std = @import("std");
 const assert = std.debug.assert;

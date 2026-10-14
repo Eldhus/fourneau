@@ -11,7 +11,7 @@
 # Why our own: Zig 0.17's ReleaseSafe build miscompiles std's inline
 # assembly version (the message pointer is never loaded into rsi), so both
 # our vendored Io.Evented and the simulator crashed in -O safe, which is
-# how production runs (measured). As a real call it needs no
+# how production runs. As a real call it needs no
 # operand constraints: the C calling convention says which registers the
 # caller saves, and this saves the rest (rbx, r12-r15, the MXCSR and x87
 # control words on the stack; rsp, rbp, rip in the context).

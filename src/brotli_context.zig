@@ -135,7 +135,7 @@ fn total(histogram: *const Histogram) u64 {
 
 /// The bits a histogram's literals cost under their own code, with the
 /// code's description: Shannon's bits, plus about four bits a symbol used
-/// and a fixed part for the code's header (an estimate; measured against
+/// and a fixed part for the code's header (an estimate, measured against
 /// written sizes).
 pub fn population_cost(histogram: *const Histogram) f64 {
     const sum: f64 = @floatFromInt(total(histogram));
