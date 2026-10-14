@@ -376,6 +376,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         drain_deadline: u32 = 0,
         free: []u32,
         free_count: u32,
+        /// Slots between `open` and free: their socket's close is in
+        /// flight, and on io_uring a close waits for its completion, so
+        /// other fibers run meanwhile.
+        closing_count: u32 = 0,
         /// Counts free slots: the acceptor waits on it, so a full server
         /// stops accepting and the kernel's backlog holds new clients.
         free_slots: Io.Semaphore,
@@ -637,6 +641,16 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             /// has no end of its own, so a drain ends it at once, and its
             /// client reconnects (EventSource's contract).
             endless: bool,
+            /// Shut while idle (eviction, a drain's start): it serves no
+            /// further request. The shut ends its wait for one, but on
+            /// io_uring the wait may already have its bytes, taken by the
+            /// kernel before the fiber runs again; serving them would read
+            /// a body from a socket shut for reading, where an empty read
+            /// is the end (a 400 for a valid request). Closed unanswered
+            /// instead: the race
+            /// every keep-alive close has, which clients retry (RFC 9112,
+            /// 9.3.1).
+            shut_idle: bool,
             continue_sent: bool,
             keep_alive: bool,
             requests: u32,
@@ -1157,10 +1171,20 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 if (oldest == null or since < server.idle_since[oldest.?]) oldest = @intCast(index);
             }
             const index = oldest orelse return;
-            assert(server.connections[index].open);
-            server.idle_since[index] = 0;
-            server.connections[index].stream.shutdown(server.io, .recv) catch {};
+            server.shut_idle(index);
             server.stats.evicted += 1;
+        }
+
+        /// End an idle connection's wait for its next request: shut for
+        /// reading, its wait returns, and it closes without serving one
+        /// (`Connection.shut_idle`).
+        fn shut_idle(server: *Server, index: u32) void {
+            const connection = &server.connections[index];
+            assert(connection.open);
+            assert(server.idle_since[index] != 0);
+            server.idle_since[index] = 0;
+            connection.shut_idle = true;
+            connection.stream.shutdown(server.io, .recv) catch {};
         }
 
         fn take_slot(server: *Server) u32 {
@@ -1189,6 +1213,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.index = index;
             connection.stream = stream;
             connection.open = true;
+            connection.shut_idle = false;
             connection.recv_used = 0;
             connection.send_used = 0;
             connection.requests = 0;
@@ -1201,10 +1226,15 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn close_connection(server: *Server, connection: *Connection) void {
             _ = connection.flush(); // the last response; the peer may be gone
             assert(connection.open);
+            // Not open from here, so no fiber shuts a descriptor the close
+            // may already have freed for another connection.
             connection.open = false;
             server.deadlines[connection.index] = 0;
             server.idle_since[connection.index] = 0;
-            connection.stream.close(server.io);
+            server.closing_count += 1;
+            connection.stream.close(server.io); // may wait: other fibers run
+            assert(server.closing_count > 0);
+            server.closing_count -= 1;
             server.stats.closed += 1;
             server.give_slot(connection.index);
         }
@@ -1850,6 +1880,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 defer server.idle_since[connection.index] = 0;
                 const got = connection.read_some(window, timeout) catch return false;
                 if (got == 0) return false; // closed, or timed out
+                // Shut while it waited: what it read goes unanswered.
+                if (connection.shut_idle) return false;
                 connection.recv_used += got;
             } else unreachable; // each pass reads a byte or finishes
         }
@@ -1958,12 +1990,13 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         }
 
         /// The slot accounting, for the simulator to check between steps:
-        /// every slot is free or open, and the counters agree.
+        /// every slot is free, open, or closing, and the counters agree.
         pub fn check_invariants(server: *Server) void {
             var open: u32 = 0;
             for (server.connections) |*connection| open += @intFromBool(connection.open);
-            assert(open + server.free_count == server.config.connections_max);
-            assert(server.stats.accepted - server.stats.closed == open);
+            const held = open + server.closing_count;
+            assert(held + server.free_count == server.config.connections_max);
+            assert(server.stats.accepted - server.stats.closed == held);
             for (server.free[0..server.free_count]) |index| {
                 assert(!server.connections[index].open);
                 assert(server.deadlines[index] == 0);
@@ -2042,25 +2075,27 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             return stop.load(.acquire);
         }
 
-        /// Stop accepting: the accept loop is canceled, then the listening
-        /// socket closed, so new clients are refused at once rather than
-        /// queued until the process exits (a successor sharing the socket
-        /// holds its own descriptor, and keeps it). Then close every
-        /// connection idle between requests, by shutting it for reading as
-        /// eviction does. Those in flight close after their response
-        /// (`read_head`, `write_head`); event streams, at the next tick.
+        /// Close every connection idle between requests, by shutting it for
+        /// reading as eviction does; those in flight close after their
+        /// response (`read_head`, `write_head`); event streams, at the next
+        /// tick. Then stop accepting: the accept loop is canceled, then the
+        /// listening socket closed, so new clients are refused at once
+        /// rather than queued until the process exits (a successor sharing
+        /// the socket holds its own descriptor, and keeps it).
+        ///
+        /// The drain's state changes come before its first wait: the cancel
+        /// waits for the acceptor to end and the close for the ring, and
+        /// other fibers run meanwhile. Closed after both, the idle
+        /// connections would run with the server draining and connections
+        /// idle still.
         fn drain_start(server: *Server, acceptor: *Io.Future(void)) void {
             assert(!server.draining);
             server.draining = true;
             const ticks = server.ticks_for(server.config.drain_timeout_ms);
             server.drain_deadline = server.tick + ticks;
-            acceptor.cancel(server.io);
-            server.listener.deinit(server.io);
             for (server.idle_since, 0..) |since, index| {
                 if (since == 0) continue;
-                assert(server.connections[index].open);
-                server.idle_since[index] = 0;
-                server.connections[index].stream.shutdown(server.io, .recv) catch {};
+                server.shut_idle(@intCast(index));
                 server.stats.drain_idle += 1;
             }
             // HTTP/2 connections with streams in flight: GOAWAY, sent with
@@ -2068,6 +2103,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             for (server.connections, 0..) |*connection, index| {
                 if (connection.open and connection.http2) server.h2[index].machine.goaway();
             }
+            acceptor.cancel(server.io);
+            server.listener.deinit(server.io);
         }
 
         /// Each tick of a drain: end the event streams, which have no end
