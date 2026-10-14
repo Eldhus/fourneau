@@ -961,7 +961,8 @@ test "sim_kernel: a seed replays exactly; seeds differ" {
 }
 
 const Cut = struct {
-    /// The second sleep's verdict, and when the first one ended.
+    /// Each sleep's verdict, and when the first one ended.
+    first: Io.Cancelable!void = {},
     second: Io.Cancelable!void = {},
     first_ended_ns: u64 = 0,
 };
@@ -981,20 +982,23 @@ fn cut_run(cut: *Cut) !void {
 }
 
 fn sleep_then_sleep(io: Io, cut: *Cut) void {
-    io.sleep(.fromSeconds(60), .awake) catch {}; // dropped, as roux's `Sleep.millis!` does
+    cut.first = io.sleep(.fromSeconds(60), .awake);
     cut.first_ended_ns = @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
+    io.recancel(); // as roux's `Sleep.millis!` must: it has no error for Roc
     cut.second = io.sleep(.fromSeconds(1), .awake);
 }
 
-// The port's sleep returns when a cancel reaches it, without saying so;
-// the cancel stays pending for the fiber's next wait.
-test "sim_kernel: a cancel cuts a sleep short, and the next wait takes it" {
+// A cancel cuts a sleep short and the sleep says so (the port's once
+// returned as though its time had passed); re-armed,
+// the next wait takes it at once.
+test "sim_kernel: a cancel cuts a sleep short, and the next wait takes it re-armed" {
     for (1..33) |seed| {
         var kernel = try Kernel.init(testing.allocator, seed, test_options);
         defer kernel.deinit(testing.allocator);
         var cut: Cut = .{};
         kernel.start(cut_main, &cut);
         try run_to_exit(&kernel, 100_000);
+        try testing.expectError(error.Canceled, cut.first);
         try testing.expectError(error.Canceled, cut.second);
         try testing.expect(cut.first_ended_ns < std.time.ns_per_s);
         try testing.expect(kernel.stats.canceled >= 1);
@@ -1177,15 +1181,14 @@ fn dropped_run(dropped: *Dropped) !void {
 }
 
 fn sleep_then_write(io: Io, socket: linux.fd_t) Io.Cancelable!usize {
-    io.sleep(.fromSeconds(60), .awake) catch {}; // as `Sleep.millis!` does
+    io.sleep(.fromSeconds(60), .awake) catch io.recancel(); // as `Sleep.millis!` must
     const result = try io.operate(.{ .net_write = .{ .socket_handle = socket, .data = &.{"x"} } });
     return result.net_write catch unreachable; // the window has room
 }
 
-// Under a seed: the drain's cancel, dropped by a
-// sleep, taken by the stream's next write (port_tests.zig has it on a
-// real ring). Before the fix, the port's write asserted here.
-test "sim_kernel: a stream write takes the cancel its fiber's sleep left" {
+// Under a seed: the drain's cancel, cutting a sleep, re-armed, taken by the
+// stream's next write (port_tests.zig has it on a real ring).
+test "sim_kernel: a stream write takes the cancel its fiber's sleep re-armed" {
     for (1..33) |seed| {
         var kernel = try Kernel.init(testing.allocator, seed, test_options);
         defer kernel.deinit(testing.allocator);

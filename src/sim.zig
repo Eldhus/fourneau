@@ -289,6 +289,15 @@ const App = struct {
             request.stream_end() catch {};
             return streamed;
         }
+        // Half the streams go quiet after each round, as roux's live banner
+        // does: seconds of short sleeps that write nothing. A client gone,
+        // or a drain's shutdown, is noticed only at the next write, so such
+        // a handler outlives a drain's start and is asleep when its
+        // deadline cancels it. It cannot
+        // stop at the sleep, as roux's `Sleep.millis!` cannot: it re-arms
+        // the cancel for its next write. The client sees no difference: it
+        // has its round. Which half, the path decides.
+        const quiet = round.bytes % 2 == 0;
         // Bounded only to say so: a send fails once the client is gone.
         for (0..std.math.maxInt(u32)) |_| {
             for (0..round.pieces) |index| {
@@ -298,8 +307,18 @@ const App = struct {
                 request.stream_flush() catch return streamed;
                 app.io.sleep(.fromMilliseconds(10), .awake) catch return streamed;
             }
+            if (quiet) for (0..quiet_sleeps) |_| {
+                app.io.sleep(.fromMilliseconds(10), .awake) catch {
+                    app.io.recancel();
+                    break;
+                };
+            };
         } else unreachable;
     }
+
+    /// A quiet stream's silence between rounds, in 10 ms sleeps: longer
+    /// than most drains' deadlines (`plan_stop`).
+    const quiet_sleeps = 500;
 
     pub fn release(app: *App, response: *Response) void {
         _ = app;

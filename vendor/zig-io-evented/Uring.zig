@@ -520,6 +520,13 @@ const CancelRegion = struct {
             status.awaiting,
         )) {
             @branchHint(.unlikely);
+            // fourneau: the fiber awaits nothing once its region takes the
+            // cancel, as when a region ends (`deinit`). Upstream left it
+            // awaiting the ring, so a later region that looked (another
+            // region of the same operation, or any after a `recancel`)
+            // asserted it awaited nothing, as did every `recancel` after a
+            // canceled operation.
+            _ = cancel_region.fiber.cancel_status.changeAwaiting(status.awaiting, .nothing);
             cancel_region.fiber.cancel_protection.acknowledge();
             cancel_region.status = .unrequested;
             return error.Canceled;
@@ -5094,6 +5101,13 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         .resv = 0,
     };
     ev.yield(null, .nothing);
+    // fourneau: a cancel that cut the sleep short is the caller's to see,
+    // as `std.Io` says (a sleep is a cancelation point; Threaded's returns
+    // `error.Canceled`) and every other operation here does: the region
+    // takes it now. Upstream returned as though the time had passed, so
+    // the cancel stayed pending for the fiber's next operation, whatever
+    // it was, and a handler that slept could not stop at a drain's cut.
+    if (cancel_region.errno() == .CANCELED) _ = try cancel_region.awaitIoUring();
     // Handles SUCCESS as well as clock not available and unexpected
     // errors. The user had a chance to check clock resolution before
     // getting here, which would have reported 0, making this a legal
