@@ -585,9 +585,12 @@ pub const Kernel = struct {
 
     /// Freed, and its completion posted unless the process asked not to
     /// see a success. What is linked behind it starts if it succeeded,
-    /// and is canceled if it did not.
+    /// and is canceled if it did not. An operation that asked not to see
+    /// its success and failed is posted, but the rest of its chain is not:
+    /// Linux's `req_set_fail` turns its CQE_SKIP into SKIP_LINK_CQES.
     fn finish(kernel: *Kernel, index: u32) void {
         var current: ?u32 = index;
+        var chain_unseen = false;
         // Bounded: a chain is at most every operation.
         for (0..kernel.operations.len + 1) |_| {
             const this = current orelse return;
@@ -595,11 +598,12 @@ pub const Kernel = struct {
             assert(operation.state == .pending);
             operation.state = .free;
             const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
-            if (skip and operation.result >= 0) {
+            if (chain_unseen or (skip and operation.result >= 0)) {
                 kernel.stats.skipped += 1;
             } else {
                 kernel.post(operation.user_data, operation.result, 0);
             }
+            if (skip and operation.result < 0) chain_unseen = true;
             current = operation.next;
             const next = operation.next orelse return;
             const behind = &kernel.operations[next];
@@ -1133,6 +1137,61 @@ fn linked_run(linked: *Linked) !void {
     defer stream.close(io);
     const reply = "a response longer than the window";
     linked.count = try Evented.sendThenReceive(io, stream.socket.handle, reply, &linked.got);
+}
+
+const Reset = struct { failed: bool = false };
+
+fn reset_main(reset: *Reset) void {
+    reset_run(reset) catch |err| std.debug.panic("reset: {t}", .{err});
+}
+
+/// The pair to a peer already gone: the send fails, and the pair must
+/// say so rather than wait for a receive whose completion never comes.
+fn reset_run(reset: *Reset) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, 1);
+    defer runtime.deinit();
+    const io = runtime.io();
+    const stream = try accept_one(io);
+    defer stream.close(io);
+    try io.sleep(.fromMilliseconds(50), .awake); // the client resets meanwhile
+    var got: [4]u8 = undefined;
+    _ = Evented.sendThenReceive(io, stream.socket.handle, "the last chunk", &got) catch |err|
+        switch (err) {
+            error.ConnectionResetByPeer => {
+                reset.failed = true;
+                return;
+            },
+            error.Canceled, error.Unexpected => unreachable,
+        };
+    unreachable; // the peer reset before the send
+}
+
+// An event stream's client left; its handler ended the stream, and the
+// server's next read went with the last chunk as the pair. Linux posted
+// the failed send's completion and not the canceled receive's, which the
+// fiber waited for: the connection's slot and descriptor were never freed.
+test "sim_kernel: a send-then-receive to a peer that reset fails, and returns" {
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        _ = kernel.network.listen();
+        var reset: Reset = .{};
+        const connection = kernel.network.client_connect().?;
+        kernel.start(reset_main, &reset);
+        var sent_reset = false;
+        for (0..10_000) |_| {
+            if (kernel.exited()) break;
+            // Once accepted: a reset in the backlog is never accepted.
+            const accepted = kernel.network.connections[connection].state != .backlog;
+            if (!sent_reset and accepted) {
+                kernel.network.client_reset(connection);
+                sent_reset = true;
+            }
+            kernel.step();
+        } else return error.TestProcessNeverExited;
+        try testing.expect(reset.failed);
+    }
 }
 
 test "sim_kernel: a send with MSG_WAITALL, then the receive linked behind it" {

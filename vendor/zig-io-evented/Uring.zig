@@ -6382,8 +6382,12 @@ pub fn sendThenReceive(
     const send = thread.enqueue();
     send.prep_send(socket_handle, bytes, linux.MSG.NOSIGNAL | linux.MSG.WAITALL);
     send.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    // A failed send still completes: to a user_data the idle loop ignores.
-    send.user_data = @backingInt(Completion.Userdata.wakeup);
+    // fourneau: a failed send completes to this fiber too. Linux then posts
+    // no completion for the receive it canceled (`req_set_fail`: the
+    // send's CQE_SKIP becomes SKIP_LINK_CQES), so either way the fiber
+    // gets exactly one: the receive's, or the failed send's. Sent to the
+    // idle loop instead, the fiber waited for good (2026-10-16).
+    send.user_data = @intFromPtr(cancel_region.fiber);
     const receive = thread.enqueue();
     receive.prep_recv(socket_handle, buffer, linux.MSG.NOSIGNAL);
     receive.user_data = @intFromPtr(cancel_region.fiber);
@@ -6392,7 +6396,8 @@ pub fn sendThenReceive(
     const completion = cancel_region.completion();
     return switch (completion.errno()) {
         .SUCCESS => @intCast(completion.result),
-        // The send failed, so the link cancelled the receive.
+        // The send failed (its completion; the receive's is not posted),
+        // or the receive was canceled, or the peer reset it.
         .CANCELED, .CONNRESET, .PIPE, .NOTCONN => error.ConnectionResetByPeer,
         else => |err| unexpectedErrno(err),
     };
