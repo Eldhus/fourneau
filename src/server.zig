@@ -361,6 +361,12 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// The tick at which each slot's current wait expires; 0 when it is
         /// not waiting. The timekeeper's array.
         deadlines: []u32,
+        /// The tick by which each slot's current phase (a TLS handshake, a
+        /// request's head) must end, however its bytes trickle in; 0
+        /// outside one. Every wait in a phase is armed no later than it, so
+        /// a client sending a byte just inside each read's timeout
+        /// (Slowloris) holds its slot for one phase's timeout, not hours.
+        phase_deadlines: []u32,
         /// The tick since which each slot has waited, idle, for its next
         /// request (its last response sent); 0 when it is not idle. When
         /// every slot is taken, the oldest is closed to admit a new client.
@@ -989,6 +995,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 .listener = listener,
                 .connections = try gpa.alloc(Connection, count),
                 .deadlines = try gpa.alloc(u32, count),
+                .phase_deadlines = try gpa.alloc(u32, count),
                 .idle_since = try gpa.alloc(u32, count),
                 .ticks_max = undefined,
                 .free = try gpa.alloc(u32, count),
@@ -1015,6 +1022,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 const table = stride(Header, headers, config.headers_max, index);
                 connection.parser = http1_head.Parser.init(config.head_limits(), table);
                 server.deadlines[index] = 0;
+                server.phase_deadlines[index] = 0;
                 server.idle_since[index] = 0;
                 server.free[index] = count - 1 - index; // slot 0 is used first
             }
@@ -1084,6 +1092,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         pub fn deinit(server: *Server, gpa: std.mem.Allocator) void {
             gpa.free(server.connections);
             gpa.free(server.deadlines);
+            gpa.free(server.phase_deadlines);
             gpa.free(server.idle_since);
             gpa.free(server.free);
             slab_free(gpa, u8, server.recv_slab);
@@ -1233,6 +1242,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             // may already have freed for another connection.
             connection.open = false;
             server.deadlines[connection.index] = 0;
+            server.phase_deadlines[connection.index] = 0;
             server.idle_since[connection.index] = 0;
             server.closing_count += 1;
             connection.stream.close(server.io); // may wait: other fibers run
@@ -1276,6 +1286,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 connection.scratch[0..half],
                 connection.scratch[half..],
             );
+            // The handshake is bounded as a whole, as a head is.
+            server.phase_start(connection.index, server.config.head_timeout_ms);
+            defer server.phase_end(connection.index);
             const socket = connection.stream.socket.handle;
             const protocols: tls.Protocols = if (server.config.http2 == null)
                 .http1
@@ -1317,9 +1330,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
         /// A client that opens with HTTP/2's preface (prior knowledge):
         /// read until it can tell. What was read stays in `recv` for
-        /// whichever protocol follows.
+        /// whichever protocol follows. Its phase goes on into HTTP/1.1's
+        /// first head: one timeout for both.
         fn sniff_http2(server: *Server, connection: *Connection) bool {
             const preface = http2.preface;
+            server.phase_start(connection.index, server.config.head_timeout_ms);
             // Each pass reads a byte at least, or decides.
             for (0..preface.len + 1) |_| {
                 const length = @min(connection.recv_used, preface.len);
@@ -1340,6 +1355,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// (`h2_flush`). It ends when the client or the server does, after
         /// every stream's handler has returned.
         fn serve_http2(server: *Server, connection: *Connection) void {
+            // The preface's phase ends: HTTP/2's waits have their own.
+            server.phase_end(connection.index);
             const h2 = &server.h2[connection.index];
             h2.machine.start();
             h2.flushing = false;
@@ -1853,9 +1870,12 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         }
 
         /// Read and parse until a whole head is here. Answers a refusal
-        /// itself; false means close.
+        /// itself; false means close. The head is a phase: from its first
+        /// byte (or once nothing is owed the client), all its reads end by
+        /// one `head_timeout_ms`, however its bytes trickle in.
         fn read_head(server: *Server, connection: *Connection) bool {
             connection.parser.reset();
+            defer server.phase_end(connection.index);
             const reads_max = server.config.recv_bytes() + 1;
             for (0..reads_max) |_| {
                 const buffer = connection.recv[0..connection.recv_used];
@@ -1877,6 +1897,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 if (idle and server.draining) return false;
                 const config = server.config;
                 const timeout = if (idle) config.idle_timeout_ms else config.head_timeout_ms;
+                // Responses still owed go out first, under the sender's
+                // deadline: the head's time is the client's alone.
+                const owed = connection.send_used > 0;
+                const phased = server.phase_deadlines[connection.index] != 0;
+                if (!idle and !owed and !phased) server.phase_start(connection.index, timeout);
                 const window = connection.recv[connection.recv_used..];
                 assert(window.len > 0); // the parser refuses before the buffer fills
                 if (idle) server.idle_since[connection.index] = server.tick;
@@ -2006,10 +2031,18 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             for (server.free[0..server.free_count]) |index| {
                 assert(!server.connections[index].open);
                 assert(server.deadlines[index] == 0);
+                assert(server.phase_deadlines[index] == 0);
             }
-            for (server.connections, server.deadlines) |*connection, deadline| {
+            for (server.connections, server.deadlines, server.phase_deadlines) |
+                *connection,
+                deadline,
+                phase,
+            | {
                 if (deadline != 0) assert(connection.open);
                 assert(deadline <= server.tick + server.ticks_max);
+                // A phase bounds every wait in it: none outlives it.
+                if (phase != 0) assert(connection.open);
+                if (phase != 0) assert(deadline <= phase);
             }
             // A drain closed every idle connection, and none waits for a
             // next request since.
@@ -2035,10 +2068,25 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             return timeout_ms / server.config.tick_ms + 2;
         }
 
+        /// The wait's own deadline, or its phase's if that comes first.
         fn arm(server: *Server, index: u32, timeout_ms: u32) void {
             const ticks = server.ticks_for(timeout_ms);
             assert(ticks <= server.ticks_max);
-            server.deadlines[index] = server.tick + ticks;
+            const own = server.tick + ticks;
+            const phase = server.phase_deadlines[index];
+            server.deadlines[index] = if (phase == 0) own else @min(own, phase);
+            assert(server.deadlines[index] != 0);
+        }
+
+        /// A phase starts: its waits, together, last at most `timeout_ms`.
+        fn phase_start(server: *Server, index: u32, timeout_ms: u32) void {
+            assert(server.phase_deadlines[index] == 0);
+            assert(server.deadlines[index] == 0); // between two waits
+            server.phase_deadlines[index] = server.tick + server.ticks_for(timeout_ms);
+        }
+
+        fn phase_end(server: *Server, index: u32) void {
+            server.phase_deadlines[index] = 0;
         }
 
         fn disarm(server: *Server, index: u32) void {

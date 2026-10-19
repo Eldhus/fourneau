@@ -893,6 +893,52 @@ test "sim: a drain shuts its idle connections before it waits" {
     }
 }
 
+// Slowloris (2009): a head sent a byte at a time, each just inside the head's
+// timeout, so a timeout per read never fires. A server alone on the internet
+// is taken down by enough of them, each holding a slot. The head's timeout
+// bounds the whole head: the slot is free one timeout after its first byte,
+// whatever the pace.
+test "sim: a head trickled a byte at a time is cut at one head's timeout" {
+    const gpa = std.testing.allocator;
+    const value: [512]u8 = @splat('a');
+    const head = "GET / HTTP/1.1\r\nHost: a\r\nX-Slow: " ++ value;
+    for (1..17) |seed| {
+        var plan = scripted_plan(1);
+        plan.server.head_timeout_ms = 500;
+        var scripted: Scripted = undefined;
+        try scripted.init(gpa, seed, plan);
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var client: HandClient = .connect(network);
+        // A byte each 400 ticks: one timeout per read never fires.
+        var sent: u32 = 0;
+        var cut_tick: ?u64 = null;
+        for (0..scripted.plan.ticks_max) |tick| {
+            if (tick % 400 == 0 and sent < head.len) {
+                client.send(network, head[sent..][0..1]);
+                sent += 1;
+            }
+            client.receive(network);
+            if (network.client_sees_end(client.connection)) {
+                cut_tick = tick;
+                break;
+            }
+            scripted.tick();
+        }
+        // One timeout, in ticks of the server's clock (each up to a tick
+        // and the kernel's latency late), with room for the shutdown.
+        const server = plan.server;
+        const server_ticks = server.head_timeout_ms / server.tick_ms + 2;
+        const bound = server_ticks * (server.tick_ms + plan.kernel.latency_ticks_max + 1) + 64;
+        try std.testing.expect(cut_tick != null);
+        try std.testing.expect(cut_tick.? <= bound);
+        try std.testing.expectEqual(1, scripted.shard.now().stats.timeouts);
+        try std.testing.expectEqual(0, client.received_count); // cut, not answered
+        network.client_close(client.connection);
+        try scripted.finish();
+    }
+}
+
 // A full server evicts its longest-idle connection for a new one. On
 // io_uring the idle wait may already hold the client's next request,
 // taken by the kernel before the fiber runs: served, its body would be read
