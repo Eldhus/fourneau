@@ -964,6 +964,55 @@ test "sim_kernel: a seed replays exactly; seeds differ" {
     try testing.expect(different);
 }
 
+const Waiters = struct {
+    const count = 3;
+    word: u32 = 0,
+    woken: u32 = 0,
+};
+
+fn waiters_main(waiters: *Waiters) void {
+    waiters_run(waiters) catch |err| std.debug.panic("waiters: {t}", .{err});
+}
+
+fn waiters_run(waiters: *Waiters) !void {
+    var runtime: Evented = undefined;
+    try process_init(&runtime, Waiters.count);
+    defer runtime.deinit();
+    const io = runtime.io();
+    var group: Io.Group = .init;
+    for (0..Waiters.count) |_| try group.concurrent(io, wait_one, .{ io, waiters });
+    // Main waits, so every fiber runs to its wait.
+    try io.sleep(.fromMilliseconds(5), .awake);
+    assert(waiters.woken == 0);
+    @atomicStore(u32, &waiters.word, 1, .monotonic);
+    io.futexWake(u32, &waiters.word, std.math.maxInt(u32)); // "all", as `Signal.notify`'s
+    try group.await(io);
+}
+
+fn wait_one(io: Io, waiters: *Waiters) Io.Cancelable!void {
+    // A wait may end spuriously: each looks at the word again, a few times at most.
+    for (0..4) |_| {
+        if (@atomicLoad(u32, &waiters.word, .monotonic) != 0) break;
+        try io.futexWait(u32, &waiters.word, 0);
+    } else unreachable;
+    waiters.woken += 1;
+}
+
+// A wake of "all" wakes every waiter: the kernel takes the count as an
+// int, so the port must not pass `std.math.maxInt(u32)` as it is (-1,
+// one waiter).
+test "sim_kernel: a wake of all wakes every fiber waiting on the word" {
+    for (1..33) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        var waiters: Waiters = .{};
+        kernel.start(waiters_main, &waiters);
+        try run_to_exit(&kernel, 1000);
+        try testing.expectEqual(Waiters.count, waiters.woken);
+        try testing.expectEqual(Waiters.count, kernel.stats.futex_woken);
+    }
+}
+
 const Cut = struct {
     /// Each sleep's verdict, and when the first one ended.
     first: Io.Cancelable!void = {},

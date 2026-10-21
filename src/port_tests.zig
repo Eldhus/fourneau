@@ -52,3 +52,46 @@ fn sleep_then_write(io: Io, socket: linux.fd_t) Io.Cancelable!usize {
     assert(written == 1);
     return written;
 }
+
+const Waiters = struct {
+    const count = 3;
+    word: u32 = 0,
+    woken: u32 = 0,
+};
+
+// A wake of "all" (`Signal.notify`'s, an HTTP/2 connection's streams on
+// one word) wakes every waiter: the kernel takes the count as an int, and
+// `std.math.maxInt(u32)` as it is arrives as -1, one waiter. A wake that
+// left some asleep is followed by one that cannot, so the test fails
+// rather than hangs.
+test "port: a wake of all wakes every fiber waiting on the word" {
+    var runtime: Evented = undefined;
+    try listen.runtime_init(Evented, &runtime, std.testing.allocator, .{
+        .thread_limit = 0, // this thread only: the tasks run when main waits
+        .fibers_max = Waiters.count,
+    });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var waiters: Waiters = .{};
+    var group: Io.Group = .init;
+    for (0..Waiters.count) |_| try group.concurrent(io, wait_one, .{ io, &waiters });
+    // Main waits, so every task runs to its wait.
+    try io.sleep(.fromMilliseconds(1), .awake);
+    assert(waiters.woken == 0);
+    @atomicStore(u32, &waiters.word, 1, .monotonic);
+    io.futexWake(u32, &waiters.word, std.math.maxInt(u32));
+    try io.sleep(.fromMilliseconds(10), .awake);
+    const woken = waiters.woken;
+    io.futexWake(u32, &waiters.word, std.math.maxInt(i32));
+    try group.await(io);
+    try std.testing.expectEqual(Waiters.count, woken);
+}
+
+fn wait_one(io: Io, waiters: *Waiters) Io.Cancelable!void {
+    // A wait may end spuriously: each looks at the word again, a few times at most.
+    for (0..4) |_| {
+        if (@atomicLoad(u32, &waiters.word, .monotonic) != 0) break;
+        try io.futexWait(u32, &waiters.word, 0);
+    } else unreachable;
+    waiters.woken += 1;
+}

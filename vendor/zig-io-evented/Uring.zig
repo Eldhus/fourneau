@@ -2200,7 +2200,10 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
         .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
         .ioprio = 0,
         .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-        .off = max_waiters,
+        // fourneau: the kernel takes the count as an int, so "all"
+        // (`std.math.maxInt(u32)`) arrived as -1 and woke one waiter;
+        // clamped as std's Threaded does.
+        .off = @min(max_waiters, std.math.maxInt(i32)),
         .addr = @intFromPtr(ptr),
         .len = 0,
         .rw_flags = 0,
