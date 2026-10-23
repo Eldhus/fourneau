@@ -74,10 +74,6 @@ pub const Config = struct {
         config.head_limits().assert_valid();
         // Every connection's scratch starts aligned (`scratch_align`).
         assert(config.scratch_bytes_max % scratch_align == 0);
-        // Each slab is one mapping of at most 4 GiB (`u32` strides).
-        assert(@as(u64, config.connections_max) * config.scratch_bytes_max <= std.math.maxInt(u32));
-        assert(@as(u64, config.connections_max) * config.send_bytes_max <= std.math.maxInt(u32));
-        assert(@as(u64, config.connections_max) * config.recv_bytes() <= std.math.maxInt(u32));
     }
 
     /// The fibers a server runs at once, at most: one per connection slot
@@ -495,10 +491,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 @max(config.body_timeout_ms, config.send_timeout_ms),
             );
             server.ticks_max = server.ticks_for(timeout_ms_max);
-            const recv = try slab_alloc(gpa, u8, count * config.recv_bytes());
-            const send = try slab_alloc(gpa, u8, count * config.send_bytes_max);
-            const scratch = try slab_alloc(gpa, u8, count * config.scratch_bytes_max);
-            const headers = try slab_alloc(gpa, Header, count * config.headers_max);
+            const slots: usize = count;
+            const recv = try slab_alloc(gpa, u8, slots * config.recv_bytes());
+            const send = try slab_alloc(gpa, u8, slots * config.send_bytes_max);
+            const scratch = try slab_alloc(gpa, u8, slots * config.scratch_bytes_max);
+            const headers = try slab_alloc(gpa, Header, slots * config.headers_max);
             for (server.connections, 0..) |*connection, index_usize| {
                 const index: u32 = @intCast(index_usize);
                 connection.* = undefined;

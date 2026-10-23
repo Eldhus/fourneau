@@ -89,6 +89,41 @@ test "port: a wake of all wakes every fiber waiting on the word" {
     try std.testing.expectEqual(Waiters.count, woken);
 }
 
+const Parking = struct {
+    parked: [2]Evented.Parked = .{ .{}, .{} },
+    resumed: u32 = 0,
+};
+
+// Two fibers park with no ring operation; a third unparks both, and both
+// run on: what a database connection's reader does for its waiting
+// requests.
+test "port: a fiber unparks fibers parked on its thread" {
+    var runtime: Evented = undefined;
+    try listen.runtime_init(Evented, &runtime, std.testing.allocator, .{
+        .thread_limit = 0,
+        .fibers_max = 3,
+    });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var parking: Parking = .{};
+    var group: Io.Group = .init;
+    for (0..2) |index| try group.concurrent(io, park_one, .{ io, &parking, index });
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(0, parking.resumed);
+    try group.concurrent(io, unpark_all, .{ io, &parking });
+    try group.await(io);
+    try std.testing.expectEqual(2, parking.resumed);
+}
+
+fn park_one(io: Io, parking: *Parking, index: usize) Io.Cancelable!void {
+    Evented.park(io, &parking.parked[index]);
+    parking.resumed += 1;
+}
+
+fn unpark_all(io: Io, parking: *Parking) Io.Cancelable!void {
+    for (&parking.parked) |*parked| assert(Evented.unpark(io, parked));
+}
+
 /// The server's application in the test below: `/echo` answers its body,
 /// anything else "hello".
 const EchoApp = struct {

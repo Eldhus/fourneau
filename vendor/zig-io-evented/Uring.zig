@@ -6363,6 +6363,39 @@ fn netAccept(
 
 const stream_iovecs_max = 16;
 
+/// fourneau: a fiber waiting for another fiber of its own thread to ready
+/// it (`park`, `unpark`). A futex costs a submission and an enter to wake
+/// and a submission and a completion to wait; fibers that hand work to each
+/// other on one thread (a database connection's reader and the requests
+/// waiting on it) need neither: a pointer and the ready queue.
+pub const Parked = struct {
+    fiber: ?*anyopaque = null,
+};
+
+/// fourneau: wait, with no ring operation, until a fiber of this thread
+/// calls `unpark` on `parked`. Not cancelable: the unparking fiber must
+/// come.
+pub fn park(io_instance: Io, parked: *Parked) void {
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    const fiber = Thread.current().currentFiber();
+    assert(parked.fiber == null);
+    parked.fiber = fiber;
+    ev.yield(null, .nothing);
+    assert(parked.fiber == null); // `unpark` cleared it before readying us
+}
+
+/// fourneau: ready the fiber parked on `parked`, on this thread; it runs
+/// once this one waits. False: none is parked there (yet).
+pub fn unpark(io_instance: Io, parked: *Parked) bool {
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    const opaque_fiber = parked.fiber orelse return false;
+    parked.fiber = null;
+    const fiber: *Fiber = @ptrCast(@alignCast(opaque_fiber));
+    assert(fiber.status.queue_next == null);
+    _ = ev.schedule(Thread.current(), .{ .head = fiber, .tail = fiber });
+    return true;
+}
+
 /// fourneau: send all of `bytes`, then receive into `buffer`, as one
 /// submission: the receive is linked behind the send and starts only once
 /// every byte is sent (MSG_WAITALL), and a sent send posts no completion.
