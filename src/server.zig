@@ -178,6 +178,17 @@ pub const Config = struct {
 
 const recv_window_bytes = 4096;
 
+/// A full server's eviction closes this many of its longest idle at once,
+/// at most: a scan of every slot admits a batch of new clients.
+const evict_batch_max = 64;
+
+/// An eighth of the slots, up to `evict_batch_max`: a small server closes
+/// one at a time, as few idle clients as it can.
+fn evict_batch(connections_max: u32) u32 {
+    assert(connections_max > 0);
+    return std.math.clamp(connections_max / 8, 1, evict_batch_max);
+}
+
 /// A request's scratch starts at a multiple of this, over either protocol:
 /// an application may lay a table of its own there (roux's host does).
 pub const scratch_align = 16;
@@ -389,6 +400,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// flight, and on io_uring a close waits for its completion, so
         /// other fibers run meanwhile.
         closing_count: u32 = 0,
+        /// Slots shut while idle (`shut_idle`) and not yet free: each frees
+        /// as its fiber closes.
+        shut_count: u32 = 0,
         /// Counts free slots: the acceptor waits on it, so a full server
         /// stops accepting and the kernel's backlog holds new clients.
         free_slots: Io.Semaphore,
@@ -1154,7 +1168,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                         continue;
                     },
                 };
-                if (server.free_count == 0) server.evict_idle();
+                // Slots shut idle free as they close: wait for those rather
+                // than shut more, so eviction stays with the longest idle.
+                if (server.free_count == 0 and server.shut_count == 0) server.evict_idle();
                 server.free_slots.wait(server.io) catch {
                     // Canceled while the server was full: never served.
                     stream.close(server.io);
@@ -1171,20 +1187,51 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             } else unreachable;
         }
 
-        /// Close the connection idle longest, if any is: the fiber waiting
-        /// on it reads 0 and closes, which frees its slot. One scan of one
-        /// array, as the timekeeper's. Only the read side is shut: a
-        /// response still being sent (the linked send-then-receive) is sent
-        /// whole before the read returns 0, so none is ever cut short.
+        /// Close the connections idle longest, a batch of them
+        /// (`evict_batch`), if any are: each fiber waiting on one reads 0
+        /// and closes, which frees its slot. One scan of one array, as the
+        /// timekeeper's, keeping the batch's longest idle as it goes. Only
+        /// the read side is shut: a response still being sent (the linked
+        /// send-then-receive) is sent whole before the read returns 0, so
+        /// none is ever cut short.
+        ///
+        /// A batch, not one: with more clients than slots, each coming back
+        /// for its next request on a new connection, one per scan of every
+        /// slot made the acceptor take one client per scan and wait for its
+        /// close (32,768 slots: 104 us of CPU per request against 38 with
+        /// every client held, p95 500 ms against 1; 2026-10-23).
         fn evict_idle(server: *Server) void {
-            var oldest: ?u32 = null;
-            for (server.idle_since, 0..) |since, index| {
+            assert(server.free_count == 0);
+            assert(server.shut_count == 0);
+            const batch_max = evict_batch(server.config.connections_max);
+            var batch: [evict_batch_max]u32 = undefined;
+            var count: u32 = 0;
+            // Where in the batch the most recently idle is: a longer idle
+            // takes its place.
+            var newest: u32 = 0;
+            for (server.idle_since, 0..) |since, index_usize| {
                 if (since == 0) continue;
-                if (oldest == null or since < server.idle_since[oldest.?]) oldest = @intCast(index);
+                const index: u32 = @intCast(index_usize);
+                if (count < batch_max) {
+                    batch[count] = index;
+                    if (since > server.idle_since[batch[newest]]) newest = count;
+                    count += 1;
+                    continue;
+                }
+                if (since >= server.idle_since[batch[newest]]) continue;
+                batch[newest] = index;
+                newest = 0;
+                for (batch[0..count], 0..) |held, position| {
+                    if (server.idle_since[held] > server.idle_since[batch[newest]]) {
+                        newest = @intCast(position);
+                    }
+                }
             }
-            const index = oldest orelse return;
-            server.shut_idle(index);
-            server.stats.evicted += 1;
+            assert(count <= batch_max);
+            for (batch[0..count]) |index| {
+                server.shut_idle(index);
+                server.stats.evicted += 1;
+            }
         }
 
         /// End an idle connection's wait for its next request: shut for
@@ -1196,6 +1243,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             assert(server.idle_since[index] != 0);
             server.idle_since[index] = 0;
             connection.shut_idle = true;
+            server.shut_count += 1;
             connection.stream.shutdown(server.io, .recv) catch {};
         }
 
@@ -1249,6 +1297,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             assert(server.closing_count > 0);
             server.closing_count -= 1;
             server.stats.closed += 1;
+            if (connection.shut_idle) {
+                assert(server.shut_count > 0);
+                server.shut_count -= 1;
+            }
             server.give_slot(connection.index);
         }
 
@@ -2027,6 +2079,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             for (server.connections) |*connection| open += @intFromBool(connection.open);
             const held = open + server.closing_count;
             assert(held + server.free_count == server.config.connections_max);
+            assert(server.shut_count <= held);
             assert(server.stats.accepted - server.stats.closed == held);
             for (server.free[0..server.free_count]) |index| {
                 assert(!server.connections[index].open);

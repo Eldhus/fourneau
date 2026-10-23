@@ -978,3 +978,43 @@ test "sim: an idle connection evicted as its next request arrives closes unanswe
     }
     try std.testing.expect(raced > 0);
 }
+
+// A full server closes a batch of its longest idle for new clients, not one
+// per accept: with more clients than slots, each returning on a new
+// connection, a scan of every slot per client was most of the shard's time.
+// Sixteen slots evict two at a time: one new client closes the two longest
+// idle, and the next takes the second slot without another eviction.
+test "sim: a full server evicts its longest idle, a batch at a time" {
+    const gpa = std.testing.allocator;
+    for (1..17) |seed| {
+        var plan = scripted_plan(16);
+        plan.kernel.network.connections_max = 24;
+        plan.kernel.network.backlog_max = 24;
+        var scripted: Scripted = undefined;
+        try scripted.init(gpa, seed, plan);
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var idle: [16]HandClient = undefined;
+        for (&idle) |*client| {
+            client.* = .connect(network);
+            client.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
+            try client.await_until(&scripted, heads_at_least(1));
+            // The next is idle since a later tick than this one.
+            scripted.ticks(20);
+        }
+        var fresh: [2]HandClient = undefined;
+        for (&fresh) |*client| {
+            client.* = .connect(network);
+            client.send(network, "GET /s/204 HTTP/1.1\r\nHost: b\r\n\r\n");
+            try client.await_until(&scripted, heads_at_least(1));
+            try std.testing.expect(std.mem.startsWith(u8, client.text(), "HTTP/1.1 204"));
+            try std.testing.expectEqual(2, scripted.shard.now().stats.evicted);
+        }
+        for (&idle, 0..) |*client, index| {
+            try std.testing.expectEqual(index < 2, network.client_sees_end(client.connection));
+            network.client_close(client.connection);
+        }
+        for (&fresh) |*client| network.client_close(client.connection);
+        try scripted.finish();
+    }
+}
