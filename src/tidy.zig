@@ -33,24 +33,9 @@ pub const Tree = struct {
 const trees = [_]Tree{
     .{
         .dir = "src",
-        // curves.zig, sha256.zig: modules of their own (tls.zig imports
-        // them), their tests artifacts of their own; curves_table.zig: `zig
-        // build curves-table`; sha256_shani.zig: an object of its own target;
-        // kernel.zig: the port's `kernel` module (vendor imports it), no tests;
-        // simulator.zig: the simulator's compilation, the port's kernel there,
-        // whose tests (sim_kernel.zig's, sim_network.zig's, sim.zig's) are
-        // that compilation's.
-        .roots = &.{
-            "tests.zig",        "curves.zig",       "sha256.zig",
-            "curves_table.zig", "sha256_shani.zig", "kernel.zig",
-            "simulator.zig",
-        },
-        .untested = &.{
-            "tests.zig",        "curves.zig",       "sha256.zig",
-            "curves_table.zig", "sha256_shani.zig", "kernel.zig",
-            "simulator.zig",    "sim_kernel.zig",   "sim_network.zig",
-            "sim.zig",
-        },
+        // kernel.zig: the port's `kernel` module (vendor imports it), no tests.
+        .roots = &.{ "tests.zig", "kernel.zig" },
+        .untested = &.{ "tests.zig", "kernel.zig" },
         .generated = &.{},
         .interfaces = &.{},
     },

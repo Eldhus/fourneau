@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const http_date = @import("http_date.zig");
-const Prng = @import("prng.zig").Prng;
 const assert = std.debug.assert;
 
 pub const Header = struct {
@@ -21,8 +20,6 @@ pub const Header = struct {
 pub const Framing = union(enum) {
     /// A body of exactly this many bytes follows (zero is a body too).
     length: u64,
-    /// A body in chunks follows, its end unknown yet (a stream).
-    chunked,
     /// No body, and no length: 1xx, 204 and 304 (RFC 9110 §6.4.1).
     none,
 };
@@ -34,20 +31,7 @@ pub const Head = struct {
     /// False closes the connection after this response.
     keep_alive: bool,
     date: *const [http_date.length]u8,
-    /// The connection is HTTPS: the head says to keep to it
-    /// (`Strict-Transport-Security`). Never on plain HTTP, where a client
-    /// must ignore it (RFC 6797 §7.2, §8.1).
-    secure: bool,
 };
-
-/// HTTPS only, for a year, on every response over TLS. The server's own:
-/// one policy for the whole site, whatever the application answers. No
-/// `includeSubDomains`: a server speaks for its own host, not its
-/// siblings (fourneau.y2kbugger.com must not bind y2kbugger.com's
-/// others). Browsers ignore it for an IP address (RFC 6797 §8.1.1).
-pub const strict_transport_security = "max-age=31536000";
-const strict_transport_security_line =
-    "Strict-Transport-Security: " ++ strict_transport_security ++ "\r\n";
 
 pub const Refusal = enum {
     status_invalid,
@@ -92,11 +76,9 @@ pub fn write(buffer: []u8, head: Head) Result {
             writer.number(length);
             writer.text("\r\n");
         },
-        .chunked => writer.text("Transfer-Encoding: chunked\r\n"),
         .none => {},
     }
     if (!head.keep_alive) writer.text("Connection: close\r\n");
-    if (head.secure) writer.text(strict_transport_security_line);
     for (head.headers) |header| {
         writer.text(header.name);
         writer.text(": ");
@@ -108,54 +90,6 @@ pub fn write(buffer: []u8, head: Head) Result {
     assert(writer.used <= buffer.len);
     assert(std.mem.endsWith(u8, buffer[0..writer.used], "\r\n\r\n"));
     return .{ .bytes = @intCast(writer.used) };
-}
-
-// --- chunks (RFC 9112 §7.1): a streamed body ---------------------------------
-
-/// The longest chunk size line: 16 hex digits (a u64) and CRLF.
-pub const chunk_size_line_bytes_max = 16 + 2;
-/// What follows a chunk's data.
-pub const chunk_tail = "\r\n";
-/// The last chunk, with no trailer section: the end of a streamed body.
-pub const chunk_last = "0\r\n\r\n";
-
-/// A chunk's size line: lowercase hex, no extensions, no leading zeros.
-/// Zero is the last chunk and never a size line: a data chunk is not empty.
-pub fn chunk_size_line(buffer: *[chunk_size_line_bytes_max]u8, size: u64) []const u8 {
-    assert(size > 0);
-    const digits = "0123456789abcdef";
-    var index: usize = chunk_size_line_bytes_max - 2;
-    var rest = size;
-    for (0..16) |_| {
-        index -= 1;
-        buffer[index] = digits[@intCast(rest & 0xf)];
-        rest >>= 4;
-        if (rest == 0) break;
-    } else unreachable; // a u64 has at most 16 hex digits
-    buffer[chunk_size_line_bytes_max - 2 ..][0..2].* = "\r\n".*;
-    const line = buffer[index..];
-    assert(line.len >= 3);
-    assert(line[0] != '0');
-    return line;
-}
-
-test "http1: response: chunk size lines" {
-    var buffer: [chunk_size_line_bytes_max]u8 = undefined;
-    try testing.expectEqualStrings("1\r\n", chunk_size_line(&buffer, 1));
-    try testing.expectEqualStrings("3a\r\n", chunk_size_line(&buffer, 58));
-    try testing.expectEqualStrings("1000\r\n", chunk_size_line(&buffer, 4096));
-    try testing.expectEqualStrings(
-        "ffffffffffffffff\r\n",
-        chunk_size_line(&buffer, std.math.maxInt(u64)),
-    );
-    // Every size reads back as itself, through the strict parse a client does.
-    var prng = Prng.init(1);
-    for (0..1000) |_| {
-        const size = prng.next() >> @intCast(prng.int_less_than(u64, 64)) | 1;
-        const line = chunk_size_line(&buffer, size);
-        const parsed = try std.fmt.parseInt(u64, line[0 .. line.len - 2], 16);
-        try testing.expectEqual(size, parsed);
-    }
 }
 
 /// 1xx, 204 No Content and 304 Not Modified carry no body (RFC 9110
@@ -174,7 +108,6 @@ const reserved_names = [_][]const u8{
     "te",
     "trailer",
     "date",
-    "strict-transport-security",
 };
 
 /// An application's header the server will not send (HTTP/2's heads too).
@@ -339,20 +272,15 @@ test "http1: response: a simple response" {
             .framing = .{ .length = 5 },
             .keep_alive = true,
             .date = test_date,
-            .secure = false,
         },
     );
 }
 
-test "http1: response: closing, chunked, no body, unknown status" {
+test "http1: response: closing, no body, unknown status" {
     try expect_written(
         "HTTP/1.1 404 Not Found\r\nDate: " ++ test_date ++ "\r\nContent-Length: 0\r\n" ++
             "Connection: close\r\n\r\n",
         bare(404, .{ .length = 0 }, false),
-    );
-    try expect_written(
-        "HTTP/1.1 200 OK\r\nDate: " ++ test_date ++ "\r\nTransfer-Encoding: chunked\r\n\r\n",
-        bare(200, .chunked, true),
     );
     try expect_written(
         "HTTP/1.1 204 No Content\r\nDate: " ++ test_date ++ "\r\n\r\n",
@@ -371,7 +299,6 @@ test "http1: response: refusals" {
         .framing = .{ .length = 0 },
         .keep_alive = true,
         .date = test_date,
-        .secure = false,
     };
     var head = ok;
     head.status = 99;
@@ -406,22 +333,6 @@ test "http1: response: refusals" {
     }
 }
 
-test "http1: response: HTTPS keeps to HTTPS, and only the server says so" {
-    var head = bare(200, .{ .length = 0 }, true);
-    head.secure = true;
-    try expect_written(
-        "HTTP/1.1 200 OK\r\nDate: " ++ test_date ++ "\r\nContent-Length: 0\r\n" ++
-            "Strict-Transport-Security: max-age=31536000\r\n\r\n",
-        head,
-    );
-    // Plain HTTP never carries it (RFC 6797 §7.2): see the simple response.
-    // An application's own would be a second policy, or a weaker one.
-    head.headers = &.{.{ .name = "strict-transport-security", .value = "max-age=0" }};
-    try expect_refused(.header_reserved, head);
-    head.secure = false;
-    try expect_refused(.header_reserved, head);
-}
-
 test "http1: response: a head that does not fit is refused" {
     var buffer: [40]u8 = undefined;
     const result = write(&buffer, .{
@@ -430,7 +341,6 @@ test "http1: response: a head that does not fit is refused" {
         .framing = .{ .length = 0 },
         .keep_alive = true,
         .date = test_date,
-        .secure = false,
     });
     try testing.expectEqual(Refusal.too_large, result.refusal);
 }
@@ -442,7 +352,6 @@ fn bare(status: u16, framing: Framing, keep_alive: bool) Head {
         .framing = framing,
         .keep_alive = keep_alive,
         .date = test_date,
-        .secure = false,
     };
 }
 

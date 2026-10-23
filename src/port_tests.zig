@@ -7,6 +7,8 @@ const linux = std.os.linux;
 const assert = std.debug.assert;
 const Evented = @import("zig_io_evented");
 const listen = @import("listen.zig");
+const server_module = @import("server.zig");
+const http1_response = @import("http1_response.zig");
 
 // A cancel that cuts a sleep short: the sleep says so, and a fiber that
 // cannot stop there (roux's `Sleep.millis!`, which has no error for Roc)
@@ -85,6 +87,136 @@ test "port: a wake of all wakes every fiber waiting on the word" {
     io.futexWake(u32, &waiters.word, std.math.maxInt(i32));
     try group.await(io);
     try std.testing.expectEqual(Waiters.count, woken);
+}
+
+/// The server's application in the test below: `/echo` answers its body,
+/// anything else "hello".
+const EchoApp = struct {
+    pub const Response = struct {
+        status: u16,
+        headers: []const http1_response.Header,
+        body: []const u8,
+    };
+
+    pub fn handle(app: *EchoApp, request: *EchoServer.Request) Response {
+        _ = app;
+        if (!std.mem.eql(u8, request.head.path(), "/echo")) {
+            return .{ .status = 200, .headers = &.{}, .body = "hello" };
+        }
+        var used: usize = 0;
+        for (0..request.scratch.len + 1) |_| {
+            const got = request.read_body(request.scratch[used..]) catch
+                return .{ .status = 400, .headers = &.{}, .body = "" };
+            if (got == 0) break;
+            used += got;
+        } else unreachable; // each pass reads a byte or ends
+        return .{ .status = 200, .headers = &.{}, .body = request.scratch[0..used] };
+    }
+
+    pub fn release(app: *EchoApp, response: *Response) void {
+        _ = app;
+        response.* = undefined;
+    }
+};
+
+const EchoServer = server_module.ServerType(EchoApp, .{
+    .send_then_receive = Evented.sendThenReceive,
+});
+
+/// Set by the server's thread once it listens: the port it bound.
+var echo_port: std.atomic.Value(u16) = .init(0);
+
+fn run_echo_server() void {
+    run_echo_server_or_fail() catch |err| std.debug.panic("echo server: {t}", .{err});
+}
+
+fn run_echo_server_or_fail() !void {
+    const gpa = std.heap.page_allocator;
+    const config: server_module.Config = .{ .connections_max = 8 };
+    var runtime: Evented = undefined;
+    try listen.runtime_init(Evented, &runtime, gpa, .{
+        .thread_limit = 0,
+        .fibers_max = config.fibers_max(),
+    });
+    const io = runtime.io();
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try address.listen(io, .{ .reuse_address = true });
+    var bound: linux.sockaddr.in = undefined;
+    var bound_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    const named = linux.getsockname(listener.socket.handle, @ptrCast(&bound), &bound_len);
+    assert(linux.errno(named) == .SUCCESS);
+    var app: EchoApp = .{};
+    var server = try EchoServer.init(gpa, io, &app, listener, config);
+    echo_port.store(std.mem.bigToNative(u16, bound.port), .release);
+    try server.run();
+}
+
+/// What the server answers to `request` on a connection of its own; all
+/// of it, up to the close or `expected` bytes.
+fn exchange(socket: linux.fd_t, request: []const u8, buffer: []u8, expected: usize) ![]const u8 {
+    var sent: usize = 0;
+    for (0..request.len + 1) |_| {
+        if (sent == request.len) break;
+        const result = linux.write(socket, request[sent..].ptr, request.len - sent);
+        if (linux.errno(result) != .SUCCESS) return error.Write;
+        sent += result;
+    } else unreachable;
+    var got: usize = 0;
+    for (0..buffer.len + 1) |_| {
+        if (got >= expected) break;
+        const result = linux.read(socket, buffer[got..].ptr, buffer.len - got);
+        if (linux.errno(result) != .SUCCESS) return error.Read;
+        if (result == 0) break;
+        got += result;
+    } else unreachable;
+    return buffer[0..got];
+}
+
+fn connect_echo() !linux.fd_t {
+    const socket: linux.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    const address: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, echo_port.load(.acquire)),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const connected = linux.connect(socket, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
+    if (linux.errno(connected) != .SUCCESS) return error.Connect;
+    return socket;
+}
+
+// The server end to end on a real ring: two requests on one connection, a
+// body read by the handler, and a chunked request refused and closed. The
+// server runs for good on its own thread (it has no stop).
+test "server: keep-alive, a body, and a chunked request refused" {
+    const thread = try std.Thread.spawn(.{}, run_echo_server, .{});
+    thread.detach();
+    for (0..1000) |_| {
+        if (echo_port.load(.acquire) != 0) break;
+        const wait: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&wait, null);
+    } else return error.ServerNeverListened;
+    var buffer: [1024]u8 = undefined;
+
+    const keep = try connect_echo();
+    defer _ = linux.close(keep);
+    for (0..2) |_| {
+        const answer = try exchange(keep, "GET / HTTP/1.1\r\nHost: a\r\n\r\n", &buffer, 1);
+        try std.testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, answer, "\r\n\r\nhello"));
+    }
+    const echo = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc";
+    const echoed = try exchange(keep, echo, &buffer, 1);
+    try std.testing.expect(std.mem.endsWith(u8, echoed, "\r\n\r\nabc"));
+
+    const chunked = try connect_echo();
+    defer _ = linux.close(chunked);
+    const refused = try exchange(
+        chunked,
+        "POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        &buffer,
+        buffer.len,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, refused, "HTTP/1.1 411 "));
+    try std.testing.expect(std.mem.indexOf(u8, refused, "Connection: close\r\n") != null);
 }
 
 fn wait_one(io: Io, waiters: *Waiters) Io.Cancelable!void {
