@@ -1493,7 +1493,7 @@ const tsan = struct {
     extern fn __tsan_switch_to_fiber(fiber: *anyopaque, flags: c_uint) void;
 };
 
-// fourneau: our switch (fourneau/src/context_switch_x86_64.S), with
+// fourneau: our switch (src/context_switch_x86_64.S), with
 // Io.fiber.contextSwitch's contract, as an ordinary call: Zig 0.17's
 // ReleaseSafe miscompiles the inline-assembly original (the message is never
 // loaded into rsi), and every switch crashed in -O safe.

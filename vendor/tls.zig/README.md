@@ -4,7 +4,8 @@ Igor Anić's TLS 1.3 (and 1.2) for Zig: github.com/ianic/tls.zig, MIT (`LICENSE`
 server handshake on the connection's fiber, then gives the session keys to the kernel (kTLS):
 `src/tls.zig`.
 
-Vendored whole (`src/`), unchanged but for fourneau's patch, each place marked "fourneau's patch":
+Vendored whole (`src/`), unchanged but for fourneau's four patches, each place marked "fourneau's
+patch":
 
 - `src/handshake_common.zig` (2026-10-10): X25519 and P-256 ECDSA signing on verified assembly.
     - X25519 (the key pair and the shared secret) and P-256 signing call fourneau's `src/curves.zig`.
@@ -30,7 +31,7 @@ Vendored whole (`src/`), unchanged but for fourneau's patch, each place marked "
 
 Upstream: commit `bd22bcb` (2026-10-03, "update demo"), which builds on Zig 0.17.0.
 
-To update: copy `src/` and `LICENSE` from the new commit, put the patch back (grep "fourneau's
+To update: copy `src/` and `LICENSE` from the new commit, put the patches back (grep "fourneau's
 patch" in the old copy, the places listed above), name the commit above, run the suite and the
 HTTPS checks (curl over HTTP/1.1 and HTTP/2, `openssl s_client -ciphersuites` for each suite
 offered).

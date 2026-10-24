@@ -6,5 +6,5 @@ shares: `dictionary.bin`, byte for byte google/brotli's `c/common/dictionary.bin
 test). SHA-256 `20e42eb1b511c21806d4d227d07e5dd06877d8ce7b3a817f378f313653f35c70`.
 
 It is data the format fixes, not code: it never changes, so it is never updated. `dictionary.zig`
-makes it a module (a file outside a module's directory cannot be embedded). google/brotli is MIT;
-the dictionary is also published in the RFC itself.
+makes it a module (a file outside a module's directory cannot be embedded). google/brotli is MIT
+(`LICENSE`, from the same commit); the dictionary is also published in the RFC itself.

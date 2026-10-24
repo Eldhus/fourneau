@@ -2,7 +2,8 @@
 
 Zig's `std.Io.Evented` for Linux (`lib/std/Io/Uring.zig`): green threads (fibers) on io_uring with
 work stealing. Upstream calls it experimental, and in 0.17.0 it cannot listen, accept, connect, or
-read and write streams. We carry it, with those filled in, until upstream can serve; then this
+read and write streams. We carry it, with listen, accept and stream reads and writes filled in
+(connect stays upstream's stub: fourneau never dials out), until upstream can serve; then this
 directory is deleted and fourneau uses `std.Io.Evented`. The interface is `std.Io` either way, so
 nothing that uses it changes.
 
