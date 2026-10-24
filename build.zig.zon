@@ -1,0 +1,8 @@
+.{
+    .name = .fourneau,
+    .version = "0.0.0",
+    .fingerprint = 0x1fc9332a80564020,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "vendor", "LICENSE", "README.md" },
+}
