@@ -1,61 +1,38 @@
-# fourneau
+# fourneau, HTTP/1.1 only
 
-A web server in Zig, meant to face the internet alone: HTTP/1.1, HTTP/2 and TLS 1.3, with
-certificates it obtains itself by ACME. One static binary; no dependencies beyond the Zig standard
-library and what is vendored here. Leverages io_uring via `std.Io.Evented`.
+This branch is fourneau cut down to what an HTTP/1.1 application server on plain sockets needs: a
+fiber per connection on io_uring (our port of `std.Io.Evented`), shards that share nothing, and
+the server's limits, deadlines and eviction. TLS, ACME, HTTP/2, brotli, static files, streamed
+responses and the simulator are not here; `master` has them. A chunked request body is refused
+(411).
 
 *Fourneau*: the cast-iron range a kitchen is built around. Pronounced *ferno*, like *inferno*, without the *in*.
-
-It serves the [dragrace](https://github.com/Eldhus/fourneau-dragrace) site on the internet with
-nothing in front.
 
 
 ## Use it
 
-As a Zig package, from a checkout beside yours (no releases yet):
+As a Zig package:
 
 ```zig
 .dependencies = .{ .fourneau = .{ .path = "../fourneau" } },
 ```
 
-It exports `fourneau` (the server), `zig_io_evented` and `tidy`.
-[roux](https://github.com/Eldhus/roux) is built on it. To try it alone, `fourneau-static` serves a
-directory over HTTP/1.1, HTTP/2 and HTTPS:
+It exports `fourneau` (the server) and `zig_io_evented` (the port, with `park` and `unpark` for
+fibers of one thread that hand work to each other).
 
-```sh
-zig build -Doptimize=ReleaseSafe
-zig-out/bin/fourneau-static --root ./public --port 8080
-```
-
-Zig 0.17.0 (`.zig-version`); Linux 6.7 or later; for HTTPS, the kernel's `tls` module.
-
-
-## The road ahead
-
-- fourneau-static against Go's `FileServer`, tower-http's `ServeDir` and Caddy.
-    - Ranges, conditional requests, `Accept-Encoding`.
-- More differential cases.
-    - Chunked trailers, many small chunks, a body split at every byte.
-    - Pipelines past the receive buffer, HTTP/2 over h2c.
-- Decide the runtime: Evented, a state-machine hybrid, or a small io_uring layer of our own.
-- Idle connections at scale: 10k and 100k keep-alive or SSE.
+Zig 0.17.0 (`.zig-version`); Linux 6.7 or later.
 
 
 ## Working on it
 
 ```sh
 zig build test                  # seconds
-zig build sim -- --seeds 1000   # a simulator sweep
 ```
-
-roux and the dragrace build against this checkout: a change to an exported module is checked by
-building them too.
 
 
 ## Security
 
 Report a problem by a private security advisory on GitHub, not an issue.
-[SECURITY.md](SECURITY.md) says what a deployment holds.
 
 
 ## License
