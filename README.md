@@ -38,7 +38,7 @@ Zig 0.17.0 (`.zig-version`); Linux 6.7 or later; for HTTPS, the kernel's `tls` m
     - Chunked trailers, many small chunks, a body split at every byte.
     - Pipelines past the receive buffer, HTTP/2 over h2c.
 - Decide the runtime: Evented, a state-machine hybrid, or a small io_uring layer of our own.
-- Idle connections at scale: 10k and 100k keep-alive or SSE.
+- Idle connections at scale: 10k and 100k and 1M keep-alive or SSE.
 
 
 ## Working on it
