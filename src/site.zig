@@ -16,10 +16,34 @@ const brotli_encode = @import("brotli_encode.zig");
 const brotli_decode = @import("brotli_decode.zig");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.fourneau);
 
-const files_max = 4096;
-const file_bytes_max = 16 * 1024 * 1024;
-const site_bytes_max = 64 * 1024 * 1024;
+/// What a site may hold. A load past one stops, naming the limit and the
+/// file it stopped at.
+const Limits = struct {
+    files: u32 = 4096,
+    file_bytes: u32 = 16 * 1024 * 1024,
+    site_bytes: u64 = 64 * 1024 * 1024,
+    /// Files, directories and links, hidden ones included: the walk's bound.
+    entries: u32 = 4096 * 8,
+};
+
+/// Why a load stopped, as one line: the limit or the error, and the file.
+const Refusal = struct {
+    buffer: [512]u8 = undefined,
+    len: u32 = 0,
+
+    fn say(refusal: *Refusal, comptime format: []const u8, args: anytype) void {
+        assert(refusal.len == 0);
+        const said = std.fmt.bufPrint(&refusal.buffer, format, args) catch &refusal.buffer;
+        refusal.len = @intCast(said.len);
+        assert(refusal.len > 0);
+    }
+
+    fn text(refusal: *const Refusal) []const u8 {
+        return refusal.buffer[0..refusal.len];
+    }
+};
 
 /// One file as sent: its bytes and the headers that go with them.
 const Variant = struct {
@@ -77,10 +101,15 @@ pub const Site = struct {
     routes: std.StringHashMapUnmanaged(File) = .empty,
     not_found: ?File = null,
 
-    /// Every file under `root`, routed from "/".
+    /// Every file under `root`, routed from "/". A load that stops is
+    /// logged: which limit or error, at which file.
     pub fn load(gpa: Allocator, io: std.Io, root: []const u8, options: LoadOptions) !Site {
         var site: Site = .{};
-        try load_into(gpa, io, root, options, &site);
+        var refusal: Refusal = .{};
+        load_into(gpa, io, root, options, .{}, &site, &refusal) catch |err| {
+            if (refusal.len > 0) log.err("site {s}: {s}", .{ root, refusal.text() });
+            return err;
+        };
         return site;
     }
 
@@ -472,13 +501,16 @@ test "site: a compressible file gets smaller copies that decode back" {
     }
 }
 
-/// Read every file under `root` into `site`, with its routes.
+/// Read every file under `root` into `site`, with its routes. A limit
+/// passed, or a file that cannot be read, is said in `refusal`.
 fn load_into(
     gpa: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
     options: LoadOptions,
+    limits: Limits,
     site: *Site,
+    refusal: *Refusal,
 ) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
@@ -486,20 +518,37 @@ fn load_into(
     defer walker.deinit();
     var site_bytes: u64 = 0;
     var files: u32 = 0;
-    for (0..files_max * 8) |_| {
+    for (0..limits.entries) |_| {
         const entry = (try walker.next(io)) orelse break;
         if (entry.kind != .file) continue;
         // Hidden files are never pages: a deploy's marker, `.git`, an
         // editor's swap file. Serving one is how secrets leak.
         if (is_hidden(entry.path)) continue;
         files += 1;
-        if (files > files_max) return error.TooManyFiles;
-        const body = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(file_bytes_max));
+        if (files > limits.files) {
+            refusal.say("more than {d} files, at {s}", .{ limits.files, entry.path });
+            return error.TooManyFiles;
+        }
+        const limited: std.Io.Limit = .limited(limits.file_bytes);
+        const body = entry.dir.readFileAlloc(io, entry.basename, gpa, limited) catch |err| {
+            const too_long = "{s} is past {d} bytes, the most a file may be";
+            switch (err) {
+                error.StreamTooLong => refusal.say(too_long, .{ entry.path, limits.file_bytes }),
+                else => refusal.say("{s}: {t}", .{ entry.path, err }),
+            }
+            return err;
+        };
         site_bytes += body.len;
-        if (site_bytes > site_bytes_max) return error.SiteTooLarge;
+        if (site_bytes > limits.site_bytes) {
+            refusal.say("past {d} bytes in all, at {s}", .{ limits.site_bytes, entry.path });
+            return error.SiteTooLarge;
+        }
         const file = try make_file(gpa, entry.basename, body, options);
         try add_routes(gpa, site, entry.path, file);
-    } else return error.TooManyEntries;
+    } else {
+        refusal.say("more than {d} entries (files, directories, links)", .{limits.entries});
+        return error.TooManyEntries;
+    }
 }
 
 /// Whether any component of a relative path starts with a dot.
@@ -537,6 +586,61 @@ fn add_routes(gpa: std.mem.Allocator, site: *Site, path: []const u8, file: File)
 fn put_alias(gpa: std.mem.Allocator, site: *Site, route: []const u8, file: File) !void {
     const got = try site.routes.getOrPut(gpa, route);
     if (!got.found_existing) got.value_ptr.* = file;
+}
+
+test "site: a load past a limit names the limit, and the file it stopped at" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "a.html", "b.html", "c.html" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "0123456789" });
+    }
+    const root = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    // Three files of 10 bytes, in the walk's order (any): each limit just
+    // under what they need.
+    const cases = [_]struct { limits: Limits, err: anyerror, says: []const u8, at: bool }{
+        .{
+            .limits = .{ .files = 2 },
+            .err = error.TooManyFiles,
+            .says = "more than 2 files, at ",
+            .at = true,
+        },
+        .{
+            .limits = .{ .file_bytes = 9 },
+            .err = error.StreamTooLong,
+            .says = ".html is past 9 bytes, the most a file may be",
+            .at = false,
+        },
+        .{
+            .limits = .{ .site_bytes = 29 },
+            .err = error.SiteTooLarge,
+            .says = "past 29 bytes in all, at ",
+            .at = true,
+        },
+        .{
+            .limits = .{ .entries = 2 },
+            .err = error.TooManyEntries,
+            .says = "more than 2 entries (files, directories, links)",
+            .at = false,
+        },
+    };
+    for (cases) |case| {
+        var site: Site = .{};
+        var refusal: Refusal = .{};
+        const options: LoadOptions = .{ .brotli = false };
+        const loaded = load_into(arena, io, root, options, case.limits, &site, &refusal);
+        try std.testing.expectError(case.err, loaded);
+        try std.testing.expect(std.mem.indexOf(u8, refusal.text(), case.says) != null);
+        if (case.at) try std.testing.expect(std.mem.endsWith(u8, refusal.text(), ".html"));
+    }
+    var site: Site = .{};
+    var refusal: Refusal = .{};
+    try load_into(arena, io, root, .{ .brotli = false }, .{}, &site, &refusal);
+    try std.testing.expectEqual(@as(u32, 0), refusal.len);
+    try std.testing.expectEqualStrings("0123456789", site.routes.get("/c").?.identity.body);
 }
 
 test "site: routes for pages, directories and the 404" {
