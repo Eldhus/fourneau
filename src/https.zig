@@ -9,9 +9,12 @@ const server_module = @import("server.zig");
 const http1_response = @import("http1_response.zig");
 const tls = @import("tls.zig");
 const acme = @import("acme.zig");
+const acme_crypto = @import("acme_crypto.zig");
+const der = @import("der.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const log = std.log.scoped(.fourneau);
 
 pub const Options = struct {
     /// A certificate chain and its key, as PEM files.
@@ -77,9 +80,100 @@ pub fn context(gpa: Allocator, io: Io, options: Options) !?*const tls.Context {
     }
     const auth = try gpa.create(tls.CertKeyPair);
     auth.* = try tls.CertKeyPair.fromFilePath(gpa, io, Io.Dir.cwd(), cert.?, key.?);
+    if (!try key_matches(auth)) {
+        log.err("{s} is not the key of the certificate in {s}", .{ key.?, cert.? });
+        return error.KeyDoesNotMatchCertificate;
+    }
     const shared = try gpa.create(tls.Context);
     shared.* = .{ .auth = auth };
     return shared;
+}
+
+/// Whether the key is the leaf certificate's. A pair that is not would
+/// fail every handshake while the server looked up: a renewal that wrote
+/// the new key and failed before the certificate (the disk full, a crash
+/// between the two) falls back to the old certificate with the new key.
+/// ECDSA keys are checked, which ACME makes; an RSA key is not.
+fn key_matches(auth: *const tls.CertKeyPair) !bool {
+    const key_pair = auth.ecdsa_key_pair orelse return true;
+    // The bundle holds the chain as read, leaf first.
+    if (auth.bundle.bytes.items.len == 0) return error.NoCertificate;
+    const leaf: std.crypto.Certificate = .{ .buffer = auth.bundle.bytes.items, .index = 0 };
+    const parsed = try leaf.parse();
+    return switch (key_pair) {
+        inline else => |pair| {
+            const public_key = pair.public_key.toUncompressedSec1();
+            return std.mem.eql(u8, &public_key, parsed.pubKey());
+        },
+    };
+}
+
+test "https: a key that is not the certificate's is refused" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const ours = try acme_crypto.KeyPair.generateDeterministic(@splat(1));
+    const other = try acme_crypto.KeyPair.generateDeterministic(@splat(2));
+    var der_buffer: [1024]u8 = undefined;
+    var cert_buffer: [2048]u8 = undefined;
+    const cert = try acme_crypto.pem(
+        "CERTIFICATE",
+        try test_certificate(ours, &der_buffer),
+        &cert_buffer,
+    );
+    for ([_]struct { key: acme_crypto.KeyPair, matches: bool }{
+        .{ .key = ours, .matches = true },
+        .{ .key = other, .matches = false },
+    }) |case| {
+        var key_buffer: [512]u8 = undefined;
+        const key = try acme_crypto.private_key_pem(case.key, &key_buffer);
+        var auth = try tls.CertKeyPair.fromSlice(gpa, io, cert, key);
+        defer auth.deinit(gpa);
+        try std.testing.expectEqual(case.matches, try key_matches(&auth));
+    }
+}
+
+/// A certificate for `key_pair`, self-signed, valid from 2025 to 9999,
+/// naming nobody: for the test above.
+fn test_certificate(key_pair: acme_crypto.KeyPair, buffer: []u8) ![]const u8 {
+    if (!@import("builtin").is_test) @compileError("for tests only");
+    var tbs_buffer: [512]u8 = undefined;
+    var tbs = der.Writer.init(&tbs_buffer);
+    try tbs.begin(.sequence);
+    try tbs.begin(der.Tag.context_constructed(0));
+    try tbs.small_integer(2); // version 3
+    try tbs.end_value();
+    try tbs.small_integer(1); // the serial number
+    try tbs.begin(.sequence);
+    try tbs.raw(&der.oid.ecdsa_with_sha256);
+    try tbs.end_value();
+    try tbs.begin(.sequence); // issuer: empty
+    try tbs.end_value();
+    try tbs.begin(.sequence); // validity: UTCTime, GeneralizedTime
+    try tbs.raw("\x17\x0d250101000000Z");
+    try tbs.raw("\x18\x0f99991231235959Z");
+    try tbs.end_value();
+    try tbs.begin(.sequence); // subject: empty
+    try tbs.end_value();
+    try tbs.begin(.sequence); // the public key
+    try tbs.begin(.sequence);
+    try tbs.raw(&der.oid.ec_public_key);
+    try tbs.raw(&der.oid.prime256v1);
+    try tbs.end_value();
+    try tbs.bit_string(&key_pair.public_key.toUncompressedSec1());
+    try tbs.end_value();
+    try tbs.end_value();
+    const Signature = std.crypto.sign.ecdsa.EcdsaP256Sha256.Signature;
+    var signature_der: [Signature.der_encoded_length_max]u8 = undefined;
+    const signature = try key_pair.sign(tbs.bytes(), null);
+    var writer = der.Writer.init(buffer);
+    try writer.begin(.sequence);
+    try writer.raw(tbs.bytes());
+    try writer.begin(.sequence);
+    try writer.raw(&der.oid.ecdsa_with_sha256);
+    try writer.end_value();
+    try writer.bit_string(signature.toDer(&signature_der));
+    try writer.end_value();
+    return writer.bytes();
 }
 
 /// An IP address when it parses as one, else a DNS name.
