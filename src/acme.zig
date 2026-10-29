@@ -571,7 +571,9 @@ const Responder = struct {
             if (body) |b| b.len else 0,
             body orelse "",
         }) catch return;
-        _ = linux.write(fd, text.ptr, text.len);
+        // Not a plain write: to a client already gone, that is SIGPIPE,
+        // which ends the whole server.
+        _ = linux.sendto(fd, text.ptr, text.len, linux.MSG.NOSIGNAL, null, 0);
     }
 
     fn lookup(responder: *Responder, target: []const u8) ?[]const u8 {
@@ -629,6 +631,35 @@ test "acme: the responder on systemd's socket answers, then leaves it listening"
     const handle = held.socket.handle;
     _ = linux.getsockopt(handle, level, linux.SO.ACCEPTCONN, @ptrCast(&accepting), &length);
     try std.testing.expectEqual(1, accepting);
+}
+
+test "acme: a client gone before its answer does not take the process with it" {
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[0]);
+    // SIGPIPE as a server started from a shell has it: the test runner
+    // ignores it, and its tests inherit that.
+    const default: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.DFL },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    var before: linux.Sigaction = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.sigaction(.PIPE, &default, &before)));
+    defer _ = linux.sigaction(.PIPE, &before, null);
+    // The request whole, then the client gone: the answer meets a closed
+    // socket, which a plain write turns into SIGPIPE, ending the process.
+    const request = "GET /.well-known/acme-challenge/token-1 HTTP/1.1\r\nHost: x\r\n\r\n";
+    try std.testing.expectEqual(request.len, linux.write(fds[1], request, request.len));
+    _ = linux.close(fds[1]);
+    var responder: Responder = .{ .thread = undefined, .listener = -1, .owned = false };
+    responder.answer_one(fds[0]);
 }
 
 /// A plain GET on loopback, its response read to the peer's close.
