@@ -751,60 +751,68 @@ fn scripted_plan(connections_max: u32) Setup {
 
 /// The server on the simulated kernel, its clients the test's own, the
 /// server's invariants checked after every tick.
-const Scripted = struct {
-    plan: Setup,
-    kernel: sim_kernel.Kernel,
-    app: App,
-    stop: std.atomic.Value(bool),
-    shard: Shard(ServerPlain),
+const Scripted = ScriptedType(ServerPlain);
+/// The same with the port's linked send-then-receive turn.
+const ScriptedLinked = ScriptedType(ServerLinked);
 
-    /// In place: the shard holds pointers into it.
-    fn init(scripted: *Scripted, gpa: std.mem.Allocator, seed: u64, plan: Setup) !void {
-        scripted.plan = plan;
-        scripted.kernel = try .init(gpa, seed, plan.kernel);
-        scripted.app = .{ .canary = false, .io = undefined };
-        scripted.stop = .init(false);
-        const listener: std.Io.net.Server = .{
-            .socket = .{
-                .handle = scripted.kernel.network.listen(),
-                .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
-            },
-            .options = {},
-        };
-        scripted.shard = .{
-            .gpa = gpa,
-            .plan = &scripted.plan,
-            .app = &scripted.app,
-            .listener = listener,
-            .stop = &scripted.stop,
-        };
-        scripted.kernel.start(Shard(ServerPlain).main, &scripted.shard);
-    }
+fn ScriptedType(comptime ServerT: type) type {
+    return struct {
+        plan: Setup,
+        kernel: sim_kernel.Kernel,
+        app: App,
+        stop: std.atomic.Value(bool),
+        shard: Shard(ServerT),
 
-    fn deinit(scripted: *Scripted, gpa: std.mem.Allocator) void {
-        scripted.kernel.deinit(gpa);
-        scripted.* = undefined;
-    }
+        const Harness = @This();
 
-    fn tick(scripted: *Scripted) void {
-        scripted.kernel.step();
-        if (scripted.shard.server) |server| server.check_invariants();
-    }
-
-    fn ticks(scripted: *Scripted, count: u32) void {
-        for (0..count) |_| scripted.tick();
-    }
-
-    /// Stop the server and run it until it returns.
-    fn finish(scripted: *Scripted) !void {
-        scripted.stop.store(true, .release);
-        for (0..scripted.plan.ticks_max) |_| {
-            if (scripted.kernel.exited()) return;
-            scripted.tick();
+        /// In place: the shard holds pointers into it.
+        fn init(scripted: *Harness, gpa: std.mem.Allocator, seed: u64, plan: Setup) !void {
+            scripted.plan = plan;
+            scripted.kernel = try .init(gpa, seed, plan.kernel);
+            scripted.app = .{ .canary = false, .io = undefined };
+            scripted.stop = .init(false);
+            const listener: std.Io.net.Server = .{
+                .socket = .{
+                    .handle = scripted.kernel.network.listen(),
+                    .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
+                },
+                .options = {},
+            };
+            scripted.shard = .{
+                .gpa = gpa,
+                .plan = &scripted.plan,
+                .app = &scripted.app,
+                .listener = listener,
+                .stop = &scripted.stop,
+            };
+            scripted.kernel.start(Shard(ServerT).main, &scripted.shard);
         }
-        return error.TestServerNeverReturned;
-    }
-};
+
+        fn deinit(scripted: *Harness, gpa: std.mem.Allocator) void {
+            scripted.kernel.deinit(gpa);
+            scripted.* = undefined;
+        }
+
+        fn tick(scripted: *Harness) void {
+            scripted.kernel.step();
+            if (scripted.shard.server) |server| server.check_invariants();
+        }
+
+        fn ticks(scripted: *Harness, count: u32) void {
+            for (0..count) |_| scripted.tick();
+        }
+
+        /// Stop the server and run it until it returns.
+        fn finish(scripted: *Harness) !void {
+            scripted.stop.store(true, .release);
+            for (0..scripted.plan.ticks_max) |_| {
+                if (scripted.kernel.exited()) return;
+                scripted.tick();
+            }
+            return error.TestServerNeverReturned;
+        }
+    };
+}
 
 /// A client the test drives: what it received, kept whole.
 const HandClient = struct {
@@ -833,7 +841,7 @@ const HandClient = struct {
     /// Ticks until `done` holds of what it received, or the end is seen.
     fn await_until(
         client: *HandClient,
-        scripted: *Scripted,
+        scripted: anytype,
         comptime done: fn ([]const u8) bool,
     ) !void {
         for (0..scripted.plan.ticks_max) |_| {
@@ -1032,6 +1040,37 @@ test "sim: short of descriptors, the longest idle is evicted only for a client w
         network.client_close(first.connection);
         network.client_close(second.connection);
         network.client_close(fresh.connection);
+        try scripted.finish();
+    }
+}
+
+// The linked turn (a response, then the next request's receive, one
+// chain): a response larger than the socket's send space, a client that
+// stops reading, and the send deadline cut the send after some bytes went
+// out. Linux reports those bytes on the failed send's completion, and the
+// receive behind it never starts. Taken for bytes received, the server
+// parsed its buffer's stale request again and ran the handler twice.
+test "sim: a send cut by its deadline after some bytes is not a request received" {
+    const gpa = std.testing.allocator;
+    for (1..9) |seed| {
+        var scripted: ScriptedLinked = undefined;
+        var plan = scripted_plan(1);
+        plan.linked = true;
+        try scripted.init(gpa, seed, plan);
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var client: HandClient = .connect(network);
+        client.send(network, "GET /big/600 HTTP/1.1\r\nHost: a\r\n\r\n");
+        // Never read: the window (64 bytes) fills, the send stalls, the
+        // deadline cuts it.
+        for (0..scripted.plan.ticks_max) |_| {
+            if (scripted.shard.server) |server| if (server.stats.timeouts > 0) break;
+            scripted.tick();
+        } else return error.TestNoTimeout;
+        try client.await_until(&scripted, heads_at_least(2)); // returns at the end
+        try std.testing.expect(network.client_sees_end(client.connection));
+        try std.testing.expectEqual(1, scripted.app.handled);
+        network.client_close(client.connection);
         try scripted.finish();
     }
 }

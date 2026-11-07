@@ -74,6 +74,10 @@ const Operation = struct {
     /// Ended by an ASYNC_CANCEL at its submission, as Linux ends it (the
     /// cancel runs inline there): -ECANCELED, posted when it is due.
     canceled: bool = false,
+    /// Linux's REQ_F_FAIL apart from the result's sign: a send that moved
+    /// some bytes before it was canceled or broken reports those bytes, a
+    /// positive result, and still fails its links and is not skipped.
+    failed: bool = false,
     fd: linux.fd_t = -1,
     /// The buffer (RECV, SEND), the msghdr (RECVMSG, SENDMSG), or the
     /// address and its length (ACCEPT, `addr2` in `off`), in the process.
@@ -491,11 +495,14 @@ pub const Kernel = struct {
         return 0;
     }
 
+    /// As Linux (`io_sendrecv_fail`): a send that moved bytes before the
+    /// cancel reports them, failed all the same.
     fn cancel_operation(kernel: *Kernel, victim: *Operation) void {
         assert(victim.state == .pending);
         assert(!victim.canceled);
         victim.canceled = true;
-        victim.result = errno(.CANCELED);
+        victim.failed = true;
+        victim.result = if (victim.moved > 0) @intCast(victim.moved) else errno(.CANCELED);
         victim.due_tick = kernel.tick;
         kernel.stats.canceled += 1;
     }
@@ -603,7 +610,13 @@ pub const Kernel = struct {
         const total = send_parts(operation, &parts_buffer);
         const parts = parts_buffer[0..total.count];
         switch (network.send(index, parts, &kernel.prng)) {
-            .broken => return errno(.PIPE),
+            // As Linux (`io_send`): broken after some bytes moved, those
+            // bytes are the result, and the request fails all the same.
+            .broken => {
+                if (operation.moved == 0) return errno(.PIPE);
+                operation.failed = true;
+                return @intCast(operation.moved);
+            },
             .would_block => return null,
             .bytes => |count| {
                 operation.moved += count;
@@ -644,12 +657,13 @@ pub const Kernel = struct {
             assert(operation.state == .pending);
             operation.state = .free;
             const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
-            if (chain_unseen or (skip and operation.result >= 0)) {
+            const failed = operation.failed or operation.result < 0;
+            if (chain_unseen or (skip and !failed)) {
                 kernel.stats.skipped += 1;
             } else {
                 kernel.post(operation.user_data, operation.result, 0);
             }
-            if (skip and operation.result < 0) chain_unseen = true;
+            if (skip and failed) chain_unseen = true;
             current = operation.next;
             const next = operation.next orelse return;
             const behind = &kernel.operations[next];
@@ -663,7 +677,7 @@ pub const Kernel = struct {
             assert(behind.state == .linked);
             behind.state = .pending;
             behind.due_tick = kernel.tick + kernel.latency();
-            if (operation.result >= 0) return; // it starts, in its own time
+            if (!failed) return; // it starts, in its own time
             behind.result = errno(.CANCELED); // and ends with this one
         } else unreachable;
     }

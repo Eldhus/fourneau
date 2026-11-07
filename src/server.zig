@@ -1344,7 +1344,12 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 comptime assert(type_options.current_fiber != null);
                 comptime assert(type_options.receive != null and type_options.send != null);
                 switch (how) {
-                    .recv => if (connection.fiber != 0) type_options.wake_read.?(connection.fiber),
+                    // A read-side wake is for a connection waiting between
+                    // requests: its fiber has started and named itself.
+                    .recv => {
+                        assert(connection.fiber != 0);
+                        type_options.wake_read.?(connection.fiber);
+                    },
                     .both => type_options.wake_both.?(connection.stream.socket.handle),
                 }
             } else {
@@ -1382,6 +1387,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.shut_idle = false;
             connection.shut_read = false;
             connection.shut_write = false;
+            connection.fiber = 0; // its fiber names itself when it starts
             connection.recv_used = 0;
             connection.send_used = 0;
             connection.requests = 0;

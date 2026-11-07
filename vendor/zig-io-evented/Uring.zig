@@ -475,6 +475,12 @@ const Fiber = struct {
                     .addr3 = 0,
                     .resv = 0,
                 };
+                // fourneau: the fiber may wait in a receive, whose
+                // `user_data` carries `receive_tag`: that one is named
+                // too (one of the two finds nothing: -ENOENT, ignored).
+                if (thread.io_uring.fd == awaiting_io_uring_fd) {
+                    cancelByUserdata(@intFromPtr(fiber) | receive_tag);
+                }
             },
         }
     }
@@ -1203,6 +1209,9 @@ fn threadEntry(ev: *Evented, index: u32) void {
 const Completion = struct {
     result: i32,
     flags: u32,
+    /// fourneau: the completion is a receive's (`receive_tag`), not a
+    /// send's, which matters to a chain of both (`sendThenReceive`).
+    receive: bool = false,
 
     const Userdata = enum(usize) {
         unused,
@@ -1310,6 +1319,7 @@ fn idle(ev: *Evented, thread: *Thread) void {
                         ready_fiber.resultPointer(Completion).* = .{
                             .result = cqe.res,
                             .flags = cqe.flags,
+                            .receive = cqe.user_data & receive_tag != 0,
                         };
                         break :ready_fiber ready_fiber;
                     },
@@ -6398,10 +6408,15 @@ pub fn sendThenReceive(
     thread.counts.linked += 1;
     ev.yield(null, .nothing);
     const completion = cancel_region.completion();
+    // fourneau: a completion from the send is its failure, whatever its
+    // result (a sent send is skipped): a send canceled or broken after some
+    // bytes reports those bytes, positive, with the receive behind it never
+    // started. Taken for bytes received, the server would read its buffer's
+    // stale request again and run its handler twice.
+    if (!completion.receive) return error.ConnectionResetByPeer;
     return switch (completion.errno()) {
         .SUCCESS => @intCast(completion.result),
-        // The send failed (its completion; the receive's is not posted),
-        // or the receive was canceled, or the peer reset it.
+        // The receive was canceled, or the peer reset it.
         .CANCELED, .CONNRESET, .PIPE, .NOTCONN => error.ConnectionResetByPeer,
         else => |err| unexpectedErrno(err),
     };
