@@ -1245,7 +1245,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     // waiting, and no close in flight about to free a
                     // descriptor, is the longest idle evicted, as a full
                     // server does. Then a tick's wait for the close, rather
-                    // than a spin.
+                    // than a spin. Accepting into the ring's file table
+                    // (`Options.accept`) the table is sized to the slots, so
+                    // this is a slot leaked: Linux then took the connection
+                    // and dropped it for want of a slot, said so.
                     error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
                         server.accept_starved(err);
                         if (server.closing_count == 0 and server.backlog_waiting()) {
@@ -1295,7 +1298,10 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// can (`Options.accept`), else a descriptor.
         fn accept(server: *Server) net.Server.AcceptError!net.Stream {
             if (type_options.accept) |accept_direct| {
+                // A direct socket has no descriptor to set an option on, nor
+                // to shut down: its waits end by cancellation.
                 comptime assert(type_options.set_option != null);
+                comptime assert(type_options.wake_read != null and type_options.wake_both != null);
                 return accept_direct(server.io, server.listener.socket.handle);
             }
             return server.listener.accept(server.io);
@@ -1315,7 +1321,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             server.accept_ok_run = 0;
             server.accept_starved_count += 1;
             const count = server.accept_starved_count;
-            if (count == 1 or count % 1024 == 0) {
+            if (count != 1 and count % 1024 != 0) return;
+            if (type_options.accept != null) {
+                log.err("accept: {t}, {d} times: the ring's file table is full, a slot " ++
+                    "leaked; the client was dropped", .{ err, count });
+            } else {
                 log.warn("accept: {t}, {d} times: evicting the longest idle for a client " ++
                     "waiting", .{ err, count });
             }

@@ -143,6 +143,8 @@ pub const Kernel = struct {
     /// file. Operations with IOSQE_FIXED_FILE name a slot.
     direct: [direct_files_max]?linux.fd_t = @splat(null),
     direct_count: u32 = 0,
+    /// Where the next allocation starts looking (Linux's `alloc_hint`).
+    direct_hint: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, seed: u64, options: Options) !Kernel {
         assert(options.tick_ns > 0);
@@ -628,10 +630,17 @@ pub const Kernel = struct {
         return kernel.direct[@intCast(slot)];
     }
 
-    /// The lowest free slot, as Linux allocates (`io_file_bitmap_get`).
-    fn direct_free(kernel: *const Kernel) ?u32 {
-        for (kernel.direct[0..kernel.direct_count], 0..) |slot, index| {
-            if (slot == null) return @intCast(index);
+    /// A free slot, taken as Linux allocates (`io_file_bitmap_get`): from
+    /// the one after the last allocated, wrapping, so a slot just freed is
+    /// not the next one reused.
+    fn direct_alloc(kernel: *Kernel) ?u32 {
+        const count = kernel.direct_count;
+        for (0..count) |offset| {
+            const slot: u32 = @intCast((kernel.direct_hint + offset) % count);
+            if (kernel.direct[slot] == null) {
+                kernel.direct_hint = (slot + 1) % count;
+                return slot;
+            }
         }
         return null;
     }
@@ -677,14 +686,19 @@ pub const Kernel = struct {
         const network = &kernel.network;
         if (operation.fd != listener_fd) return errno(.NOTSOCK);
         if (network.listener_closed) return errno(.INVAL);
-        // Linux checks the descriptor limit, or the table for a free slot,
-        // before it takes a connection off the backlog, which stays queued.
-        if (operation.direct_alloc) {
-            if (kernel.direct_free() == null) return errno(.NFILE);
-        } else if (network.open_count() >= network.descriptors_max) return errno(.MFILE);
+        // Linux checks the descriptor limit before it takes a connection
+        // off the backlog, which stays queued. A slot in the ring's file
+        // table it looks for only after (`io_fixed_fd_install`): none free,
+        // the connection it took is closed, -ENFILE, the client dropped.
+        if (!operation.direct_alloc and network.open_count() >= network.descriptors_max) {
+            return errno(.MFILE);
+        }
         const fd = network.accept() orelse return null;
         const result: i32 = if (operation.direct_alloc) direct: {
-            const slot = kernel.direct_free().?;
+            const slot = kernel.direct_alloc() orelse {
+                assert(network.close(fd));
+                return errno(.NFILE);
+            };
             kernel.direct[slot] = fd;
             break :direct @intCast(slot);
         } else fd;

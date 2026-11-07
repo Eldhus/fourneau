@@ -6518,7 +6518,10 @@ pub const SetOptionError = error{ SocketUnconnected, Canceled, Unexpected };
 
 /// fourneau: `setsockopt` through the ring's socket command, for a socket
 /// that may be a direct one (no descriptor to call it on): TCP_NODELAY,
-/// kernel TLS's attach and keys. Linux 6.7 and later.
+/// kernel TLS's attach and keys. Linux 6.7 and later; and 6.13 and later
+/// for a direct socket's close to take effect at once (before, the
+/// kernel released the file with the ring's node, which every in-flight
+/// operation held, so a closed connection lingered until one completed).
 pub fn setSocketOption(
     io_instance: Io,
     socket_handle: net.Socket.Handle,
