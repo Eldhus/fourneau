@@ -222,10 +222,37 @@ pub const Options = struct {
     /// descriptors evicts an idle connection only for a client waiting.
     /// Null: taken as waiting.
     listen_backlog: ?ListenBacklog = null,
+    /// End a connection's wait from another fiber (eviction, a deadline,
+    /// the drain) by canceling what is pending, where the `Io` can (our
+    /// port: `Evented.wakeRead` for its fiber's receive, `wakeBoth` for
+    /// everything on its socket, `currentFiber` to name the fiber, with
+    /// `receive` and `send` that return `Shut` instead of retrying). All
+    /// or none. Null: the socket is shut down with a system call, which
+    /// `std.Io` has.
+    wake_read: ?WakeRead = null,
+    wake_both: ?WakeBoth = null,
+    current_fiber: ?CurrentFiber = null,
+    receive: ?Receive = null,
+    send: ?Send = null,
 };
 
 /// Clients waiting in a listener's backlog; null when the kernel will not say.
 pub const ListenBacklog = fn (listen_handle: net.Socket.Handle) ?u32;
+/// Cancel the receive a fiber waits in; no wait.
+pub const WakeRead = fn (fiber: usize) void;
+/// Cancel every operation pending on a socket; no wait.
+pub const WakeBoth = fn (socket_handle: net.Socket.Handle) void;
+/// The fiber running now, for `WakeRead`.
+pub const CurrentFiber = fn () usize;
+/// One receive; `error.Shut` when woken, `error.Canceled` when the fiber was.
+pub const Receive = fn (io: Io, socket_handle: net.Socket.Handle, buffer: []u8) anyerror!usize;
+/// One send of a head then a body; the same errors.
+pub const Send = fn (
+    io: Io,
+    socket_handle: net.Socket.Handle,
+    head: []const u8,
+    body: []const u8,
+) anyerror!usize;
 
 /// Send all of the bytes, then receive into the buffer; the count received.
 pub const SendThenReceive = fn (
@@ -674,6 +701,13 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             /// every keep-alive close has, which clients retry (RFC 9112,
             /// 9.3.1).
             shut_idle: bool,
+            /// Shut by `Server.shut` (eviction, a deadline, the drain):
+            /// sticky, as a socket's shutdown is. A receive sees the end;
+            /// a send fails.
+            shut_read: bool,
+            shut_write: bool,
+            /// The fiber serving it (`Options.current_fiber`), for `wake_read`.
+            fiber: usize,
             continue_sent: bool,
             keep_alive: bool,
             requests: u32,
@@ -931,17 +965,27 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 return connection.receive(buffer);
             }
 
-            /// The read itself, no deadline of its own: in 0.17,
-            /// `net.Stream.read` does not compile (it destructures a struct
-            /// as a tuple).
+            /// The read itself, no deadline of its own. Shut (`Server.shut`),
+            /// before or during it: the end, 0. In 0.17, `net.Stream.read`
+            /// does not compile (it destructures a struct as a tuple).
             fn receive(connection: *Connection, buffer: []u8) !u32 {
                 assert(buffer.len > 0);
-                var parts = [_][]u8{buffer};
-                const result = try connection.server.io.operate(.{ .net_read = .{
-                    .socket_handle = connection.stream.socket.handle,
-                    .data = &parts,
-                } });
-                const got = (try result.net_read).data_len;
+                if (connection.shut_read) return 0;
+                const server = connection.server;
+                const handle = connection.stream.socket.handle;
+                const got: usize = if (type_options.receive) |receive_once|
+                    receive_once(server.io, handle, buffer) catch |err| switch (err) {
+                        error.Shut => 0,
+                        else => |e| return e,
+                    }
+                else got: {
+                    var parts = [_][]u8{buffer};
+                    const result = try server.io.operate(.{ .net_read = .{
+                        .socket_handle = handle,
+                        .data = &parts,
+                    } });
+                    break :got (try result.net_read).data_len;
+                };
                 assert(got <= buffer.len);
                 return @intCast(got);
             }
@@ -952,6 +996,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 const send_then_receive = type_options.send_then_receive.?;
                 const server = connection.server;
                 assert(connection.send_used > 0);
+                if (connection.shut_read or connection.shut_write) return error.Disconnected;
                 const pending = connection.send[0..connection.send_used];
                 connection.send_used = 0;
                 // One deadline for both: the read's is the longer, and a peer
@@ -974,22 +1019,35 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
                 for (0..total + 1) |_| {
                     if (sent == total) return true;
+                    // Shut (`Server.shut`), before or during a write: it fails.
+                    if (connection.shut_write) return false;
                     // The deadline is for progress, not for the whole response:
                     // re-armed before each write, so a slow but steady reader of a
                     // large response is never cut off (the simulator's seed 45 was).
                     server.arm(connection.index, server.config.send_timeout_ms);
                     const head_rest = if (sent < head.len) head[sent..] else "";
                     const body_rest = if (sent < head.len) body else body[sent - head.len ..];
-                    const result = server.io.operate(.{ .net_write = .{
-                        .socket_handle = connection.stream.socket.handle,
-                        .header = head_rest,
-                        .data = &.{body_rest},
-                    } }) catch return false;
-                    const written = result.net_write catch return false;
+                    const written = connection.send_once(head_rest, body_rest) orelse return false;
                     if (written == 0) return false;
                     sent += written;
                     assert(sent <= total);
                 } else unreachable; // each pass writes a byte or returns
+            }
+
+            /// One write of a head then a body; null when the socket is gone,
+            /// shut, or the fiber canceled.
+            fn send_once(connection: *Connection, head: []const u8, body: []const u8) ?usize {
+                const server = connection.server;
+                const handle = connection.stream.socket.handle;
+                if (type_options.send) |send_parts| {
+                    return send_parts(server.io, handle, head, body) catch null;
+                }
+                const result = server.io.operate(.{ .net_write = .{
+                    .socket_handle = handle,
+                    .header = head,
+                    .data = &.{body},
+                } }) catch return null;
+                return result.net_write catch null;
             }
         };
 
@@ -1264,7 +1322,35 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             assert(server.idle_since[index] != 0);
             server.idle_since[index] = 0;
             connection.shut_idle = true;
-            connection.stream.shutdown(server.io, .recv) catch {};
+            server.shut(connection, .recv);
+        }
+
+        /// End a connection's waits from another fiber, as a socket's
+        /// shutdown did: for reading (eviction, a drain's idle close: a
+        /// response still going out goes out whole, and the fiber returns
+        /// when its receive is found or its turn ends) or both ways (a
+        /// deadline, the drain's cut: everything pending is canceled, the
+        /// next send fails too). The flags keep it shut from now on, as a
+        /// shutdown was sticky; the cancel wakes the fiber waiting
+        /// (`Options.wake_read`, `wake_both`): no system call, and nothing
+        /// that could reach another connection. Without them, the socket is
+        /// shut down.
+        fn shut(server: *Server, connection: *Connection, how: enum { recv, both }) void {
+            assert(connection.open);
+            connection.shut_read = true;
+            if (how == .both) connection.shut_write = true;
+            if (type_options.wake_read != null) {
+                comptime assert(type_options.wake_both != null);
+                comptime assert(type_options.current_fiber != null);
+                comptime assert(type_options.receive != null and type_options.send != null);
+                switch (how) {
+                    .recv => if (connection.fiber != 0) type_options.wake_read.?(connection.fiber),
+                    .both => type_options.wake_both.?(connection.stream.socket.handle),
+                }
+            } else {
+                const shutdown_how: net.ShutdownHow = if (how == .both) .both else .recv;
+                connection.stream.shutdown(server.io, shutdown_how) catch {};
+            }
         }
 
         fn take_slot(server: *Server) u32 {
@@ -1294,6 +1380,8 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.stream = stream;
             connection.open = true;
             connection.shut_idle = false;
+            connection.shut_read = false;
+            connection.shut_write = false;
             connection.recv_used = 0;
             connection.send_used = 0;
             connection.requests = 0;
@@ -1323,6 +1411,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn serve_connection(server: *Server, index: u32) void {
             const connection = &server.connections[index];
             defer server.close_connection(connection);
+            connection.fiber = if (type_options.current_fiber) |current| current() else 0;
             // HTTP/2 by ALPN on HTTPS, by its preface on plain HTTP.
             const http2_chosen = if (server.config.tls) |context|
                 server.handshake(connection, context) orelse return
@@ -1548,7 +1637,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn h2_close(server: *Server, connection: *Connection, h2: *Http2Connection) void {
             _ = server.h2_flush(connection, .until_sent);
             server.h2_break(h2);
-            connection.stream.shutdown(server.io, .both) catch {};
+            server.shut(connection, .both);
             server.h2_notify_all(h2);
             // Bounded only to say so: each pass sees a stream fiber end.
             for (0..std.math.maxInt(u64)) |_| {
@@ -1868,7 +1957,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             // deadline, so it gets the idle one (or, draining, its end).
             const index = connection.index;
             if (server.draining) {
-                connection.stream.shutdown(server.io, .recv) catch {};
+                server.shut(connection, .recv);
             } else if (!h2.flushing) {
                 server.arm(index, server.config.idle_timeout_ms);
                 server.idle_since[index] = server.tick;
@@ -2238,7 +2327,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 if (!connection.open or !connection.endless) continue;
                 assert(connection.stream_state == .streaming);
                 connection.endless = false; // shut once
-                connection.stream.shutdown(server.io, .both) catch {};
+                server.shut(connection, .both);
                 server.stats.drain_streams += 1;
             }
             for (server.streams) |*stream| {
@@ -2260,20 +2349,20 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             for (server.connections, 0..) |*connection, index| {
                 if (!connection.open) continue;
                 server.deadlines[index] = 0;
-                connection.stream.shutdown(server.io, .both) catch {};
+                server.shut(connection, .both);
                 server.stats.drain_cut += 1;
             }
             server.group.cancel(server.io);
         }
 
-        /// Shut the socket down: the fiber waiting on it reads 0 and closes.
-        /// Between two waits, so the slot is the one the deadline was armed
-        /// for: its fiber disarms before it closes.
+        /// Shut the connection: the fiber waiting on it reads 0 or fails to
+        /// write, and closes. Between two waits, so the slot is the one the
+        /// deadline was armed for: its fiber disarms before it closes.
         fn expire(server: *Server, index: u32) void {
             const connection = &server.connections[index];
             assert(connection.open);
             server.deadlines[index] = 0;
-            connection.stream.shutdown(server.io, .both) catch {};
+            server.shut(connection, .both);
             server.stats.timeouts += 1;
         }
     };

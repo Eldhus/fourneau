@@ -53,16 +53,21 @@ const App = struct {
     }
 };
 
-const Server = server_module.ServerType(App, .{
+/// What our port offers the server beyond `std.Io`.
+const port_options: server_module.Options = .{
     .send_then_receive = Evented.sendThenReceive,
     .listen_backlog = Evented.listenBacklog,
-});
+    .wake_read = Evented.wakeRead,
+    .wake_both = Evented.wakeBoth,
+    .current_fiber = Evented.currentFiber,
+    .receive = Evented.receive,
+    .send = Evented.send,
+};
+
+const Server = server_module.ServerType(App, port_options);
 
 /// Port 80 beside HTTPS: redirects (https.zig).
-const Redirect = https.RedirectType(.{
-    .send_then_receive = Evented.sendThenReceive,
-    .listen_backlog = Evented.listenBacklog,
-});
+const Redirect = https.RedirectType(port_options);
 
 const Options = struct {
     root: ?[]const u8 = null,

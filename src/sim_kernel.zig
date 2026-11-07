@@ -61,14 +61,19 @@ const Operation = struct {
     opcode: linux.IORING_OP = .NOP,
     flags: u8 = 0,
     user_data: u64 = 0,
-    /// What it cancels (ASYNC_CANCEL), or posts (MSG_RING).
+    /// What it cancels (ASYNC_CANCEL: a user_data, or with `by_fd` every
+    /// operation on a descriptor), or posts (MSG_RING).
     target: u64 = 0,
+    by_fd: bool = false,
     message_result: i32 = 0,
     /// Not before this tick; a socket's operation then waits for its
     /// socket too.
     due_tick: u64 = 0,
     /// The result posted when it is done, unless canceled first.
     result: i32 = 0,
+    /// Ended by an ASYNC_CANCEL at its submission, as Linux ends it (the
+    /// cancel runs inline there): -ECANCELED, posted when it is due.
+    canceled: bool = false,
     fd: linux.fd_t = -1,
     /// The buffer (RECV, SEND), the msghdr (RECVMSG, SENDMSG), or the
     /// address and its length (ACCEPT, `addr2` in `off`), in the process.
@@ -329,8 +334,19 @@ pub const Kernel = struct {
             .ACCEPT => operation.addr2 = sqe.off,
             .TIMEOUT => kernel.submit_timeout(operation, sqe),
             .ASYNC_CANCEL => {
-                assert(sqe.rw_flags == 0); // by user_data, the first match
-                operation.target = sqe.addr;
+                const by_fd: u32 = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_ALL;
+                if (sqe.rw_flags == by_fd) {
+                    // Every operation pending on a socket (the port's `wakeBoth`).
+                    operation.by_fd = true;
+                    operation.target = @intCast(@as(u32, @bitCast(sqe.fd)));
+                } else {
+                    assert(sqe.rw_flags == 0); // by user_data, the first match
+                    operation.target = sqe.addr;
+                }
+                // Linux runs a cancel inline as it is submitted: what it
+                // ends is ended now, before any later submission (a reused
+                // fiber's or descriptor's), and the completions come due.
+                operation.result = kernel.cancel_now(operation);
             },
             .MSG_RING => {
                 assert(sqe.fd == ring_fd); // to itself: one ring
@@ -452,22 +468,47 @@ pub const Kernel = struct {
 
     /// What the operation does when it is due. False: its socket cannot
     /// proceed yet, and it stays pending.
+    /// An ASYNC_CANCEL, at its submission. The first operation with that
+    /// `user_data` is ended, -ECANCELED; none: -ENOENT (it completed
+    /// already, or never was). By descriptor: every operation pending on
+    /// it, as the kernel finds them (one linked behind another, not
+    /// started, is not found: its head's end cancels it); the count, or
+    /// -ENOENT. The ended ones complete when due.
+    fn cancel_now(kernel: *Kernel, cancel: *const Operation) i32 {
+        if (cancel.by_fd) {
+            var canceled: i32 = 0;
+            for (kernel.operations) |*victim| {
+                if (victim.state != .pending or victim.canceled) continue;
+                if (victim.opcode == .ASYNC_CANCEL or !is_socket_operation(victim.opcode)) continue;
+                if (victim.fd != @as(linux.fd_t, @intCast(cancel.target))) continue;
+                kernel.cancel_operation(victim);
+                canceled += 1;
+            }
+            return if (canceled > 0) canceled else errno(.NOENT);
+        }
+        const victim = kernel.find(cancel.target) orelse return errno(.NOENT);
+        kernel.cancel_operation(&kernel.operations[victim]);
+        return 0;
+    }
+
+    fn cancel_operation(kernel: *Kernel, victim: *Operation) void {
+        assert(victim.state == .pending);
+        assert(!victim.canceled);
+        victim.canceled = true;
+        victim.result = errno(.CANCELED);
+        victim.due_tick = kernel.tick;
+        kernel.stats.canceled += 1;
+    }
+
     fn complete(kernel: *Kernel, index: u32) bool {
         const operation = &kernel.operations[index];
         assert(operation.state == .pending);
+        if (operation.canceled) {
+            kernel.finish(index);
+            return true;
+        }
         switch (operation.opcode) {
-            // The first operation with that `user_data` ends at once,
-            // -ECANCELED. None: -ENOENT (it completed already, or never was).
-            .ASYNC_CANCEL => if (kernel.find(operation.target)) |victim| {
-                kernel.unlink(victim);
-                kernel.operations[victim].state = .pending;
-                kernel.operations[victim].result = errno(.CANCELED);
-                kernel.finish(victim);
-                kernel.stats.canceled += 1;
-                operation.result = 0;
-            } else {
-                operation.result = errno(.NOENT);
-            },
+            .ASYNC_CANCEL => {}, // decided at its submission (`cancel_now`)
             .MSG_RING => kernel.post(operation.target, operation.message_result, 0),
             .ACCEPT, .RECV, .SEND, .RECVMSG, .SENDMSG, .CLOSE => {
                 operation.result = kernel.attempt(operation) orelse return false;
@@ -500,6 +541,14 @@ pub const Kernel = struct {
         if (guarded.futex == .woken) return;
         guarded.result = errno(.CANCELED);
         kernel.finish(guarded_index);
+    }
+
+    /// The operations a cancel by descriptor reaches: those on a socket.
+    fn is_socket_operation(opcode: linux.IORING_OP) bool {
+        return switch (opcode) {
+            .ACCEPT, .RECV, .SEND, .RECVMSG, .SENDMSG => true,
+            else => false,
+        };
     }
 
     /// A socket's operation, tried now: its result, or null when its socket
@@ -570,20 +619,14 @@ pub const Kernel = struct {
         for (kernel.operations, 0..) |*operation, index| {
             if (operation.state == .free or operation.user_data != user_data) continue;
             if (operation.opcode == .ASYNC_CANCEL) continue;
-            // Woken, it is done: only its completion is on its way.
-            if (operation.futex == .woken) continue;
+            // Linked behind another and not started: nowhere the kernel
+            // looks (it is on its head's link, not in any cancel table).
+            if (operation.state == .linked) continue;
+            // Woken, or canceled, it is done: only its completion is on its way.
+            if (operation.futex == .woken or operation.canceled) continue;
             return @intCast(index);
         }
         return null;
-    }
-
-    /// A linked operation canceled before it started: the one before it
-    /// no longer starts it.
-    fn unlink(kernel: *Kernel, index: u32) void {
-        if (kernel.operations[index].state != .linked) return;
-        for (kernel.operations) |*operation| {
-            if (operation.state != .free and operation.next == index) operation.next = null;
-        }
     }
 
     /// Freed, and its completion posted unless the process asked not to

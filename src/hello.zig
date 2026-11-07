@@ -67,6 +67,11 @@ const App = struct {
 const Server = server_module.ServerType(App, .{
     .send_then_receive = Evented.sendThenReceive,
     .listen_backlog = Evented.listenBacklog,
+    .wake_read = Evented.wakeRead,
+    .wake_both = Evented.wakeBoth,
+    .current_fiber = Evented.currentFiber,
+    .receive = Evented.receive,
+    .send = Evented.send,
 });
 
 const Options = struct {

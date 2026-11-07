@@ -1305,7 +1305,8 @@ fn idle(ev: *Evented, thread: *Thread) void {
                 },
                 _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
                     0b00 => {
-                        const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                        // fourneau: a receive carries `receive_tag` above the two.
+                        const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b111));
                         ready_fiber.resultPointer(Completion).* = .{
                             .result = cqe.res,
                             .flags = cqe.flags,
@@ -6382,18 +6383,18 @@ pub fn sendThenReceive(
     defer cancel_region.deinit();
     const thread = try cancel_region.awaitIoUring();
     thread.reserve(2); // the pair is one chain: one submission
-    const send = thread.enqueue();
-    send.prep_send(socket_handle, bytes, linux.MSG.NOSIGNAL | linux.MSG.WAITALL);
-    send.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
+    const sending = thread.enqueue();
+    sending.prep_send(socket_handle, bytes, linux.MSG.NOSIGNAL | linux.MSG.WAITALL);
+    sending.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     // fourneau: a failed send completes to this fiber too. Linux then posts
     // no completion for the receive it canceled (`req_set_fail`: the
     // send's CQE_SKIP becomes SKIP_LINK_CQES), so either way the fiber
     // gets exactly one: the receive's, or the failed send's. Sent to the
     // idle loop instead, the fiber waited for good (2026-10-16).
-    send.user_data = @intFromPtr(cancel_region.fiber);
-    const receive = thread.enqueue();
-    receive.prep_recv(socket_handle, buffer, linux.MSG.NOSIGNAL);
-    receive.user_data = @intFromPtr(cancel_region.fiber);
+    sending.user_data = @intFromPtr(cancel_region.fiber);
+    const receiving = thread.enqueue();
+    receiving.prep_recv(socket_handle, buffer, linux.MSG.NOSIGNAL);
+    receiving.user_data = @intFromPtr(cancel_region.fiber) | receive_tag;
     thread.counts.linked += 1;
     ev.yield(null, .nothing);
     const completion = cancel_region.completion();
@@ -6404,6 +6405,176 @@ pub fn sendThenReceive(
         .CANCELED, .CONNRESET, .PIPE, .NOTCONN => error.ConnectionResetByPeer,
         else => |err| unexpectedErrno(err),
     };
+}
+
+/// fourneau: the fiber running now, as `wakeRead` names it.
+pub fn currentFiber() usize {
+    return @intFromPtr(Thread.current().currentFiber());
+}
+
+/// fourneau: a receive's `user_data` is its fiber with this bit, so a
+/// `wakeRead` finds the receive and never the send it may be linked
+/// behind. Fibers are aligned past it; the completion dispatch masks it.
+const receive_tag: usize = 0b100;
+comptime {
+    assert(@alignOf(Fiber) >= 8);
+}
+
+/// fourneau: end a fiber's wait for the next request from another fiber
+/// (eviction, a drain's idle close), with no system call: its pending
+/// `receive`, or the receive of its `sendThenReceive`, is canceled and
+/// returns `Shut`. A receive linked behind a send still going out is not
+/// found (the kernel does not look at links not started), so the send
+/// goes out whole, as a read-side shutdown let it; the caller keeps the
+/// socket shut (fourneau's server: a later receive sees the end), so the
+/// fiber ends when its turn does. Fire and forget: no yield; the cancel
+/// goes in the same submission as what it cancels, after it; finding
+/// nothing is -ENOENT, ignored. Unlike a shutdown through the ring, which
+/// runs on the kernel's workers after a later close, this can never reach
+/// another connection: it names one fiber's receive.
+pub fn wakeRead(fiber: usize) void {
+    assert(fiber & 0b111 == 0);
+    cancelByUserdata(fiber | receive_tag);
+}
+
+/// fourneau: end every wait on a socket (a deadline, the drain's cut):
+/// what is pending on it is canceled, a send-then-receive chain whole, so
+/// its fiber gets exactly one completion, and `receive` or `send`
+/// returns `Shut`. The caller keeps the socket shut both ways from then
+/// on. Fire and forget, as `wakeRead`.
+pub fn wakeBoth(socket_handle: net.Socket.Handle) void {
+    const thread: *Thread = .current();
+    thread.enqueue().* = .{
+        .opcode = .ASYNC_CANCEL,
+        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = socket_handle,
+        .off = 0,
+        .addr = 0,
+        .len = 0,
+        .rw_flags = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_ALL,
+        .user_data = @backingInt(Completion.Userdata.wakeup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+}
+
+/// The first operation with this `user_data` is canceled; its own
+/// completion is skipped, or -ENOENT, which the dispatch ignores.
+fn cancelByUserdata(user_data: usize) void {
+    const thread: *Thread = .current();
+    thread.enqueue().* = .{
+        .opcode = .ASYNC_CANCEL,
+        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = 0,
+        .off = 0,
+        .addr = user_data,
+        .len = 0,
+        .rw_flags = 0,
+        .user_data = @backingInt(Completion.Userdata.wakeup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+}
+
+/// fourneau: what `receive` and `send` end with. `Shut`: `wake` ended the
+/// wait; `Canceled`: the fiber's own cancelation (`Io.cancel`).
+pub const ShutError = error{
+    Shut,
+    Canceled,
+    ConnectionResetByPeer,
+    SocketUnconnected,
+    SystemResources,
+    Unexpected,
+};
+
+/// fourneau: one receive, ended by `wake` with `Shut`; the stream read
+/// (`netReadStream`) retries a canceled receive, which would lose the
+/// wake. Otherwise as the stream read: a kTLS record that is not data is
+/// the end of the stream, 0.
+pub fn receive(
+    io_instance: Io,
+    socket_handle: net.Socket.Handle,
+    buffer: []u8,
+) ShutError!usize {
+    assert(buffer.len > 0);
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    var cancel_region: CancelRegion = .init();
+    defer cancel_region.deinit();
+    const thread = try cancel_region.awaitIoUring();
+    const sqe = thread.enqueue();
+    sqe.prep_recv(socket_handle, buffer, linux.MSG.NOSIGNAL);
+    sqe.user_data = @intFromPtr(cancel_region.fiber) | receive_tag;
+    ev.yield(null, .nothing);
+    const completion = cancel_region.completion();
+    return switch (completion.errno()) {
+        .SUCCESS => @intCast(completion.result),
+        .CANCELED => shutOrCanceled(&cancel_region),
+        .CONNRESET => error.ConnectionResetByPeer,
+        .NOTCONN => error.SocketUnconnected,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .IO => 0,
+        else => |err| unexpectedErrno(err),
+    };
+}
+
+/// fourneau: one send of `head` then `body` (a response's head and its
+/// body, one operation), ended by `wake` with `Shut`; the count sent.
+pub fn send(
+    io_instance: Io,
+    socket_handle: net.Socket.Handle,
+    head: []const u8,
+    body: []const u8,
+) ShutError!usize {
+    assert(head.len + body.len > 0);
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    var cancel_region: CancelRegion = .init();
+    defer cancel_region.deinit();
+    const iovecs = [2]iovec_const{
+        .{ .base = head.ptr, .len = head.len },
+        .{ .base = body.ptr, .len = body.len },
+    };
+    var msg: linux.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iovecs,
+        .iovlen = 2,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const thread = try cancel_region.awaitIoUring();
+    const sqe = thread.enqueue();
+    if (head.len == 0) {
+        sqe.prep_send(socket_handle, body, linux.MSG.NOSIGNAL);
+    } else if (body.len == 0) {
+        sqe.prep_send(socket_handle, head, linux.MSG.NOSIGNAL);
+    } else sqe.prep_sendmsg(socket_handle, &msg, linux.MSG.NOSIGNAL);
+    sqe.user_data = @intFromPtr(cancel_region.fiber);
+    ev.yield(null, .nothing);
+    const completion = cancel_region.completion();
+    return switch (completion.errno()) {
+        .SUCCESS => @intCast(completion.result),
+        .CANCELED => shutOrCanceled(&cancel_region),
+        .CONNRESET, .PIPE => error.ConnectionResetByPeer,
+        .NOTCONN => error.SocketUnconnected,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => |err| unexpectedErrno(err),
+    };
+}
+
+/// A canceled operation was ended by `wake`, unless the fiber itself was
+/// canceled, which the region reports as the stream read's loop does.
+fn shutOrCanceled(cancel_region: *CancelRegion) ShutError {
+    _ = cancel_region.awaitIoUring() catch return error.Canceled;
+    return error.Shut;
 }
 
 /// fourneau: whether clients wait in a listener's backlog, for an acceptor

@@ -326,9 +326,21 @@ const App = struct {
     }
 };
 
-const ServerPlain = server_module.ServerType(App, .{ .listen_backlog = Evented.listenBacklog });
+const ServerPlain = server_module.ServerType(App, .{
+    .listen_backlog = Evented.listenBacklog,
+    .wake_read = Evented.wakeRead,
+    .wake_both = Evented.wakeBoth,
+    .current_fiber = Evented.currentFiber,
+    .receive = Evented.receive,
+    .send = Evented.send,
+});
 const ServerLinked = server_module.ServerType(App, .{
     .listen_backlog = Evented.listenBacklog,
+    .wake_read = Evented.wakeRead,
+    .wake_both = Evented.wakeBoth,
+    .current_fiber = Evented.currentFiber,
+    .receive = Evented.receive,
+    .send = Evented.send,
     .send_then_receive = Evented.sendThenReceive,
 });
 
