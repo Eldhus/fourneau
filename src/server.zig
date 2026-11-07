@@ -234,6 +234,15 @@ pub const Options = struct {
     current_fiber: ?CurrentFiber = null,
     receive: ?Receive = null,
     send: ?Send = null,
+    /// Accept into the ring's own file table (our port: `acceptDirect`,
+    /// with `InitOptions.direct_sockets_max` sized to the slots and one
+    /// more): a connection then holds no process descriptor. Needs
+    /// `set_option`, since a direct socket has no descriptor to set an
+    /// option on. Null: the listener's `accept`, a descriptor each.
+    accept: ?Accept = null,
+    /// A socket option through the ring (`Evented.setSocketOption`):
+    /// TCP_NODELAY and kernel TLS. Null: the system call.
+    set_option: ?SetOption = null,
 };
 
 /// Clients waiting in a listener's backlog; null when the kernel will not say.
@@ -253,6 +262,16 @@ pub const Send = fn (
     head: []const u8,
     body: []const u8,
 ) anyerror!usize;
+/// Accept a connection on the listener, as `net.Server.accept` does.
+pub const Accept = fn (io: Io, listen_handle: net.Socket.Handle) net.Server.AcceptError!net.Stream;
+/// Set a socket option; `error.SocketUnconnected` when the peer is gone.
+pub const SetOption = fn (
+    io: Io,
+    socket_handle: net.Socket.Handle,
+    level: i32,
+    name: u32,
+    value: []const u8,
+) anyerror!void;
 
 /// Send all of the bytes, then receive into the buffer; the count received.
 pub const SendThenReceive = fn (
@@ -1216,7 +1235,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn accept_loop(server: *Server) void {
             // Bounded only to say so: it ends by cancelation.
             for (0..std.math.maxInt(u64)) |_| {
-                const stream = server.listener.accept(server.io) catch |err| switch (err) {
+                const stream = server.accept() catch |err| switch (err) {
                     error.Canceled => return,
                     // Out of descriptors before the slots are full: the
                     // process's limit, when the reserve the startup sized it
@@ -1257,6 +1276,29 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     server.close_connection(&server.connections[index]);
                 };
             } else unreachable;
+        }
+
+        /// TCP_NODELAY on a new connection (`no_delay`): through the ring
+        /// where the `Io` can (`Options.set_option`), which a direct socket
+        /// needs, else the system call.
+        fn set_no_delay(server: *Server, handle: net.Socket.Handle) void {
+            const set_option = type_options.set_option orelse return no_delay(handle);
+            const on: u32 = 1;
+            const linux = std.os.linux;
+            const value = std.mem.asBytes(&on);
+            set_option(server.io, handle, linux.IPPROTO.TCP, linux.TCP.NODELAY, value) catch |err| {
+                log.warn("TCP_NODELAY: {t}", .{err});
+            };
+        }
+
+        /// The next connection: into the ring's file table where the `Io`
+        /// can (`Options.accept`), else a descriptor.
+        fn accept(server: *Server) net.Server.AcceptError!net.Stream {
+            if (type_options.accept) |accept_direct| {
+                comptime assert(type_options.set_option != null);
+                return accept_direct(server.io, server.listener.socket.handle);
+            }
+            return server.listener.accept(server.io);
         }
 
         /// One tick's wait, for a descriptor or a slot to free: false when
@@ -1379,7 +1421,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         fn open_connection(server: *Server, index: u32, stream: net.Stream) void {
             const connection = &server.connections[index];
             assert(!connection.open);
-            if (server.config.tcp_nodelay) no_delay(stream.socket.handle);
+            if (server.config.tcp_nodelay) server.set_no_delay(stream.socket.handle);
             connection.server = server;
             connection.index = index;
             connection.stream = stream;
@@ -1460,7 +1502,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             const established = tls.handshake(server.io, &transport, socket, context, .{
                 .early = connection.recv,
                 .protocols = protocols,
-            }) catch |err| {
+            }, type_options.set_option) catch |err| {
                 server.stats.handshakes_failed += 1;
                 log.debug("handshake: {t}", .{err});
                 switch (err) {

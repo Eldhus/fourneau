@@ -71,6 +71,8 @@ main_fiber_buffer: [
     std.mem.alignForward(usize, @sizeOf(Fiber), @alignOf(Completion)) + @sizeOf(Completion)
 ]u8 align(@max(@alignOf(Fiber), @alignOf(Completion))),
 log2_ring_entries: u4,
+/// fourneau: the ring's file table's size (`InitOptions.direct_sockets_max`).
+direct_sockets_max: u32,
 threads: Thread.List,
 /// fourneau: every fiber's memory, reserved once at `init` (`Fiber.reserve`),
 /// `fibers_max` strides of `Fiber.allocation_size`.
@@ -884,6 +886,10 @@ pub const InitOptions = struct {
     /// `ConcurrencyUnavailable`, and `async` runs its function inline.
     /// The main fiber is not one of them.
     fibers_max: u32,
+    /// fourneau: the ring's own file table, for sockets accepted into it
+    /// (`acceptDirect`): a connection then holds no process descriptor.
+    /// Sized at `init` (TigerStyle's static allocation); 0 registers none.
+    direct_sockets_max: u32 = 0,
 
     /// Affects the following operations:
     /// * `processExecutablePath` on OpenBSD and Haiku.
@@ -909,6 +915,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .backing_allocator = backing_allocator,
         .main_fiber_buffer = undefined,
         .log2_ring_entries = options.log2_ring_entries,
+        .direct_sockets_max = options.direct_sockets_max,
         .threads = .{
             .allocated = @ptrCast(allocated_slice[0..threads_size]),
             .reserved = 1,
@@ -987,6 +994,12 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng = .uninitialized,
     };
     errdefer main_thread.io_uring.deinit();
+    // fourneau: the table direct sockets live in, sparse, the kernel
+    // allocating from all of it (`IORING_FILE_INDEX_ALLOC`).
+    if (options.direct_sockets_max > 0) {
+        try main_thread.io_uring.register_files_sparse(options.direct_sockets_max);
+        try main_thread.io_uring.register_file_alloc_range(0, options.direct_sockets_max);
+    }
     ev.fibers = try Fiber.reserve(options.fibers_max);
     if (tracy.enable) tracy.fiberEnter(main_fiber.name);
 }
@@ -5381,6 +5394,9 @@ fn netShutdown(
     how: net.ShutdownHow,
 ) net.ShutdownError!void {
     _ = userdata;
+    // fourneau: a direct socket has no descriptor to call it on; its waits
+    // are ended by `wakeRead` and `wakeBoth` instead.
+    assert(directIndex(handle) == null);
     const flags: i32 = switch (how) {
         .recv => linux.SHUT.RD,
         .send => linux.SHUT.WR,
@@ -5492,17 +5508,21 @@ fn chdir(sync: *CancelRegion.Sync, path: [*:0]const u8) ChdirError!void {
     }
 }
 
+/// fourneau: a direct socket (`directIndex`) is closed by its index in the
+/// table (`prep_close_direct`: the index plus one in the file-index field,
+/// the descriptor field unused).
 fn close(ev: *Evented, fd: fd_t) void {
     var cancel_region: CancelRegion = .initBlocked();
     defer cancel_region.deinit();
     const thread = cancel_region.awaitIoUring() catch |err| switch (err) {
         error.Canceled => unreachable, // blocked
     };
+    const direct = directIndex(fd);
     thread.enqueue().* = .{
         .opcode = .CLOSE,
         .flags = 0,
         .ioprio = 0,
-        .fd = fd,
+        .fd = if (direct != null) 0 else fd,
         .off = 0,
         .addr = 0,
         .len = 0,
@@ -5510,7 +5530,7 @@ fn close(ev: *Evented, fd: fd_t) void {
         .user_data = @intFromPtr(cancel_region.fiber),
         .buf_index = 0,
         .personality = 0,
-        .splice_fd_in = 0,
+        .splice_fd_in = if (direct) |index| @intCast(index + 1) else 0,
         .addr3 = 0,
         .resv = 0,
     };
@@ -5525,11 +5545,12 @@ fn close(ev: *Evented, fd: fd_t) void {
 fn closeAsync(ev: *Evented, fd: fd_t) void {
     _ = ev;
     const thread: *Thread = .current();
+    const direct = directIndex(fd);
     thread.enqueue().* = .{
         .opcode = .CLOSE,
         .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
         .ioprio = 0,
-        .fd = fd,
+        .fd = if (direct != null) 0 else fd,
         .off = 0,
         .addr = 0,
         .len = 0,
@@ -5537,7 +5558,7 @@ fn closeAsync(ev: *Evented, fd: fd_t) void {
         .user_data = @backingInt(Completion.Userdata.close),
         .buf_index = 0,
         .personality = 0,
-        .splice_fd_in = 0,
+        .splice_fd_in = if (direct) |index| @intCast(index + 1) else 0,
         .addr3 = 0,
         .resv = 0,
     };
@@ -6395,6 +6416,7 @@ pub fn sendThenReceive(
     thread.reserve(2); // the pair is one chain: one submission
     const sending = thread.enqueue();
     sending.prep_send(socket_handle, bytes, linux.MSG.NOSIGNAL | linux.MSG.WAITALL);
+    prepSocket(sending, socket_handle);
     sending.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     // fourneau: a failed send completes to this fiber too. Linux then posts
     // no completion for the receive it canceled (`req_set_fail`: the
@@ -6404,6 +6426,7 @@ pub fn sendThenReceive(
     sending.user_data = @intFromPtr(cancel_region.fiber);
     const receiving = thread.enqueue();
     receiving.prep_recv(socket_handle, buffer, linux.MSG.NOSIGNAL);
+    prepSocket(receiving, socket_handle);
     receiving.user_data = @intFromPtr(cancel_region.fiber) | receive_tag;
     thread.counts.linked += 1;
     ev.yield(null, .nothing);
@@ -6420,6 +6443,143 @@ pub fn sendThenReceive(
         .CANCELED, .CONNRESET, .PIPE, .NOTCONN => error.ConnectionResetByPeer,
         else => |err| unexpectedErrno(err),
     };
+}
+
+/// fourneau: a direct socket's handle is its index in the ring's file
+/// table with this bit, which no descriptor carries (`fs.nr_open` is far
+/// below it). `std.Io` knows a socket as one integer, so the kind lives in
+/// it; every operation on a socket asks `directIndex` and names the fixed
+/// file instead of a descriptor.
+const direct_bit: net.Socket.Handle = 1 << 30;
+
+/// The index of a direct socket in the ring's file table; null for a
+/// descriptor.
+pub fn directIndex(handle: net.Socket.Handle) ?u32 {
+    if (handle & direct_bit == 0) return null;
+    return @intCast(handle & ~direct_bit);
+}
+
+/// After a `prep_*` named the handle as a descriptor: a direct socket is
+/// named by index with the fixed-file flag instead.
+fn prepSocket(sqe: *linux.io_uring_sqe, handle: net.Socket.Handle) void {
+    if (directIndex(handle)) |index| {
+        sqe.fd = @intCast(index);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+    }
+}
+
+/// fourneau: accept into the ring's file table (`InitOptions.
+/// direct_sockets_max`): the connection is a slot there, no descriptor,
+/// so it costs no `RLIMIT_NOFILE`, no lock on the process's descriptor
+/// table shared by every shard's thread, and no lookup per operation. The
+/// listener stays a descriptor. A full table is reported as the
+/// descriptors' limit would be: the caller sized the table to its slots,
+/// so it waits as for one.
+pub fn acceptDirect(
+    io_instance: Io,
+    listen_handle: net.Socket.Handle,
+) net.Server.AcceptError!net.Stream {
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    assert(directIndex(listen_handle) == null);
+    assert(ev.direct_sockets_max > 0); // a table was registered at `init`
+    var cancel_region: CancelRegion = .init();
+    defer cancel_region.deinit();
+    var storage: PosixAddress = undefined;
+    var addr_len: linux.socklen_t = @sizeOf(PosixAddress);
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        const sqe = thread.enqueue();
+        const index_alloc = linux.IORING_FILE_INDEX_ALLOC;
+        sqe.prep_accept_direct(listen_handle, &storage.any, &addr_len, 0, index_alloc);
+        sqe.user_data = @intFromPtr(cancel_region.fiber);
+        ev.yield(null, .nothing);
+        const completion = cancel_region.completion();
+        switch (completion.errno()) {
+            .SUCCESS => {
+                assert(completion.result >= 0);
+                return .{ .socket = .{
+                    .handle = completion.result | direct_bit,
+                    .address = addressFromPosix(&storage),
+                } };
+            },
+            .INTR, .CANCELED => {},
+            .CONNABORTED => {}, // the client gave up before we took it: take the next
+            .MFILE, .NFILE => return error.ProcessFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .INVAL => return error.SocketNotListening,
+            .BADF, .NOTSOCK, .FAULT, .OPNOTSUPP => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+/// fourneau: what a socket option set through the ring ends with.
+pub const SetOptionError = error{ SocketUnconnected, Canceled, Unexpected };
+
+/// fourneau: `setsockopt` through the ring's socket command, for a socket
+/// that may be a direct one (no descriptor to call it on): TCP_NODELAY,
+/// kernel TLS's attach and keys. Linux 6.7 and later.
+pub fn setSocketOption(
+    io_instance: Io,
+    socket_handle: net.Socket.Handle,
+    level: i32,
+    name: u32,
+    value: []const u8,
+) SetOptionError!void {
+    assert(value.len > 0);
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    var cancel_region: CancelRegion = .init();
+    defer cancel_region.deinit();
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        const sqe = thread.enqueue();
+        prepSetsockopt(sqe, socket_handle, level, name, value);
+        sqe.user_data = @intFromPtr(cancel_region.fiber);
+        ev.yield(null, .nothing);
+        switch (cancel_region.errno()) {
+            .SUCCESS => return,
+            .INTR, .CANCELED => {},
+            .NOTCONN => return error.SocketUnconnected,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+/// `IORING_OP_URING_CMD` `SOCKET_URING_OP_SETSOCKOPT`, as liburing lays it
+/// out: the command in `off`, level and name in `addr`, the value's bytes
+/// in `addr3` and their count in `splice_fd_in`.
+fn prepSetsockopt(
+    sqe: *linux.io_uring_sqe,
+    socket_handle: net.Socket.Handle,
+    level: i32,
+    name: u32,
+    value: []const u8,
+) void {
+    const off: extern struct {
+        cmd_op: linux.IO_URING_SOCKET_OP,
+        pad: u32,
+    } align(@alignOf(u64)) = .{ .cmd_op = .SETSOCKOPT, .pad = 0 };
+    const addr: extern struct { level: i32, opt_name: u32 } align(@alignOf(u64)) = .{
+        .level = level,
+        .opt_name = name,
+    };
+    sqe.* = .{
+        .opcode = .URING_CMD,
+        .flags = 0,
+        .ioprio = 0,
+        .fd = socket_handle,
+        .off = @as(*const u64, @ptrCast(&off)).*,
+        .addr = @as(*const u64, @ptrCast(&addr)).*,
+        .len = 0,
+        .rw_flags = 0,
+        .user_data = 0,
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = @intCast(value.len),
+        .addr3 = @intFromPtr(value.ptr),
+        .resv = 0,
+    };
+    prepSocket(sqe, socket_handle);
 }
 
 /// fourneau: the fiber running now, as `wakeRead` names it.
@@ -6459,15 +6619,17 @@ pub fn wakeRead(fiber: usize) void {
 /// on. Fire and forget, as `wakeRead`.
 pub fn wakeBoth(socket_handle: net.Socket.Handle) void {
     const thread: *Thread = .current();
+    const by_fd: u32 = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_ALL;
+    const fixed: u32 = if (directIndex(socket_handle) != null) linux.IORING_ASYNC_CANCEL_FD_FIXED else 0;
     thread.enqueue().* = .{
         .opcode = .ASYNC_CANCEL,
         .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
         .ioprio = 0,
-        .fd = socket_handle,
+        .fd = if (directIndex(socket_handle)) |index| @intCast(index) else socket_handle,
         .off = 0,
         .addr = 0,
         .len = 0,
-        .rw_flags = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_ALL,
+        .rw_flags = by_fd | fixed,
         .user_data = @backingInt(Completion.Userdata.wakeup),
         .buf_index = 0,
         .personality = 0,
@@ -6526,6 +6688,7 @@ pub fn receive(
     const thread = try cancel_region.awaitIoUring();
     const sqe = thread.enqueue();
     sqe.prep_recv(socket_handle, buffer, linux.MSG.NOSIGNAL);
+    prepSocket(sqe, socket_handle);
     sqe.user_data = @intFromPtr(cancel_region.fiber) | receive_tag;
     ev.yield(null, .nothing);
     const completion = cancel_region.completion();
@@ -6572,6 +6735,7 @@ pub fn send(
     } else if (body.len == 0) {
         sqe.prep_send(socket_handle, head, linux.MSG.NOSIGNAL);
     } else sqe.prep_sendmsg(socket_handle, &msg, linux.MSG.NOSIGNAL);
+    prepSocket(sqe, socket_handle);
     sqe.user_data = @intFromPtr(cancel_region.fiber);
     ev.yield(null, .nothing);
     const completion = cancel_region.completion();
@@ -6640,6 +6804,7 @@ fn netReadStream(
             const buffer: []u8 = @as([*]u8, @ptrCast(iovecs[0].base))[0..iovecs[0].len];
             sqe.prep_recv(o.socket_handle, buffer, linux.MSG.NOSIGNAL);
         } else sqe.prep_recvmsg(o.socket_handle, &msg, linux.MSG.NOSIGNAL);
+        prepSocket(sqe, o.socket_handle);
         sqe.user_data = @intFromPtr(cancel_region.fiber);
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();
@@ -6696,6 +6861,7 @@ fn netWriteStream(
         if (count == 1) {
             sqe.prep_send(o.socket_handle, iovecs[0].base[0..iovecs[0].len], linux.MSG.NOSIGNAL);
         } else sqe.prep_sendmsg(o.socket_handle, &msg, linux.MSG.NOSIGNAL);
+        prepSocket(sqe, o.socket_handle);
         sqe.user_data = @intFromPtr(cancel_region.fiber);
         ev.yield(null, .nothing);
         const completion = cancel_region.completion();

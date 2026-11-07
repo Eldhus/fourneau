@@ -182,12 +182,23 @@ pub fn TransportType(comptime Connection: type) type {
 /// The handshake, then kTLS. Writes into `early` whatever the client sent
 /// after its Finished that the input buffer already holds, decrypted:
 /// the first bytes of the HTTP stream.
+/// The server's way to set a socket option (its `Io`'s, for a socket that
+/// may have no descriptor); null for the system call.
+pub const SetOption = fn (
+    io: Io,
+    socket: std.posix.socket_t,
+    level: i32,
+    name: u32,
+    value: []const u8,
+) anyerror!void;
+
 pub fn handshake(
     io: Io,
     transport: anytype,
     socket: std.posix.socket_t,
     context: *const Context,
     options: struct { early: []u8, protocols: Protocols },
+    comptime set_option: ?SetOption,
 ) HandshakeError!Established {
     transport.reader.fill(1) catch return error.HandshakeFailed;
     if (transport.reader.buffered()[0] != record_type_handshake) return error.NotTls;
@@ -201,7 +212,7 @@ pub fn handshake(
     }) catch return error.HandshakeFailed;
     const early_bytes = try take_buffered(&session, &transport.reader, options.early);
     var keys = tls.Ktls.init(session.cipher);
-    try kernel_tls(socket, &keys);
+    try kernel_tls(io, socket, &keys, set_option);
     const chosen = session.alpn_protocol orelse "http/1.1";
     const http2 = std.mem.eql(u8, chosen, "h2");
     assert(!http2 or options.protocols == .http2_and_http1);
@@ -225,20 +236,38 @@ fn take_buffered(session: anytype, reader: *Io.Reader, early: []u8) HandshakeErr
 
 /// The keys to the kernel. That the kernel has TLS at all was checked at
 /// startup (`check_kernel`), so a failure here is about this connection.
-fn kernel_tls(socket: std.posix.socket_t, keys: *tls.Ktls) HandshakeError!void {
-    try set_option(socket, attach_step);
-    try set_option(socket, .{
+fn kernel_tls(
+    io: Io,
+    socket: std.posix.socket_t,
+    keys: *tls.Ktls,
+    comptime set_option: ?SetOption,
+) HandshakeError!void {
+    const tx: SocketOption = .{
         .label = "TLS_TX",
         .level = linux.SOL.TLS,
         .name = tls.Ktls.TX,
         .value = keys.txBytes(),
-    });
-    try set_option(socket, .{
+    };
+    const rx: SocketOption = .{
         .label = "TLS_RX",
         .level = linux.SOL.TLS,
         .name = tls.Ktls.RX,
         .value = keys.rxBytes(),
-    });
+    };
+    const steps = [_]SocketOption{ attach_step, tx, rx };
+    for (steps) |step| {
+        const set = set_option orelse {
+            try set_option_syscall(socket, step);
+            continue;
+        };
+        set(io, socket, step.level, step.name, step.value) catch |err| switch (err) {
+            error.SocketUnconnected => return error.PeerClosed,
+            else => {
+                std.log.scoped(.fourneau).warn("kTLS: {s}: {t}", .{ step.label, err });
+                return error.KernelTlsFailed;
+            },
+        };
+    }
 }
 
 const SocketOption = struct { label: []const u8, level: i32, name: u32, value: []const u8 };
@@ -251,7 +280,7 @@ const attach_step: SocketOption = .{
     .value = ulp,
 };
 
-fn set_option(socket: std.posix.socket_t, option: SocketOption) HandshakeError!void {
+fn set_option_syscall(socket: std.posix.socket_t, option: SocketOption) HandshakeError!void {
     assert(option.label.len > 0);
     assert(option.value.len > 0);
     const result = linux.setsockopt(
@@ -331,7 +360,7 @@ test "tls: a client gone before its keys is PeerClosed, not a kernel fault" {
     const open = try test_pair(listener);
     defer _ = linux.close(open.client);
     defer _ = linux.close(open.server);
-    try set_option(open.server, attach_step);
+    try set_option_syscall(open.server, attach_step);
     // The client closed, and its FIN is in (read says end of stream): the
     // connection is CLOSE_WAIT, and Linux refuses TLS with ENOTCONN.
     const gone = try test_pair(listener);
@@ -339,7 +368,7 @@ test "tls: a client gone before its keys is PeerClosed, not a kernel fault" {
     _ = try test_syscall(linux.close(gone.client));
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(u32, 0), try test_syscall(linux.read(gone.server, &byte, 1)));
-    try std.testing.expectError(error.PeerClosed, set_option(gone.server, attach_step));
+    try std.testing.expectError(error.PeerClosed, set_option_syscall(gone.server, attach_step));
 }
 
 fn test_syscall(result: usize) !u32 {

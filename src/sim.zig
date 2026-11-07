@@ -333,6 +333,18 @@ const ServerPlain = server_module.ServerType(App, .{
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .accept = Evented.acceptDirect,
+    .set_option = Evented.setSocketOption,
+});
+/// Connections as descriptors (`net.Server.accept`): the scenario on the
+/// descriptor limit, which a direct socket does not meet.
+const ServerDescriptors = server_module.ServerType(App, .{
+    .listen_backlog = Evented.listenBacklog,
+    .wake_read = Evented.wakeRead,
+    .wake_both = Evented.wakeBoth,
+    .current_fiber = Evented.currentFiber,
+    .receive = Evented.receive,
+    .send = Evented.send,
 });
 const ServerLinked = server_module.ServerType(App, .{
     .listen_backlog = Evented.listenBacklog,
@@ -341,6 +353,8 @@ const ServerLinked = server_module.ServerType(App, .{
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .accept = Evented.acceptDirect,
+    .set_option = Evented.setSocketOption,
     .send_then_receive = Evented.sendThenReceive,
 });
 
@@ -416,6 +430,8 @@ fn Shard(comptime Server: type) type {
                 .thread_limit = 0, // one shard, one thread
                 .fibers_max = shard.plan.server.fibers_max(),
                 .log2_ring_entries = shard.plan.log2_ring_entries,
+                // The slots, and the one accepted while they are all held.
+                .direct_sockets_max = shard.plan.server.connections_max + 1,
             });
             defer runtime.deinit();
             const io = runtime.io();
@@ -754,6 +770,8 @@ fn scripted_plan(connections_max: u32) Setup {
 const Scripted = ScriptedType(ServerPlain);
 /// The same with the port's linked send-then-receive turn.
 const ScriptedLinked = ScriptedType(ServerLinked);
+/// The same with connections as descriptors.
+const ScriptedDescriptors = ScriptedType(ServerDescriptors);
 
 fn ScriptedType(comptime ServerT: type) type {
     return struct {
@@ -1010,7 +1028,7 @@ test "sim: an idle connection evicted as its next request arrives closes unanswe
 test "sim: short of descriptors, the longest idle is evicted only for a client waiting" {
     const gpa = std.testing.allocator;
     for (1..17) |seed| {
-        var scripted: Scripted = undefined;
+        var scripted: ScriptedDescriptors = undefined;
         var plan = scripted_plan(4);
         plan.kernel.network.descriptors_max = 2;
         try scripted.init(gpa, seed, plan);

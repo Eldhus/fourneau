@@ -72,6 +72,8 @@ const Server = server_module.ServerType(App, .{
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .accept = Evented.acceptDirect,
+    .set_option = Evented.setSocketOption,
 });
 
 const Options = struct {
@@ -170,6 +172,7 @@ fn run_shard_or_fail(options: Options, stop: *const std.atomic.Value(bool)) !voi
         // costing ~3,000 kernel cycles a request.
         .log2_ring_entries = 12,
         .fibers_max = config.fibers_max() + 1, // and `print_counts`
+        .direct_sockets_max = config.connections_max + 1,
     });
     defer runtime.deinit();
 
@@ -311,7 +314,11 @@ test "hello: a stopped server drains: the request in flight is answered and clos
         .stop = &stop,
     };
     var runtime: Evented = undefined;
-    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = config.fibers_max() });
+    try runtime.init(gpa, .{
+        .thread_limit = 0,
+        .fibers_max = config.fibers_max(),
+        .direct_sockets_max = config.connections_max + 1,
+    });
     defer runtime.deinit();
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -516,7 +523,11 @@ test "hello: HTTP/2 under load: streams kept in flight, every slot given back" {
         .http2 = .{ .streams_max = 2 * clients * parallel },
     };
     var runtime: Evented = undefined;
-    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = config.fibers_max() });
+    try runtime.init(gpa, .{
+        .thread_limit = 0,
+        .fibers_max = config.fibers_max(),
+        .direct_sockets_max = config.connections_max + 1,
+    });
     defer runtime.deinit();
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -560,7 +571,11 @@ test "hello: HTTP/2 by prior knowledge: two streams on one connection, then a dr
         .http2 = .{ .streams_max = 8 },
     };
     var runtime: Evented = undefined;
-    try runtime.init(gpa, .{ .thread_limit = 0, .fibers_max = config.fibers_max() });
+    try runtime.init(gpa, .{
+        .thread_limit = 0,
+        .fibers_max = config.fibers_max(),
+        .direct_sockets_max = config.connections_max + 1,
+    });
     defer runtime.deinit();
     const io = runtime.io();
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);

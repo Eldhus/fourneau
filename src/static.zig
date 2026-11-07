@@ -62,6 +62,8 @@ const port_options: server_module.Options = .{
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .accept = Evented.acceptDirect,
+    .set_option = Evented.setSocketOption,
 };
 
 const Server = server_module.ServerType(App, port_options);
@@ -74,73 +76,44 @@ const Options = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     shards: u32 = 0,
-    /// Per shard, sized to the descriptor limit (`connections_per_shard`).
+    /// Per shard (`connections_per_shard`), set in `main`.
     connections_max: u32 = 0,
     /// The certificate (files or ACME) and the redirect: https.zig.
     https: https.Options = .{},
 };
 
 /// Connections across all shards, when that gives a shard at least
-/// `connections_per_shard_min` (256 shards want 16,384).
+/// `connections_per_shard_min` (256 shards want 16,384). A connection is
+/// a slot in its shard's ring file table (`Evented.acceptDirect`), not a
+/// descriptor: the descriptor limit does not bound them.
 const connections_max = 1024;
-/// A shard holds at least these; below them the server does not start.
+/// A shard holds at least these.
 const connections_per_shard_min = 64;
 
-/// Connections a shard holds: `connections_max` in all, or
-/// `connections_per_shard_min` each when that is more, as the descriptor
-/// limit allows. A connection is a descriptor, so the soft limit is first
-/// raised to what the server needs: the connections and the reserve for
-/// everything else. Fewer than `connections_per_shard_min` a shard fit:
-/// the environment cannot run the server, said with the number to set.
-fn connections_per_shard(shards: u32, redirect: bool) !u32 {
+fn connections_per_shard(shards: u32) u32 {
     assert(shards >= 1);
     assert(shards <= shards_max);
-    const wanted = @max(connections_per_shard_min, connections_max / shards) * shards;
-    const minimum = connections_per_shard_min * shards;
+    return @max(connections_per_shard_min, connections_max / shards);
+}
+
+/// The process's descriptors, ready: the soft limit raised to the reserve
+/// (1,024 by default under systemd, which the reserve is under until 460
+/// shards), and what is open before the shards start checked against the
+/// reserve, or the server refuses with the counts and the number to set,
+/// instead of running short of descriptors under load.
+fn descriptors_ready(shards: u32, redirect: bool) !void {
+    assert(shards >= 1);
+    assert(shards <= shards_max);
     const reserved = descriptors_reserved(shards, redirect);
-    const need: u64 = @as(u64, reserved) + wanted;
-    const descriptors = listen.descriptor_limit_raise(need);
-    const fitting = listen.connections_fitting(.{
-        .descriptors = descriptors,
-        .reserved = reserved,
-        .wanted = wanted,
-        .minimum = minimum,
-    }) orelse {
-        log.err("the descriptor limit is {d}; {d} connections need {d} with {d} reserved: " ++
-            "set it to {d} (ulimit -n {d}; LimitNOFILE={d} under systemd)", .{
-            descriptors, wanted, need, reserved, need, need, need,
+    const limit = listen.descriptor_limit_raise(reserved);
+    if (limit < reserved) {
+        log.err("the descriptor limit is {d}; {d} shards need {d}: set it to {d} (ulimit -n " ++
+            "{d}; LimitNOFILE={d} under systemd)", .{
+            limit, shards, reserved, reserved, reserved, reserved,
         });
         return error.DescriptorLimit;
-    };
-    if (fitting < wanted) {
-        log.warn("{d} connections, not {d}: the descriptor limit is {d}, {d} of them " ++
-            "reserved; set it to {d} for all", .{ fitting, wanted, descriptors, reserved, need });
     }
-    const per_shard = fitting / shards;
-    assert(per_shard >= connections_per_shard_min);
-    assert(per_shard * shards <= fitting);
-    return per_shard;
-}
-
-/// Descriptors that are no connection, as a sum: stdio (3); a ring and a
-/// listener a shard; with a redirect, each shard's redirect listener and
-/// its connections (`Redirect.config`); ACME's responder, its listener and
-/// the one client it answers at a time (3); the site's directory while it
-/// loads (1); and a margin for what a library opens (64). What is open
-/// before the shards start is checked against it
-/// (`check_descriptors_reserved`); what opens later is in the sum by count.
-fn descriptors_reserved(shards: u32, redirect: bool) u32 {
-    assert(shards <= shards_max);
-    const redirects: u32 = if (redirect) shards * (1 + Redirect.config.connections_max) else 0;
-    return 3 + 2 * shards + redirects + 3 + 1 + 64;
-}
-
-/// What the process holds open just before its shards start, plus each
-/// shard's ring and listener, fits the reserve, or the server refuses with
-/// the counts instead of running short of descriptors under load.
-fn check_descriptors_reserved(shards: u32, redirect: bool) !void {
     const open = listen.descriptors_open() orelse return; // no /proc: unchecked
-    const reserved = descriptors_reserved(shards, redirect);
     if (open + 2 * shards > reserved) {
         log.err("{d} descriptors open before {d} shards start, past the {d} reserved for " ++
             "them: inherited descriptors, or the reserve's sum is short", .{
@@ -148,6 +121,19 @@ fn check_descriptors_reserved(shards: u32, redirect: bool) !void {
         });
         return error.DescriptorsReserved;
     }
+}
+
+/// The process's descriptors, as a sum (a connection is none): stdio (3);
+/// a ring and a listener a shard; with a redirect, its listener a shard;
+/// ACME's responder, its listener and the one client it answers at a time
+/// (3); the site's directory while it loads (1); and a margin for what a
+/// library opens (64). What is open before the shards start is checked
+/// against it (`descriptors_ready`); what opens later is in the sum by
+/// count.
+fn descriptors_reserved(shards: u32, redirect: bool) u32 {
+    assert(shards <= shards_max);
+    const redirects: u32 = if (redirect) shards else 0;
+    return 3 + 2 * shards + redirects + 3 + 1 + 64;
 }
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -215,9 +201,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
-    const redirect = options.https.redirect_port != null;
-    options.connections_max = try connections_per_shard(options.shards, redirect);
-    try check_descriptors_reserved(options.shards, redirect);
+    options.connections_max = connections_per_shard(options.shards);
+    try descriptors_ready(options.shards, options.https.redirect_port != null);
     var threads: [shards_max]std.Thread = undefined;
     for (threads[1..options.shards]) |*thread| {
         thread.* = try std.Thread.spawn(.{}, run_shard, .{ &shared, options });
@@ -291,6 +276,9 @@ fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
         .log2_ring_entries = 12, // not the default 8: queues overflowed
         .fibers_max = config.fibers_max() +
             if (options.https.redirect_port != null) Redirect.fibers_max else 0,
+        // Each server's slots, and the one it accepts while all are held.
+        .direct_sockets_max = config.connections_max + 1 +
+            if (options.https.redirect_port != null) Redirect.config.connections_max + 1 else 0,
     });
     defer runtime.deinit();
     const io = runtime.io();

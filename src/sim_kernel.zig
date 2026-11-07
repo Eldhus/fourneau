@@ -45,6 +45,8 @@ pub const Options = struct {
 };
 /// The ring's descriptor, as the process sees it: never a real one.
 const ring_fd: linux.fd_t = 1 << 20;
+/// The ring's file table, at most: a plan's connections and a few more.
+const direct_files_max = 512;
 const page_bytes = std.heap.page_size_min;
 /// Times the process may run without waiting before it is called stuck.
 const runs_without_wait_max = 1 << 20;
@@ -78,6 +80,11 @@ const Operation = struct {
     /// some bytes before it was canceled or broken reports those bytes, a
     /// positive result, and still fails its links and is not skipped.
     failed: bool = false,
+    /// An ACCEPT into the ring's file table (`IORING_FILE_INDEX_ALLOC`):
+    /// its result is the slot, not a descriptor.
+    direct_alloc: bool = false,
+    /// A CLOSE of a slot in the ring's file table (`prep_close_direct`).
+    direct_close: ?u32 = null,
     fd: linux.fd_t = -1,
     /// The buffer (RECV, SEND), the msghdr (RECVMSG, SENDMSG), or the
     /// address and its length (ACCEPT, `addr2` in `off`), in the process.
@@ -131,6 +138,11 @@ pub const Kernel = struct {
     /// The next submission's place in the order of all of them.
     sequence: u64 = 0,
     stats: Stats = .{},
+    /// The ring's file table (`register_files_sparse`): a slot holds the
+    /// descriptor the process would otherwise have, as Linux holds the
+    /// file. Operations with IOSQE_FIXED_FILE name a slot.
+    direct: [direct_files_max]?linux.fd_t = @splat(null),
+    direct_count: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, seed: u64, options: Options) !Kernel {
         assert(options.tick_ns > 0);
@@ -309,8 +321,12 @@ pub const Kernel = struct {
         return count;
     }
 
-    fn submit_one(kernel: *Kernel, sqe: *const linux.io_uring_sqe) u32 {
-        const flags_known: u8 = linux.IOSQE_CQE_SKIP_SUCCESS | linux.IOSQE_IO_LINK;
+    /// A submission taken: its operation, pending, with what every kind
+    /// shares; a fixed file resolved to the slot's descriptor, or to none
+    /// (-EBADF when tried).
+    fn submit_begin(kernel: *Kernel, sqe: *const linux.io_uring_sqe) u32 {
+        const flags_known: u8 = linux.IOSQE_CQE_SKIP_SUCCESS | linux.IOSQE_IO_LINK |
+            linux.IOSQE_FIXED_FILE;
         if (sqe.flags & ~flags_known != 0) unsimulated("a submission flag", sqe.flags);
         const index = kernel.free_operation();
         const operation = &kernel.operations[index];
@@ -326,8 +342,33 @@ pub const Kernel = struct {
             .sequence = kernel.sequence,
         };
         kernel.sequence += 1;
+        if (sqe.flags & linux.IOSQE_FIXED_FILE != 0) {
+            operation.fd = kernel.direct_fd(sqe.fd) orelse -1;
+        }
+        return index;
+    }
+
+    fn submit_one(kernel: *Kernel, sqe: *const linux.io_uring_sqe) u32 {
+        const index = kernel.submit_begin(sqe);
+        const operation = &kernel.operations[index];
         switch (sqe.opcode) {
-            .NOP, .CLOSE => {},
+            .NOP => {},
+            // By its slot in the table (the index plus one in the
+            // file-index field), or by descriptor.
+            .CLOSE => if (sqe.splice_fd_in != 0) {
+                operation.direct_close = @intCast(sqe.splice_fd_in - 1);
+            },
+            // The socket command: SETSOCKOPT alone, a no-op on a simulated
+            // socket (no Nagle, no kernel TLS here), -EBADF on none.
+            .URING_CMD => {
+                const cmd_op: u32 = @truncate(sqe.off);
+                if (cmd_op != @backingInt(linux.IO_URING_SOCKET_OP.SETSOCKOPT)) {
+                    unsimulated("a socket command", cmd_op);
+                }
+                const known = operation.fd == listener_fd or
+                    kernel.network.connection_of(operation.fd) != null;
+                operation.result = if (known) 0 else errno(.BADF);
+            },
             .FUTEX_WAIT, .FUTEX_WAKE => kernel.submit_futex(operation, sqe),
             .LINK_TIMEOUT => kernel.submit_timeout(operation, sqe),
             .RECV, .SEND, .RECVMSG, .SENDMSG => {
@@ -335,14 +376,28 @@ pub const Kernel = struct {
                 if (sqe.rw_flags & ~known != 0) unsimulated("a MSG_ flag", sqe.rw_flags);
                 operation.message_flags = sqe.rw_flags;
             },
-            .ACCEPT => operation.addr2 = sqe.off,
+            .ACCEPT => {
+                operation.addr2 = sqe.off;
+                // Into the ring's file table, the kernel choosing the slot.
+                if (sqe.splice_fd_in != 0) {
+                    const alloc: i32 = @bitCast(@as(u32, linux.IORING_FILE_INDEX_ALLOC));
+                    assert(sqe.splice_fd_in == alloc); // a chosen slot: unsimulated
+                    operation.direct_alloc = true;
+                }
+            },
             .TIMEOUT => kernel.submit_timeout(operation, sqe),
             .ASYNC_CANCEL => {
                 const by_fd: u32 = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_ALL;
-                if (sqe.rw_flags == by_fd) {
-                    // Every operation pending on a socket (the port's `wakeBoth`).
+                const by_fixed: u32 = by_fd | linux.IORING_ASYNC_CANCEL_FD_FIXED;
+                if (sqe.rw_flags == by_fd or sqe.rw_flags == by_fixed) {
+                    // Every operation pending on a socket (the port's
+                    // `wakeBoth`), named by descriptor or by its slot.
                     operation.by_fd = true;
-                    operation.target = @intCast(@as(u32, @bitCast(sqe.fd)));
+                    const fd = if (sqe.rw_flags == by_fixed)
+                        kernel.direct_fd(sqe.fd) orelse -1
+                    else
+                        sqe.fd;
+                    operation.target = @intCast(@as(u32, @bitCast(fd)));
                 } else {
                     assert(sqe.rw_flags == 0); // by user_data, the first match
                     operation.target = sqe.addr;
@@ -553,9 +608,40 @@ pub const Kernel = struct {
     /// The operations a cancel by descriptor reaches: those on a socket.
     fn is_socket_operation(opcode: linux.IORING_OP) bool {
         return switch (opcode) {
-            .ACCEPT, .RECV, .SEND, .RECVMSG, .SENDMSG => true,
+            .ACCEPT, .RECV, .SEND, .RECVMSG, .SENDMSG, .URING_CMD => true,
             else => false,
         };
+    }
+
+    // --- the ring's file table ------------------------------------------
+
+    /// `register_files_sparse`: a table of `count` empty slots.
+    fn direct_register(kernel: *Kernel, count: u32) void {
+        assert(kernel.direct_count == 0); // registered once
+        if (count > direct_files_max) @panic("sim_kernel: direct_files_max");
+        kernel.direct_count = count;
+    }
+
+    /// The descriptor a slot holds, if the slot is in the table and taken.
+    fn direct_fd(kernel: *const Kernel, slot: i32) ?linux.fd_t {
+        if (slot < 0 or slot >= kernel.direct_count) return null;
+        return kernel.direct[@intCast(slot)];
+    }
+
+    /// The lowest free slot, as Linux allocates (`io_file_bitmap_get`).
+    fn direct_free(kernel: *const Kernel) ?u32 {
+        for (kernel.direct[0..kernel.direct_count], 0..) |slot, index| {
+            if (slot == null) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// The slot's descriptor, the slot freed: a direct close.
+    fn direct_take(kernel: *Kernel, slot: u32) ?linux.fd_t {
+        if (slot >= kernel.direct_count) return null;
+        const fd = kernel.direct[slot] orelse return null;
+        kernel.direct[slot] = null;
+        return fd;
     }
 
     /// A socket's operation, tried now: its result, or null when its socket
@@ -563,7 +649,13 @@ pub const Kernel = struct {
     fn attempt(kernel: *Kernel, operation: *Operation) ?i32 {
         const network = &kernel.network;
         switch (operation.opcode) {
-            .CLOSE => return if (network.close(operation.fd)) 0 else errno(.BADF),
+            .CLOSE => {
+                const fd = if (operation.direct_close) |slot|
+                    kernel.direct_take(slot) orelse return errno(.BADF)
+                else
+                    operation.fd;
+                return if (network.close(fd)) 0 else errno(.BADF);
+            },
             .ACCEPT => return kernel.attempt_accept(operation),
             .RECV, .RECVMSG => {
                 const index = network.connection_of(operation.fd) orelse return errno(.BADF);
@@ -585,10 +677,17 @@ pub const Kernel = struct {
         const network = &kernel.network;
         if (operation.fd != listener_fd) return errno(.NOTSOCK);
         if (network.listener_closed) return errno(.INVAL);
-        // Linux checks the descriptor limit before it takes a connection
-        // off the backlog, which stays queued.
-        if (network.open_count() >= network.descriptors_max) return errno(.MFILE);
+        // Linux checks the descriptor limit, or the table for a free slot,
+        // before it takes a connection off the backlog, which stays queued.
+        if (operation.direct_alloc) {
+            if (kernel.direct_free() == null) return errno(.NFILE);
+        } else if (network.open_count() >= network.descriptors_max) return errno(.MFILE);
         const fd = network.accept() orelse return null;
+        const result: i32 = if (operation.direct_alloc) direct: {
+            const slot = kernel.direct_free().?;
+            kernel.direct[slot] = fd;
+            break :direct @intCast(slot);
+        } else fd;
         if (operation.addr != 0) {
             const address: *linux.sockaddr.in = @ptrFromInt(operation.addr);
             const length: *linux.socklen_t = @ptrFromInt(operation.addr2);
@@ -599,7 +698,7 @@ pub const Kernel = struct {
             };
             length.* = @sizeOf(linux.sockaddr.in);
         }
-        return fd;
+        return result;
     }
 
     /// Some bytes sent; with MSG_WAITALL it stays pending until all are.
@@ -864,6 +963,19 @@ pub const Ring = struct {
         assert(ring.fd == ring_fd);
         running.?.close_ring();
         ring.* = undefined;
+    }
+
+    /// The ring's file table, empty, for direct sockets (std's).
+    pub fn register_files_sparse(ring: *Ring, count: u32) !void {
+        assert(ring.fd == ring_fd);
+        running.?.direct_register(count);
+    }
+
+    /// Where the kernel allocates slots from: all of the table here.
+    pub fn register_file_alloc_range(ring: *Ring, offset: u32, count: u32) !void {
+        assert(ring.fd == ring_fd);
+        assert(offset == 0);
+        assert(count == running.?.direct_count);
     }
 
     pub fn get_sqe(ring: *Ring) error{SubmissionQueueFull}!*linux.io_uring_sqe {
