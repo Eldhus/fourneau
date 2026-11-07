@@ -389,6 +389,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// flight, and on io_uring a close waits for its completion, so
         /// other fibers run meanwhile.
         closing_count: u32 = 0,
+        /// The last accept failed for want of a descriptor: said once per
+        /// episode, not once per tick of retrying.
+        accept_starved: bool = false,
         /// Counts free slots: the acceptor waits on it, so a full server
         /// stops accepting and the kernel's backlog holds new clients.
         free_slots: Io.Semaphore,
@@ -1146,14 +1149,29 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             for (0..std.math.maxInt(u64)) |_| {
                 const stream = server.listener.accept(server.io) catch |err| switch (err) {
                     error.Canceled => return,
+                    // Out of descriptors before the slots are full: the
+                    // process's limit, when the reserve the startup sized it
+                    // by was short, or the system's. Make room as a full
+                    // server does, then wait a tick for the close to free
+                    // one, rather than spin.
+                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+                        if (!server.accept_starved) {
+                            log.warn("accept: {t}: evicting the longest idle until one frees", .{
+                                err,
+                            });
+                        }
+                        server.accept_starved = true;
+                        server.evict_idle();
+                        if (!server.wait_tick()) return; // canceled
+                        continue;
+                    },
                     else => {
                         log.warn("accept: {t}", .{err});
-                        // Out of descriptors: wait a tick rather than spin.
-                        const tick: Io.Duration = .fromMilliseconds(server.config.tick_ms);
-                        server.io.sleep(tick, .awake) catch return; // canceled
+                        if (!server.wait_tick()) return; // canceled
                         continue;
                     },
                 };
+                server.accept_starved = false;
                 if (server.free_count == 0) server.evict_idle();
                 server.free_slots.wait(server.io) catch {
                     // Canceled while the server was full: never served.
@@ -1169,6 +1187,14 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     server.close_connection(&server.connections[index]);
                 };
             } else unreachable;
+        }
+
+        /// One tick's wait, for a descriptor or a slot to free: false when
+        /// canceled (a drain).
+        fn wait_tick(server: *Server) bool {
+            const tick: Io.Duration = .fromMilliseconds(server.config.tick_ms);
+            server.io.sleep(tick, .awake) catch return false;
+            return true;
         }
 
         /// Close the connection idle longest, if any is: the fiber waiting

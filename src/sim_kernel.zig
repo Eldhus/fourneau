@@ -529,6 +529,9 @@ pub const Kernel = struct {
         const network = &kernel.network;
         if (operation.fd != listener_fd) return errno(.NOTSOCK);
         if (network.listener_closed) return errno(.INVAL);
+        // Linux checks the descriptor limit before it takes a connection
+        // off the backlog, which stays queued.
+        if (network.open_count() >= network.descriptors_max) return errno(.MFILE);
         const fd = network.accept() orelse return null;
         if (operation.addr != 0) {
             const address: *linux.sockaddr.in = @ptrFromInt(operation.addr);

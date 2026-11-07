@@ -29,6 +29,8 @@ const https = @import("https.zig");
 const Stop = @import("stop.zig").Stop;
 const listen = @import("listen.zig");
 
+const log = std.log.scoped(.fourneau);
+
 const shards_max = 256;
 
 /// The files, from site.zig; the app answers with them, or the 404 page.
@@ -67,51 +69,69 @@ const Options = struct {
     https: https.Options = .{},
 };
 
-/// Connections across all shards, as the descriptor limit allows.
+/// Connections across all shards, when that gives a shard at least
+/// `connections_per_shard_min` (256 shards want 16,384).
 const connections_max = 1024;
-/// A shard holds at least these, whatever the shard count.
+/// A shard holds at least these; below them the server does not start.
 const connections_per_shard_min = 64;
 
-/// Connections a shard holds: `connections_max` in all, at least
-/// `connections_per_shard_min` each, as the descriptor limit allows (raised
-/// to its hard limit first: a connection is a descriptor). Fewer than one a
-/// shard fit: the environment cannot run the server, said with the way out.
+/// Connections a shard holds: `connections_max` in all, or
+/// `connections_per_shard_min` each when that is more, as the descriptor
+/// limit allows. A connection is a descriptor, so the soft limit is first
+/// raised to what the server needs: the connections and the reserve for
+/// everything else. Fewer than `connections_per_shard_min` a shard fit:
+/// the environment cannot run the server, said with the number to set.
 fn connections_per_shard(shards: u32) !u32 {
     assert(shards >= 1);
     assert(shards <= shards_max);
-    const descriptors = listen.descriptor_limit_raise();
     const wanted = @max(connections_per_shard_min, connections_max / shards) * shards;
+    const minimum = connections_per_shard_min * shards;
     const reserved = descriptors_reserved(shards);
+    const need: u64 = @as(u64, reserved) + wanted;
+    const descriptors = listen.descriptor_limit_raise(need);
     const fitting = listen.connections_fitting(.{
         .descriptors = descriptors,
         .reserved = reserved,
         .wanted = wanted,
-        .minimum = shards,
+        .minimum = minimum,
     }) orelse {
-        std.debug.print("fourneau-static: the descriptor limit, {d}, leaves no connection a " ++
-            "shard past the {d} reserved: raise it (ulimit -n; LimitNOFILE= under systemd)\n", .{
-            descriptors,
-            reserved,
+        log.err("the descriptor limit is {d}; {d} connections need {d} with {d} reserved: " ++
+            "set it to {d} (ulimit -n {d}; LimitNOFILE={d} under systemd)", .{
+            descriptors, wanted, need, reserved, need, need, need,
         });
         return error.DescriptorLimit;
     };
     if (fitting < wanted) {
-        std.debug.print("fourneau-static: {d} connections, not {d}: the descriptor limit is " ++
-            "{d}, {d} of them reserved\n", .{ fitting, wanted, descriptors, reserved });
+        log.warn("{d} connections, not {d}: the descriptor limit is {d}, {d} of them " ++
+            "reserved; set it to {d} for all", .{ fitting, wanted, descriptors, reserved, need });
     }
     const per_shard = fitting / shards;
-    assert(per_shard >= 1);
+    assert(per_shard >= connections_per_shard_min);
     assert(per_shard * shards <= fitting);
     return per_shard;
 }
 
-/// Descriptors that are no connection, as a sum: stdio; a ring and a
-/// listener a shard; the redirect server's ring and listener; ACME's
-/// responder, its listener and the one client it answers at a time; the
-/// site's directory while it loads; and a margin for what a library opens.
+/// Descriptors that are no connection, as a sum: stdio (3); a ring and a
+/// listener a shard; the redirect server's ring and listener (2); ACME's
+/// responder, its listener and the one client it answers at a time (3);
+/// the site's directory while it loads (1); and a margin for what a
+/// library opens (64). What is open before the shards start is checked
+/// against it (`assert_descriptors_reserved`).
 fn descriptors_reserved(shards: u32) u32 {
     assert(shards <= shards_max);
     return 3 + 2 * shards + 2 + 3 + 1 + 64;
+}
+
+/// The reserve is a sum, not a guess: what the process holds open just
+/// before its shards start, plus each shard's ring and listener, fits it,
+/// or the sum is wrong and the server says so instead of running short.
+fn assert_descriptors_reserved(shards: u32) void {
+    const open = listen.descriptors_open() orelse return; // no /proc: unchecked
+    const reserved = descriptors_reserved(shards);
+    if (open + 2 * shards > reserved) {
+        std.debug.panic("fourneau-static: {d} descriptors open before {d} shards, past the " ++
+            "{d} reserved: descriptors_reserved is wrong", .{ open, shards, reserved });
+    }
 }
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
@@ -180,6 +200,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
     options.connections_max = try connections_per_shard(options.shards);
+    assert_descriptors_reserved(options.shards);
     var threads: [shards_max]std.Thread = undefined;
     for (threads[1..options.shards]) |*thread| {
         thread.* = try std.Thread.spawn(.{}, run_shard, .{ &shared, options });

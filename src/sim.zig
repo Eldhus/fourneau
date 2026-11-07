@@ -978,3 +978,36 @@ test "sim: an idle connection evicted as its next request arrives closes unanswe
     }
     try std.testing.expect(raced > 0);
 }
+
+// The process's descriptor limit below the slots (a reserve sized short,
+// or the system's limit): accept fails with EMFILE while slots are free.
+// The acceptor evicts the longest idle as a full server would, the close
+// frees a descriptor, and the new client is served, not left in the
+// backlog until it times out.
+test "sim: out of descriptors before the slots are full, the longest idle is evicted" {
+    const gpa = std.testing.allocator;
+    for (1..17) |seed| {
+        var scripted: Scripted = undefined;
+        var plan = scripted_plan(4);
+        plan.kernel.network.descriptors_max = 1;
+        try scripted.init(gpa, seed, plan);
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var idle: HandClient = .connect(network);
+        idle.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
+        try idle.await_until(&scripted, heads_at_least(1));
+        scripted.ticks(20);
+        var fresh: HandClient = .connect(network);
+        fresh.send(network, "GET /s/204 HTTP/1.1\r\nHost: b\r\nConnection: close\r\n\r\n");
+        try fresh.await_until(&scripted, heads_at_least(1));
+        try std.testing.expect(std.mem.startsWith(u8, fresh.text(), "HTTP/1.1 204"));
+        try idle.await_until(&scripted, heads_at_least(2)); // ends: it was evicted
+        try std.testing.expect(network.client_sees_end(idle.connection));
+        const stats = scripted.shard.now().stats;
+        try std.testing.expectEqual(1, stats.evicted);
+        try std.testing.expectEqual(2, stats.accepted);
+        network.client_close(idle.connection);
+        network.client_close(fresh.connection);
+        try scripted.finish();
+    }
+}

@@ -18,6 +18,10 @@ pub const Options = struct {
     backlog_max: u32,
     /// Each direction's queue: the most bytes in flight one way.
     window_bytes: u32,
+    /// The process's descriptor limit, as connections: an accept past this
+    /// many open on the server's side fails with EMFILE, as Linux's does
+    /// when `RLIMIT_NOFILE` is short. Unlimited by default.
+    descriptors_max: u32 = std.math.maxInt(u32),
 };
 
 /// Descriptors, as the process sees them: never real ones.
@@ -94,6 +98,7 @@ pub const Send = union(enum) {
 pub const Network = struct {
     connections: []Connection,
     backlog: []u32,
+    descriptors_max: u32,
     backlog_count: u32 = 0,
     listening: bool = false,
     /// The server closed its listening socket (a drain).
@@ -119,7 +124,21 @@ pub const Network = struct {
                 .to_client = .{ .bytes = try gpa.alloc(u8, options.window_bytes) },
             };
         }
-        return .{ .connections = connections, .backlog = backlog };
+        return .{
+            .connections = connections,
+            .backlog = backlog,
+            .descriptors_max = options.descriptors_max,
+        };
+    }
+
+    /// The connections open on the server's side: each holds one of the
+    /// process's descriptors until the server closes it.
+    pub fn open_count(network: *const Network) u32 {
+        var count: u32 = 0;
+        for (network.connections) |connection| {
+            if (connection.state == .open and !connection.server_closed) count += 1;
+        }
+        return count;
     }
 
     pub fn deinit(network: *Network, gpa: std.mem.Allocator) void {

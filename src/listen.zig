@@ -133,15 +133,19 @@ pub fn runtime_init(
 const descriptor_limit_default = 1024;
 
 /// The soft descriptor limit (`RLIMIT_NOFILE`: 1,024 by default under
-/// systemd and most shells, the hard limit far above) raised to the hard
-/// one, since a connection is a descriptor; the limit then in force. A
-/// limit that cannot be read or raised stays what it is: the server sizes
-/// itself to what it got (`connections_fitting`), and the acceptor's wait
-/// on EMFILE is the backstop.
-pub fn descriptor_limit_raise() u64 {
+/// systemd and most shells, the hard limit far above) raised to `need`
+/// when it is below it, bounded by the hard limit; the limit then in
+/// force. Raised to the need, not to the hard limit, so that a leak of
+/// descriptors still fails near the server's own bound instead of at
+/// half a million (Redis sizes its limit the same way). Never lowered:
+/// an operator's higher setting stands. A limit that cannot be read or
+/// raised stays what it is: the server sizes itself to what it got
+/// (`connections_fitting`), and the acceptor evicts on EMFILE.
+pub fn descriptor_limit_raise(need: u64) u64 {
+    assert(need >= 1);
     var limit = std.posix.getrlimit(.NOFILE) catch return descriptor_limit_default;
-    if (limit.cur < limit.max) {
-        limit.cur = limit.max;
+    if (limit.cur < need and limit.cur < limit.max) {
+        limit.cur = @min(need, limit.max);
         std.posix.setrlimit(.NOFILE, limit) catch {
             limit = std.posix.getrlimit(.NOFILE) catch return descriptor_limit_default;
         };
@@ -149,6 +153,38 @@ pub fn descriptor_limit_raise() u64 {
     assert(limit.cur <= limit.max);
     return limit.cur;
 }
+
+/// The descriptors this process holds open now, counted in /proc, so a
+/// server can check its reserve against what it really opened before its
+/// shards start. Null where /proc cannot be read (a container without
+/// it): the check is skipped, not failed.
+pub fn descriptors_open() ?u32 {
+    const flags: linux.O = .{ .DIRECTORY = true, .CLOEXEC = true, .ACCMODE = .RDONLY };
+    const opened = linux.open("/proc/self/fd", flags, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const dir: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(dir);
+    var buffer: [4096]u8 align(@alignOf(linux.dirent64)) = undefined;
+    var count: u32 = 0;
+    for (0..descriptors_open_reads_max) |_| {
+        const read = linux.getdents64(dir, &buffer, @intCast(buffer.len));
+        if (linux.errno(read) != .SUCCESS) return null;
+        if (read == 0) break;
+        var offset: usize = 0;
+        while (offset < read) {
+            const entry: *const linux.dirent64 = @ptrCast(@alignCast(&buffer[offset]));
+            const name: [*:0]const u8 = @ptrCast(&entry.name);
+            // `.` and `..` are no descriptors; the directory's own is.
+            if (name[0] != '.') count += 1;
+            offset += entry.reclen;
+        }
+    } else return null;
+    assert(count >= 1); // the directory's own descriptor was listed
+    return count - 1;
+}
+
+/// /proc/self/fd read in 4 KiB pieces: enough for a million entries.
+const descriptors_open_reads_max = 1 << 14;
 
 pub const Fitting = struct {
     /// The descriptor limit in force (`descriptor_limit_raise`).
@@ -163,11 +199,11 @@ pub const Fitting = struct {
 };
 
 /// The connections the descriptor limit leaves room for: `wanted` when
-/// they fit past `reserved`, else what does. Null when not even `minimum`
-/// fit: the environment cannot run the server, which says so and exits
-/// (before this, the slots never filled, eviction never ran, and the
-/// acceptor logged EMFILE ten times a second while clients waited in the
-/// backlog).
+/// they fit past `reserved`, else what does, down to `minimum`. Null
+/// when not even `minimum` fit: the environment cannot run the server,
+/// which says what limit to set and exits (before this, the slots never
+/// filled, eviction never ran, and the acceptor logged EMFILE ten times a
+/// second while clients waited in the backlog).
 pub fn connections_fitting(fitting: Fitting) ?u32 {
     assert(fitting.minimum >= 1);
     assert(fitting.wanted >= fitting.minimum);
@@ -235,9 +271,26 @@ fn fits(descriptors: u64) ?u32 {
     });
 }
 
-test "listen: the descriptor limit raised is the one in force" {
-    const raised = descriptor_limit_raise();
-    const limit = try std.posix.getrlimit(.NOFILE);
-    try std.testing.expectEqual(limit.cur, raised);
-    try std.testing.expect(raised >= 1);
+test "listen: the soft limit raised to the need, never past the hard one, never lowered" {
+    const before = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, before) catch {};
+    // Lowered to 64 first (always allowed), then raised to the need.
+    try std.posix.setrlimit(.NOFILE, .{ .cur = 64, .max = before.max });
+    try std.testing.expectEqual(64, (try std.posix.getrlimit(.NOFILE)).cur);
+    try std.testing.expectEqual(200, descriptor_limit_raise(200));
+    try std.testing.expectEqual(200, (try std.posix.getrlimit(.NOFILE)).cur);
+    // A limit already past the need stands.
+    try std.testing.expectEqual(200, descriptor_limit_raise(100));
+    // A need past the hard limit: the hard limit, and no error.
+    const past: u64 = if (before.max == linux.RLIM.INFINITY) before.max else before.max + 1;
+    try std.testing.expectEqual(before.max, descriptor_limit_raise(past));
+    try std.testing.expectEqual(before.max, (try std.posix.getrlimit(.NOFILE)).cur);
+}
+
+test "listen: the descriptors open are counted in /proc" {
+    const before = descriptors_open() orelse return error.SkipZigTest; // no /proc
+    try std.testing.expect(before >= 3); // stdio
+    const extra: linux.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer _ = linux.close(extra);
+    try std.testing.expectEqual(before + 1, descriptors_open().?);
 }
