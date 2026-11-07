@@ -61,9 +61,58 @@ const Options = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     shards: u32 = 0,
+    /// Per shard, sized to the descriptor limit (`connections_per_shard`).
+    connections_max: u32 = 0,
     /// The certificate (files or ACME) and the redirect: https.zig.
     https: https.Options = .{},
 };
+
+/// Connections across all shards, as the descriptor limit allows.
+const connections_max = 1024;
+/// A shard holds at least these, whatever the shard count.
+const connections_per_shard_min = 64;
+
+/// Connections a shard holds: `connections_max` in all, at least
+/// `connections_per_shard_min` each, as the descriptor limit allows (raised
+/// to its hard limit first: a connection is a descriptor). Fewer than one a
+/// shard fit: the environment cannot run the server, said with the way out.
+fn connections_per_shard(shards: u32) !u32 {
+    assert(shards >= 1);
+    assert(shards <= shards_max);
+    const descriptors = listen.descriptor_limit_raise();
+    const wanted = @max(connections_per_shard_min, connections_max / shards) * shards;
+    const reserved = descriptors_reserved(shards);
+    const fitting = listen.connections_fitting(.{
+        .descriptors = descriptors,
+        .reserved = reserved,
+        .wanted = wanted,
+        .minimum = shards,
+    }) orelse {
+        std.debug.print("fourneau-static: the descriptor limit, {d}, leaves no connection a " ++
+            "shard past the {d} reserved: raise it (ulimit -n; LimitNOFILE= under systemd)\n", .{
+            descriptors,
+            reserved,
+        });
+        return error.DescriptorLimit;
+    };
+    if (fitting < wanted) {
+        std.debug.print("fourneau-static: {d} connections, not {d}: the descriptor limit is " ++
+            "{d}, {d} of them reserved\n", .{ fitting, wanted, descriptors, reserved });
+    }
+    const per_shard = fitting / shards;
+    assert(per_shard >= 1);
+    assert(per_shard * shards <= fitting);
+    return per_shard;
+}
+
+/// Descriptors that are no connection, as a sum: stdio; a ring and a
+/// listener a shard; the redirect server's ring and listener; ACME's
+/// responder, its listener and the one client it answers at a time; the
+/// site's directory while it loads; and a margin for what a library opens.
+fn descriptors_reserved(shards: u32) u32 {
+    assert(shards <= shards_max);
+    return 3 + 2 * shards + 2 + 3 + 1 + 64;
+}
 
 fn parse_options(init: std.process.Init.Minimal) !Options {
     var options: Options = .{};
@@ -130,6 +179,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
+    options.connections_max = try connections_per_shard(options.shards);
     var threads: [shards_max]std.Thread = undefined;
     for (threads[1..options.shards]) |*thread| {
         thread.* = try std.Thread.spawn(.{}, run_shard, .{ &shared, options });
@@ -189,8 +239,9 @@ fn run_shard(shared: *const Shared, options: Options) void {
 
 fn run_shard_or_fail(shared: *const Shared, options: Options) !void {
     const gpa = std.heap.page_allocator;
+    assert(options.connections_max >= 1); // `main` sized it
     const config: server_module.Config = .{
-        .connections_max = @max(64, 1024 / options.shards),
+        .connections_max = options.connections_max,
         .tls = shared.tls,
         .stop = shared.stop,
         // Browsers: one connection, every request and event stream on it.

@@ -128,6 +128,57 @@ pub fn runtime_init(
     } else unreachable;
 }
 
+/// What a process is left with when its limit cannot be read: Linux's
+/// default soft limit.
+const descriptor_limit_default = 1024;
+
+/// The soft descriptor limit (`RLIMIT_NOFILE`: 1,024 by default under
+/// systemd and most shells, the hard limit far above) raised to the hard
+/// one, since a connection is a descriptor; the limit then in force. A
+/// limit that cannot be read or raised stays what it is: the server sizes
+/// itself to what it got (`connections_fitting`), and the acceptor's wait
+/// on EMFILE is the backstop.
+pub fn descriptor_limit_raise() u64 {
+    var limit = std.posix.getrlimit(.NOFILE) catch return descriptor_limit_default;
+    if (limit.cur < limit.max) {
+        limit.cur = limit.max;
+        std.posix.setrlimit(.NOFILE, limit) catch {
+            limit = std.posix.getrlimit(.NOFILE) catch return descriptor_limit_default;
+        };
+    }
+    assert(limit.cur <= limit.max);
+    return limit.cur;
+}
+
+pub const Fitting = struct {
+    /// The descriptor limit in force (`descriptor_limit_raise`).
+    descriptors: u64,
+    /// The process's descriptors that are no connection: stdio, each
+    /// shard's ring and listener, files, a margin. The caller's sum.
+    reserved: u32,
+    /// The connections the server would hold, every shard together.
+    wanted: u32,
+    /// Fewer than these and the server cannot run.
+    minimum: u32,
+};
+
+/// The connections the descriptor limit leaves room for: `wanted` when
+/// they fit past `reserved`, else what does. Null when not even `minimum`
+/// fit: the environment cannot run the server, which says so and exits
+/// (before this, the slots never filled, eviction never ran, and the
+/// acceptor logged EMFILE ten times a second while clients waited in the
+/// backlog).
+pub fn connections_fitting(fitting: Fitting) ?u32 {
+    assert(fitting.minimum >= 1);
+    assert(fitting.wanted >= fitting.minimum);
+    if (fitting.descriptors <= fitting.reserved) return null;
+    const room = fitting.descriptors - fitting.reserved;
+    const connections: u32 = @intCast(@min(room, fitting.wanted));
+    if (connections < fitting.minimum) return null;
+    assert(connections <= fitting.wanted);
+    return connections;
+}
+
 test "listen: the socket systemd passed, by name, for this process only" {
     const activation: Activation = .{ .pid = "42", .fds = "2", .names = "https:http" };
     try std.testing.expectEqual(3, find_in(activation, 42, "https"));
@@ -159,4 +210,34 @@ test "listen: a server on a copy of a listening socket; not on another kind" {
     const plain: linux.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
     defer _ = linux.close(plain);
     try std.testing.expectError(error.NotListening, server_from(plain));
+}
+
+test "listen: connections sized to the descriptor limit" {
+    // Room for every connection wanted: wanted; no limit at all: wanted.
+    try std.testing.expectEqual(1024, fits(524_288));
+    try std.testing.expectEqual(1024, fits(256 + 1024));
+    try std.testing.expectEqual(1024, fits(linux.RLIM.INFINITY));
+    // Room for fewer: what fits, down to the minimum.
+    try std.testing.expectEqual(768, fits(1024));
+    try std.testing.expectEqual(8, fits(256 + 8));
+    // Fewer than the minimum, or no room at all: the server cannot run.
+    try std.testing.expectEqual(null, fits(256 + 7));
+    try std.testing.expectEqual(null, fits(256));
+    try std.testing.expectEqual(null, fits(0));
+}
+
+fn fits(descriptors: u64) ?u32 {
+    return connections_fitting(.{
+        .descriptors = descriptors,
+        .reserved = 256,
+        .wanted = 1024,
+        .minimum = 8,
+    });
+}
+
+test "listen: the descriptor limit raised is the one in force" {
+    const raised = descriptor_limit_raise();
+    const limit = try std.posix.getrlimit(.NOFILE);
+    try std.testing.expectEqual(limit.cur, raised);
+    try std.testing.expect(raised >= 1);
 }
