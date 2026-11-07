@@ -27,6 +27,9 @@ pub const Options = struct {
 /// Descriptors, as the process sees them: never real ones.
 pub const listener_fd: linux.fd_t = 1 << 21;
 const connection_fd_base: linux.fd_t = listener_fd + 1;
+/// The dead socket (`kernel.dead_socket`): no connection, a receive on
+/// it reads the end and a send fails, and it is never closed.
+pub const dead_fd: linux.fd_t = listener_fd - 1;
 
 const ByteQueue = struct {
     bytes: []u8,

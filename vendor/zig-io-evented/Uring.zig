@@ -73,6 +73,10 @@ main_fiber_buffer: [
 log2_ring_entries: u4,
 /// fourneau: the ring's file table's size (`InitOptions.direct_sockets_max`).
 direct_sockets_max: u32,
+/// fourneau: a stream socket whose peer is closed, made at `init`: what
+/// `retire` puts in a direct socket's slot. One, as FILES_UPDATE takes
+/// an array of descriptors.
+dead_socket: [1]fd_t,
 threads: Thread.List,
 /// fourneau: every fiber's memory, reserved once at `init` (`Fiber.reserve`),
 /// `fibers_max` strides of `Fiber.allocation_size`.
@@ -916,6 +920,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .main_fiber_buffer = undefined,
         .log2_ring_entries = options.log2_ring_entries,
         .direct_sockets_max = options.direct_sockets_max,
+        .dead_socket = .{-1},
         .threads = .{
             .allocated = @ptrCast(allocated_slice[0..threads_size]),
             .reserved = 1,
@@ -999,6 +1004,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     if (options.direct_sockets_max > 0) {
         try main_thread.io_uring.register_files_sparse(options.direct_sockets_max);
         try main_thread.io_uring.register_file_alloc_range(0, options.direct_sockets_max);
+        // fourneau: what `retire` puts in a slot, one for the process.
+        ev.dead_socket = .{kernel.dead_socket() orelse return error.SystemResources};
     }
     ev.fibers = try Fiber.reserve(options.fibers_max);
     if (tracy.enable) tracy.fiberEnter(main_fiber.name);
@@ -1015,6 +1022,7 @@ pub fn deinit(ev: *Evented) void {
     ev.yield(null, .exit);
     ev.null_fd.close();
     ev.random_fd.close();
+    if (ev.dead_socket[0] != -1) _ = kernel.close(ev.dead_socket[0]);
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(ev.threads.allocated.ptr));
     const idle_stack_end_offset = std.mem.alignForward(
         usize,
@@ -1233,6 +1241,8 @@ const Completion = struct {
         close,
         cleanup,
         exit,
+        /// fourneau: `retire`'s FILES_UPDATE, whose success is skipped.
+        retire,
         /// If bit 0 is 1, a pointer to the `context` field of `Io.Batch.Storage.Pending`.
         /// If bits 0 and 1 are 0, a `*Fiber`.
         _,
@@ -1325,6 +1335,10 @@ fn idle(ev: *Evented, thread: *Thread) void {
                     assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
                     return;
                 },
+                // fourneau: a success is skipped; a failure names a slot
+                // past the table or a bad descriptor, neither of which a
+                // caller can hand it: a bug.
+                .retire => @panic("retire: the ring refused the slot's update"),
                 _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
                     0b00 => {
                         // fourneau: a receive carries `receive_tag` above the two.
@@ -6602,17 +6616,72 @@ comptime {
 /// (eviction, a drain's idle close), with no system call: its pending
 /// `receive`, or the receive of its `sendThenReceive`, is canceled and
 /// returns `Shut`. A receive linked behind a send still going out is not
-/// found (the kernel does not look at links not started), so the send
-/// goes out whole, as a read-side shutdown let it; the caller keeps the
-/// socket shut (fourneau's server: a later receive sees the end), so the
-/// fiber ends when its turn does. Fire and forget: no yield; the cancel
-/// goes in the same submission as what it cancels, after it; finding
-/// nothing is -ENOENT, ignored. Unlike a shutdown through the ring, which
-/// runs on the kernel's workers after a later close, this can never reach
-/// another connection: it names one fiber's receive.
+/// found (the kernel does not look at links not issued): the caller
+/// follows with `retire`, which ends it once the send is out. Fire and
+/// forget: no yield; the cancel goes in the same submission as what it
+/// cancels, after it; finding nothing is -ENOENT, ignored. Unlike a
+/// shutdown through the ring, which runs on the kernel's workers after a
+/// later close, this can never reach another connection: it names one
+/// fiber's receive.
 pub fn wakeRead(fiber: usize) void {
     assert(fiber & 0b111 == 0);
     cancelByUserdata(fiber | receive_tag);
+}
+
+/// fourneau: end a fiber's `sendThenReceive`, whatever its socket's slot
+/// holds now (after `retire`, the dead socket: a cancel by the slot
+/// reaches nothing on the socket the chain is still on). The send, if it
+/// is in flight, is named by the fiber: its failure cancels the receive
+/// behind it. Else the receive, if issued; one not yet issued finds the
+/// retired slot. Fire and forget, as `wakeRead`.
+pub fn wakeChain(fiber: usize) void {
+    assert(fiber & 0b111 == 0);
+    cancelByUserdata(fiber);
+    cancelByUserdata(fiber | receive_tag);
+}
+
+/// fourneau: after `wakeRead` or `wakeBoth`, for the wait no cancel can
+/// reach: the receive of `sendThenReceive`, linked behind its send. Until
+/// the send is done it is on the send's link, in no cancel table; once
+/// the send is done Linux issues it from task work, which the next
+/// `io_uring_enter` runs after that call's submissions, a cancel among
+/// them. So the socket's slot in the ring's file table is given the dead
+/// socket (`Evented.dead_socket`) instead, inline at submission
+/// (`io_files_update`): a request issued from now on finds that one, and
+/// the receive reads 0, a send fails EPIPE; what is in flight keeps the
+/// socket, which Linux releases when the last of them completes. The
+/// response goes out whole, the fiber reads the end, and its close of the
+/// slot drops the dead socket's reference; the dead socket lives on for
+/// the next. A descriptor instead of a slot: the system call, which does
+/// the same (and shuts only reading for `.recv`, with writes to come).
+/// Fire and forget, after the cancel in the same submission.
+pub fn retire(io_instance: Io, socket_handle: net.Socket.Handle, how: net.ShutdownHow) void {
+    assert(how != .send);
+    const ev: *Evented = @ptrCast(@alignCast(io_instance.userdata));
+    const index = directIndex(socket_handle) orelse {
+        const flags: i32 = if (how == .both) linux.SHUT.RDWR else linux.SHUT.RD;
+        _ = kernel.shutdown(socket_handle, flags); // gone already: nothing to end
+        return;
+    };
+    assert(index < ev.direct_sockets_max);
+    assert(ev.dead_socket[0] >= 0);
+    const thread: *Thread = .current();
+    thread.enqueue().* = .{
+        .opcode = .FILES_UPDATE,
+        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = -1,
+        .off = index,
+        .addr = @intFromPtr(&ev.dead_socket),
+        .len = 1,
+        .rw_flags = 0,
+        .user_data = @backingInt(Completion.Userdata.retire),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
 }
 
 /// fourneau: end every wait on a socket (a deadline, the drain's cut):

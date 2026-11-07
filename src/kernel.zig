@@ -32,6 +32,20 @@ pub const shutdown = linux.shutdown;
 /// (the port's `listenBacklog`, for an acceptor short of descriptors).
 pub const getsockopt = linux.getsockopt;
 
+/// At startup: a stream socket whose peer is closed, so a receive on it
+/// reads the end and a send fails with EPIPE (the port's `retire` puts it
+/// in a direct socket's slot). Null when the kernel refuses one.
+pub fn dead_socket() ?linux.fd_t {
+    var pair: [2]linux.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &pair)) != .SUCCESS) return null;
+    _ = linux.close(pair[1]);
+    return pair[0];
+}
+
+/// At exit: the dead socket's close.
+pub const close = linux.close;
+
 /// The head of Linux's `tcp_info` (TCP_INFO), as far as `unacked`, which
 /// on a listening socket is its backlog's length. The kernel copies as
 /// many bytes as are asked for.

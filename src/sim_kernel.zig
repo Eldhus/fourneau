@@ -27,6 +27,7 @@ const sim_network = @import("sim_network.zig");
 
 pub const Network = sim_network.Network;
 pub const listener_fd = sim_network.listener_fd;
+const dead_fd = sim_network.dead_fd;
 
 pub const Options = struct {
     tick_ns: u64,
@@ -58,8 +59,12 @@ const passes_per_tick_max = 1_000_000;
 var running: ?*Kernel = null;
 
 const Operation = struct {
-    /// `linked`: behind another (IOSQE_IO_LINK), started when it succeeds.
-    state: enum { free, pending, linked } = .free,
+    /// `linked`: behind another (IOSQE_IO_LINK), which has not ended.
+    /// `queued`: its head succeeded, and it starts when due. Linux issues
+    /// it from task work, which the next `io_uring_enter` runs after its
+    /// submissions: until then it is in no cancel table (no cancel finds
+    /// it), and its fixed file is looked up only when it is issued.
+    state: enum { free, pending, linked, queued } = .free,
     opcode: linux.IORING_OP = .NOP,
     flags: u8 = 0,
     user_data: u64 = 0,
@@ -85,6 +90,9 @@ const Operation = struct {
     direct_alloc: bool = false,
     /// A CLOSE of a slot in the ring's file table (`prep_close_direct`).
     direct_close: ?u32 = null,
+    /// The slot named with IOSQE_FIXED_FILE: `fd` is what it held when
+    /// the operation was issued (`queued`: when it started).
+    fixed_slot: ?u32 = null,
     fd: linux.fd_t = -1,
     /// The buffer (RECV, SEND), the msghdr (RECVMSG, SENDMSG), or the
     /// address and its length (ACCEPT, `addr2` in `off`), in the process.
@@ -145,6 +153,14 @@ pub const Kernel = struct {
     direct_count: u32 = 0,
     /// Where the next allocation starts looking (Linux's `alloc_hint`).
     direct_hint: u32 = 0,
+    /// Sockets taken out of the table (a close, a FILES_UPDATE) while an
+    /// operation issued on them is in flight: as Linux keeps the file
+    /// until the last of them completes, each closes when its last does.
+    orphans: [direct_files_max]linux.fd_t = undefined,
+    orphans_count: u32 = 0,
+    /// A test's: while set, no queued operation starts, as when Linux has
+    /// not yet run the task work that issues a link's next.
+    links_held: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, seed: u64, options: Options) !Kernel {
         assert(options.tick_ns > 0);
@@ -345,9 +361,22 @@ pub const Kernel = struct {
         };
         kernel.sequence += 1;
         if (sqe.flags & linux.IOSQE_FIXED_FILE != 0) {
+            assert(sqe.fd >= 0);
+            operation.fixed_slot = @intCast(sqe.fd);
             operation.fd = kernel.direct_fd(sqe.fd) orelse -1;
         }
         return index;
+    }
+
+    /// A queued operation starts, as Linux issues a link's next from task
+    /// work: its fixed file looked up now (none in the slot: -EBADF).
+    fn start_queued(kernel: *Kernel, operation: *Operation) void {
+        assert(operation.state == .queued);
+        assert(!operation.canceled);
+        if (operation.fixed_slot) |slot| {
+            operation.fd = kernel.direct_fd(@intCast(slot)) orelse -1;
+        }
+        operation.state = .pending;
     }
 
     fn submit_one(kernel: *Kernel, sqe: *const linux.io_uring_sqe) u32 {
@@ -388,6 +417,7 @@ pub const Kernel = struct {
                 }
             },
             .TIMEOUT => kernel.submit_timeout(operation, sqe),
+            .FILES_UPDATE => kernel.submit_files_update(operation, sqe),
             .ASYNC_CANCEL => {
                 const by_fd: u32 = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_ALL;
                 const by_fixed: u32 = by_fd | linux.IORING_ASYNC_CANCEL_FD_FIXED;
@@ -422,6 +452,67 @@ pub const Kernel = struct {
 
     fn latency(kernel: *Kernel) u64 {
         return kernel.prng.int_at_most(u64, 0, kernel.options.latency_ticks_max);
+    }
+
+    /// FILES_UPDATE of one slot (the port's `retire`): the descriptor at
+    /// `addr` goes in, -1 empties it; inline at submission, as Linux
+    /// (`io_files_update`). What the slot held is released: closed now,
+    /// or when the last operation issued on it completes.
+    fn submit_files_update(
+        kernel: *Kernel,
+        operation: *Operation,
+        sqe: *const linux.io_uring_sqe,
+    ) void {
+        assert(sqe.fd == -1);
+        assert(sqe.len == 1); // one slot: all the port updates
+        const slot: u64 = sqe.off;
+        if (slot >= kernel.direct_count) {
+            operation.result = errno(.INVAL);
+            return;
+        }
+        const fds: *const [1]linux.fd_t = @ptrFromInt(sqe.addr);
+        const fd = fds[0];
+        if (fd != -1 and fd != dead_fd) unsimulated("a file registered", @intCast(fd));
+        const old = kernel.direct[slot];
+        kernel.direct[slot] = if (fd == -1) null else fd;
+        if (old) |held| kernel.release(held);
+        operation.result = 1;
+    }
+
+    /// A socket taken out of the table (a direct close, a FILES_UPDATE).
+    /// The dead socket is never closed. One with an operation in flight
+    /// closes when the last completes (`release_if_orphan`).
+    fn release(kernel: *Kernel, fd: linux.fd_t) void {
+        if (fd == dead_fd) return;
+        if (kernel.in_flight(fd)) {
+            assert(kernel.orphans_count < kernel.orphans.len);
+            kernel.orphans[kernel.orphans_count] = fd;
+            kernel.orphans_count += 1;
+            return;
+        }
+        assert(kernel.network.close(fd));
+    }
+
+    /// An operation on `fd` completed: closed now, if it was the last on
+    /// a socket taken out of the table.
+    fn release_if_orphan(kernel: *Kernel, fd: linux.fd_t) void {
+        for (kernel.orphans[0..kernel.orphans_count], 0..) |orphan, at| {
+            if (orphan != fd) continue;
+            if (kernel.in_flight(fd)) return;
+            kernel.orphans_count -= 1;
+            kernel.orphans[at] = kernel.orphans[kernel.orphans_count];
+            assert(kernel.network.close(fd));
+            return;
+        }
+    }
+
+    /// Whether an operation issued on `fd` is in flight (a queued one is
+    /// not: it has not looked its file up).
+    fn in_flight(kernel: *const Kernel, fd: linux.fd_t) bool {
+        for (kernel.operations) |*operation| {
+            if (operation.state == .pending and operation.fd == fd) return true;
+        }
+        return false;
     }
 
     /// Futexes on 32-bit words of this process, every bit of the mask:
@@ -505,7 +596,9 @@ pub const Kernel = struct {
     fn complete_due(kernel: *Kernel) u32 {
         var count: u32 = 0;
         for (kernel.operations, 0..) |*operation, index| {
-            if (operation.state != .pending or operation.due_tick > kernel.tick) continue;
+            if (operation.due_tick > kernel.tick) continue;
+            if (operation.state == .queued and !kernel.links_held) kernel.start_queued(operation);
+            if (operation.state != .pending) continue;
             kernel.due[count] = @intCast(index);
             count += 1;
         }
@@ -659,14 +752,18 @@ pub const Kernel = struct {
         const network = &kernel.network;
         switch (operation.opcode) {
             .CLOSE => {
-                const fd = if (operation.direct_close) |slot|
-                    kernel.direct_take(slot) orelse return errno(.BADF)
-                else
-                    operation.fd;
-                return if (network.close(fd)) 0 else errno(.BADF);
+                // A slot's: the slot is freed, and its socket released
+                // (closed once nothing in flight holds it).
+                if (operation.direct_close) |slot| {
+                    const held = kernel.direct_take(slot) orelse return errno(.BADF);
+                    kernel.release(held);
+                    return 0;
+                }
+                return if (network.close(operation.fd)) 0 else errno(.BADF);
             },
             .ACCEPT => return kernel.attempt_accept(operation),
             .RECV, .RECVMSG => {
+                if (operation.fd == dead_fd) return 0; // the end, at once
                 const index = network.connection_of(operation.fd) orelse return errno(.BADF);
                 const buffer = receive_buffer(operation);
                 assert(buffer.len > 0);
@@ -718,6 +815,7 @@ pub const Kernel = struct {
     /// Some bytes sent; with MSG_WAITALL it stays pending until all are.
     fn attempt_send(kernel: *Kernel, operation: *Operation) ?i32 {
         const network = &kernel.network;
+        if (operation.fd == dead_fd) return errno(.PIPE); // nothing goes out
         const index = network.connection_of(operation.fd) orelse return errno(.BADF);
         var parts_buffer: [iovecs_max][]const u8 = undefined;
         const total = send_parts(operation, &parts_buffer);
@@ -740,14 +838,15 @@ pub const Kernel = struct {
         }
     }
 
-    /// An operation not yet complete, pending or linked, by `user_data`.
+    /// An operation a cancel by `user_data` reaches: issued, not done.
     fn find(kernel: *const Kernel, user_data: u64) ?u32 {
         for (kernel.operations, 0..) |*operation, index| {
             if (operation.state == .free or operation.user_data != user_data) continue;
             if (operation.opcode == .ASYNC_CANCEL) continue;
-            // Linked behind another and not started: nowhere the kernel
-            // looks (it is on its head's link, not in any cancel table).
-            if (operation.state == .linked) continue;
+            // Linked behind another and not issued (its head not done, or
+            // done and the issue queued as task work): nowhere the kernel
+            // looks (on its head's link, or in task work: in no cancel table).
+            if (operation.state == .linked or operation.state == .queued) continue;
             // Woken, or canceled, it is done: only its completion is on its way.
             if (operation.futex == .woken or operation.canceled) continue;
             return @intCast(index);
@@ -769,6 +868,7 @@ pub const Kernel = struct {
             const operation = &kernel.operations[this];
             assert(operation.state == .pending);
             operation.state = .free;
+            kernel.release_if_orphan(operation.fd);
             const skip = operation.flags & linux.IOSQE_CQE_SKIP_SUCCESS != 0;
             const failed = operation.failed or operation.result < 0;
             if (chain_unseen or (skip and !failed)) {
@@ -788,9 +888,12 @@ pub const Kernel = struct {
                 continue;
             }
             assert(behind.state == .linked);
-            behind.state = .pending;
             behind.due_tick = kernel.tick + kernel.latency();
-            if (!failed) return; // it starts, in its own time
+            if (!failed) {
+                behind.state = .queued; // it starts, in its own time
+                return;
+            }
+            behind.state = .pending;
             behind.result = errno(.CANCELED); // and ends with this one
         } else unreachable;
     }
@@ -908,6 +1011,17 @@ pub fn shutdown(fd: linux.fd_t, how: i32) usize {
     const kernel = running.?;
     if (kernel.network.shutdown(fd, how)) return 0;
     return @bitCast(@as(isize, errno(.BADF)));
+}
+
+/// The dead socket (src/kernel.zig): one, never closed.
+pub fn dead_socket() ?linux.fd_t {
+    return dead_fd;
+}
+
+/// The dead socket's close at exit (src/kernel.zig): nothing to do.
+pub fn close(fd: linux.fd_t) usize {
+    assert(fd == dead_fd);
+    return 0;
 }
 
 /// As src/kernel.zig declares it.
@@ -1496,6 +1610,102 @@ test "sim_kernel: a send with MSG_WAITALL, then the receive linked behind it" {
         try testing.expectEqualStrings(reply, client.received[0..client.received_count]);
         try testing.expect(linked.count > 0);
         try testing.expectEqualStrings("next"[0..linked.count], linked.got[0..linked.count]);
+    }
+}
+
+const Retired = struct {
+    /// The chain's fiber, named by itself (as the server's connections are).
+    fiber: usize = 0,
+    /// Set by the test once the send is done and the receive queued.
+    shut_now: bool = false,
+    /// What the chain returned: the end (0), or bytes.
+    count: usize = 0,
+    failed: bool = false,
+};
+
+fn retired_main(retired: *Retired) void {
+    retired_run(retired) catch |err| std.debug.panic("retired: {t}", .{err});
+}
+
+/// A chain on a direct socket, and a second fiber that shuts the socket
+/// both ways when told, as the server's deadline does: a cancel by the
+/// slot, the chain named by its fiber, and the slot retired.
+fn retired_run(retired: *Retired) !void {
+    var runtime: Evented = undefined;
+    try runtime.init(testing.allocator, .{
+        .thread_limit = 0,
+        .fibers_max = 2,
+        .direct_sockets_max = 1,
+    });
+    defer runtime.deinit();
+    const io = runtime.io();
+    const stream = try Evented.acceptDirect(io, listener_fd);
+    defer stream.close(io);
+    const handle = stream.socket.handle;
+    var group: Io.Group = .init;
+    try group.concurrent(io, retired_chain, .{ io, handle, retired });
+    for (0..1000) |_| {
+        if (retired.shut_now) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    } else return error.TestNeverTold;
+    assert(retired.fiber != 0);
+    Evented.wakeBoth(handle);
+    Evented.wakeChain(retired.fiber);
+    Evented.retire(io, handle, .both);
+    try group.await(io);
+}
+
+fn retired_chain(io: Io, handle: Io.net.Socket.Handle, retired: *Retired) Io.Cancelable!void {
+    retired.fiber = Evented.currentFiber();
+    var got: [4]u8 = undefined;
+    const reply = "a response longer than the window";
+    retired.count = Evented.sendThenReceive(io, handle, reply, &got) catch {
+        retired.failed = true;
+        return;
+    };
+}
+
+/// The first operation queued behind its done head, of this kind.
+fn queued_operation(kernel: *Kernel, opcode: linux.IORING_OP) ?*Operation {
+    for (kernel.operations) |*operation| {
+        if (operation.state == .queued and operation.opcode == opcode) return operation;
+    }
+    return null;
+}
+
+// The linked turn's receive with its send just done: Linux issues it from
+// task work, which the next `io_uring_enter` runs after that call's
+// submissions, so a cancel among them finds it in no cancel table. The
+// server's deadline in that window ended nothing, and the fiber waited
+// for the client. With the slot retired, the receive is issued on the
+// dead socket and reads the end.
+test "sim_kernel: a receive queued behind its done send is ended by retiring the slot" {
+    const reply = "a response longer than the window";
+    for (1..9) |seed| {
+        var kernel = try Kernel.init(testing.allocator, seed, test_options);
+        defer kernel.deinit(testing.allocator);
+        _ = kernel.network.listen();
+        var retired: Retired = .{};
+        // It reads the whole response and sends nothing: the receive waits.
+        var client: TestClient = .{ .request = "", .expected_bytes = 64 };
+        kernel.links_held = true; // the window stays open until the slot is retired
+        kernel.start(retired_main, &retired);
+        var told = false;
+        for (0..10_000) |_| {
+            if (kernel.exited()) break;
+            if (!told and queued_operation(&kernel, .RECV) != null) {
+                retired.shut_now = true;
+                told = true;
+            }
+            if (kernel.direct[0] == dead_fd) kernel.links_held = false;
+            client.step(&kernel.network);
+            kernel.step();
+        } else return error.TestProcessNeverExited;
+        try testing.expect(told);
+        try testing.expectEqualStrings(reply, client.received[0..client.received_count]);
+        try testing.expect(!retired.failed);
+        try testing.expectEqual(0, retired.count); // the end, not bytes
+        try testing.expectEqual(0, kernel.stats.canceled); // the cancels found nothing
     }
 }
 

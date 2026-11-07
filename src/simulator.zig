@@ -16,6 +16,8 @@ pub const clock_gettime = sim_kernel.clock_gettime;
 pub const shutdown = sim_kernel.shutdown;
 pub const getsockopt = sim_kernel.getsockopt;
 pub const TcpInfoHead = sim_kernel.TcpInfoHead;
+pub const dead_socket = sim_kernel.dead_socket;
+pub const close = sim_kernel.close;
 
 /// `fourneau-sim`: the sweep (sim.zig).
 pub const main = sim.main;

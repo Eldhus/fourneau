@@ -330,9 +330,11 @@ const ServerPlain = server_module.ServerType(App, .{
     .listen_backlog = Evented.listenBacklog,
     .wake_read = Evented.wakeRead,
     .wake_both = Evented.wakeBoth,
+    .wake_chain = Evented.wakeChain,
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .retire = Evented.retire,
     .accept = Evented.acceptDirect,
     .set_option = Evented.setSocketOption,
 });
@@ -342,17 +344,21 @@ const ServerDescriptors = server_module.ServerType(App, .{
     .listen_backlog = Evented.listenBacklog,
     .wake_read = Evented.wakeRead,
     .wake_both = Evented.wakeBoth,
+    .wake_chain = Evented.wakeChain,
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .retire = Evented.retire,
 });
 const ServerLinked = server_module.ServerType(App, .{
     .listen_backlog = Evented.listenBacklog,
     .wake_read = Evented.wakeRead,
     .wake_both = Evented.wakeBoth,
+    .wake_chain = Evented.wakeChain,
     .current_fiber = Evented.currentFiber,
     .receive = Evented.receive,
     .send = Evented.send,
+    .retire = Evented.retire,
     .accept = Evented.acceptDirect,
     .set_option = Evented.setSocketOption,
     .send_then_receive = Evented.sendThenReceive,
@@ -496,6 +502,10 @@ fn run_shard(
     // A run cut short (a failure, the canary) still ends its server, so
     // the process frees what it holds.
     defer if (!kernel.exited()) wind_down(kernel, &stop, plan);
+    if (result.exit_code == exit_liveness) {
+        print_state(kernel, shard.now());
+        print_clients(clients);
+    }
     if (result.exit_code != 0) return result;
     const stop_tick = ending.stop_tick orelse {
         std.debug.print("server: never told to stop by tick {d}\n", .{ending.tick});
@@ -517,6 +527,16 @@ fn run_shard(
         result.exit_code = exit_correctness;
     }
     return result;
+}
+
+/// For a run that did not end: the clients not done, and where each stands.
+fn print_clients(clients: []const sim_client.Client) void {
+    for (clients, 0..) |*client, index| {
+        if (client.state == .done) continue;
+        std.debug.print("client {d}: {t}, connection {?d}, sending {d}, awaiting {d}\n", .{
+            index, client.state, client.connection, client.send_index, client.receive_index,
+        });
+    }
 }
 
 /// For a run that did not end: what the server counted, and what still
@@ -872,6 +892,12 @@ const HandClient = struct {
     }
 };
 
+/// Never done: `await_until` returns when the client sees the end.
+fn at_end(bytes: []const u8) bool {
+    _ = bytes;
+    return false;
+}
+
 /// Responses ending at their head (a 204, the only kind these tests ask
 /// for when they count them), as many as `count`.
 fn heads_at_least(comptime count: u32) fn ([]const u8) bool {
@@ -1088,6 +1114,48 @@ test "sim: a send cut by its deadline after some bytes is not a request received
         try client.await_until(&scripted, heads_at_least(2)); // returns at the end
         try std.testing.expect(network.client_sees_end(client.connection));
         try std.testing.expectEqual(1, scripted.app.handled);
+        network.client_close(client.connection);
+        try scripted.finish();
+    }
+}
+
+// The linked turn again: the server marks the connection idle as the chain
+// starts, so a drain (or an eviction) shuts it while its response is still
+// going out. The receive behind the send has not started, so no cancel
+// finds it. A read-side shutdown let the send finish and then ended the
+// read at once; the wake must do the same: the client reads the whole
+// response, and the connection ends right after, not at the drain's cut
+// (or, evicted, the send's deadline) seconds later.
+test "sim: a connection shut while its response goes out ends when the send does" {
+    const gpa = std.testing.allocator;
+    for (1..9) |seed| {
+        var scripted: ScriptedLinked = undefined;
+        var plan = scripted_plan(1);
+        plan.linked = true;
+        try scripted.init(gpa, seed, plan);
+        defer scripted.deinit(gpa);
+        const network = &scripted.kernel.network;
+        var client: HandClient = .connect(network);
+        client.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
+        try client.await_until(&scripted, heads_at_least(1));
+        client.send(network, "GET /big/600 HTTP/1.1\r\nHost: a\r\n\r\n");
+        // Not read yet: the window (64 bytes) fills, the send stalls, and
+        // the connection is idle to the server. The drain shuts it.
+        scripted.ticks(10);
+        scripted.stop.store(true, .release);
+        for (0..scripted.plan.ticks_max) |_| {
+            if (scripted.shard.now().stats.drain_idle > 0) break;
+            scripted.tick();
+        } else return error.TestNoDrain;
+        // Now read it all: the send completes, and the connection ends.
+        try client.await_until(&scripted, at_end);
+        try std.testing.expect(network.client_sees_end(client.connection));
+        // The whole body came (letters only: the last blank line is the head's).
+        const body_at = std.mem.lastIndexOf(u8, client.text(), "\r\n\r\n").? + 4;
+        try std.testing.expectEqual(600, client.text().len - body_at);
+        const stats = scripted.shard.now().stats;
+        try std.testing.expectEqual(0, stats.drain_cut);
+        try std.testing.expectEqual(0, stats.timeouts);
         network.client_close(client.connection);
         try scripted.finish();
     }

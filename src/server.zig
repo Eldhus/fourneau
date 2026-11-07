@@ -226,14 +226,17 @@ pub const Options = struct {
     /// the drain) by canceling what is pending, where the `Io` can (our
     /// port: `Evented.wakeRead` for its fiber's receive, `wakeBoth` for
     /// everything on its socket, `currentFiber` to name the fiber, with
-    /// `receive` and `send` that return `Shut` instead of retrying). All
-    /// or none. Null: the socket is shut down with a system call, which
-    /// `std.Io` has.
+    /// `receive` and `send` that return `Shut` instead of retrying, and
+    /// `retire` for the wait a cancel cannot reach: the receive of a
+    /// linked turn, behind a send still going out). All or none. Null:
+    /// the socket is shut down with a system call, which `std.Io` has.
     wake_read: ?WakeRead = null,
     wake_both: ?WakeBoth = null,
+    wake_chain: ?WakeChain = null,
     current_fiber: ?CurrentFiber = null,
     receive: ?Receive = null,
     send: ?Send = null,
+    retire: ?Retire = null,
     /// Accept into the ring's own file table (our port: `acceptDirect`,
     /// with `InitOptions.direct_sockets_max` sized to the slots and one
     /// more): a connection then holds no process descriptor. Needs
@@ -251,8 +254,14 @@ pub const ListenBacklog = fn (listen_handle: net.Socket.Handle) ?u32;
 pub const WakeRead = fn (fiber: usize) void;
 /// Cancel every operation pending on a socket; no wait.
 pub const WakeBoth = fn (socket_handle: net.Socket.Handle) void;
+/// Cancel a fiber's linked send-then-receive, whatever its socket's slot
+/// holds now; no wait.
+pub const WakeChain = fn (fiber: usize) void;
 /// The fiber running now, for `WakeRead`.
 pub const CurrentFiber = fn () usize;
+/// End what is issued on a socket from now on, letting what is in flight
+/// finish (`Evented.retire`); `.recv` or `.both`; no wait.
+pub const Retire = fn (io: Io, socket_handle: net.Socket.Handle, how: net.ShutdownHow) void;
 /// One receive; `error.Shut` when woken, `error.Canceled` when the fiber was.
 pub const Receive = fn (io: Io, socket_handle: net.Socket.Handle, buffer: []u8) anyerror!usize;
 /// One send of a head then a body; the same errors.
@@ -727,6 +736,11 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             shut_write: bool,
             /// The fiber serving it (`Options.current_fiber`), for `wake_read`.
             fiber: usize,
+            /// In the linked turn (`send_and_read`): its response and the
+            /// receive of its next request are one chain in the kernel, so
+            /// a wake cannot reach the receive until the response is out
+            /// (`Server.shut`).
+            chained: bool,
             continue_sent: bool,
             keep_alive: bool,
             requests: u32,
@@ -1024,6 +1038,9 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 server.arm(connection.index, @max(timeout_ms, config.send_timeout_ms));
                 defer server.disarm(connection.index);
                 const socket = connection.stream.socket.handle;
+                assert(!connection.chained);
+                connection.chained = true;
+                defer connection.chained = false;
                 const got = try send_then_receive(server.io, socket, pending, buffer);
                 assert(got <= buffer.len);
                 return @intCast(got);
@@ -1379,14 +1396,18 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
 
         /// End a connection's waits from another fiber, as a socket's
         /// shutdown did: for reading (eviction, a drain's idle close: a
-        /// response still going out goes out whole, and the fiber returns
-        /// when its receive is found or its turn ends) or both ways (a
-        /// deadline, the drain's cut: everything pending is canceled, the
-        /// next send fails too). The flags keep it shut from now on, as a
-        /// shutdown was sticky; the cancel wakes the fiber waiting
-        /// (`Options.wake_read`, `wake_both`): no system call, and nothing
-        /// that could reach another connection. Without them, the socket is
-        /// shut down.
+        /// response still going out goes out whole, then the read sees
+        /// the end) or both ways (a deadline, the drain's cut: everything
+        /// pending is canceled, the next send fails too). The flags keep
+        /// it shut from now on, as a shutdown was sticky; the cancel wakes
+        /// the fiber waiting (`Options.wake_read`, `wake_both`): no system
+        /// call, and nothing that could reach another connection. What no
+        /// cancel reaches, the socket is retired from (`Options.retire`):
+        /// the receive of a linked turn, behind a send still going out
+        /// (`Connection.chained`), which the kernel issues only once the
+        /// send is out; and, shut both ways, one it has yet to issue when
+        /// the send has just completed. Without them, the socket is shut
+        /// down.
         fn shut(server: *Server, connection: *Connection, how: enum { recv, both }) void {
             assert(connection.open);
             connection.shut_read = true;
@@ -1395,14 +1416,24 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                 comptime assert(type_options.wake_both != null);
                 comptime assert(type_options.current_fiber != null);
                 comptime assert(type_options.receive != null and type_options.send != null);
+                comptime assert(type_options.retire != null and type_options.wake_chain != null);
+                const handle = connection.stream.socket.handle;
                 switch (how) {
                     // A read-side wake is for a connection waiting between
                     // requests: its fiber has started and named itself.
                     .recv => {
                         assert(connection.fiber != 0);
                         type_options.wake_read.?(connection.fiber);
+                        if (connection.chained) type_options.retire.?(server.io, handle, .recv);
                     },
-                    .both => type_options.wake_both.?(connection.stream.socket.handle),
+                    .both => {
+                        type_options.wake_both.?(handle);
+                        // Retired for reading already, the slot no longer
+                        // names the socket its chain is still on: the
+                        // chain is named by its fiber.
+                        if (connection.chained) type_options.wake_chain.?(connection.fiber);
+                        type_options.retire.?(server.io, handle, .both);
+                    },
                 }
             } else {
                 const shutdown_how: net.ShutdownHow = if (how == .both) .both else .recv;
@@ -1440,6 +1471,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             connection.shut_read = false;
             connection.shut_write = false;
             connection.fiber = 0; // its fiber names itself when it starts
+            connection.chained = false;
             connection.recv_used = 0;
             connection.send_used = 0;
             connection.requests = 0;
