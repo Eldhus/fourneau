@@ -217,7 +217,15 @@ pub const Options = struct {
     /// the `Io` has one (our io_uring port: `Evented.sendThenReceive`, one
     /// completion per turn instead of two). Null: a write, then a read.
     send_then_receive: ?SendThenReceive = null,
+    /// Whether clients wait in the listener's backlog, where the `Io` can
+    /// say (our port: `Evented.listenBacklog`): an acceptor short of
+    /// descriptors evicts an idle connection only for a client waiting.
+    /// Null: taken as waiting.
+    listen_backlog: ?ListenBacklog = null,
 };
+
+/// Clients waiting in a listener's backlog; null when the kernel will not say.
+pub const ListenBacklog = fn (listen_handle: net.Socket.Handle) ?u32;
 
 /// Send all of the bytes, then receive into the buffer; the count received.
 pub const SendThenReceive = fn (
@@ -389,9 +397,12 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
         /// flight, and on io_uring a close waits for its completion, so
         /// other fibers run meanwhile.
         closing_count: u32 = 0,
-        /// The last accept failed for want of a descriptor: said once per
-        /// episode, not once per tick of retrying.
-        accept_starved: bool = false,
+        /// Accepts failed for want of a descriptor since the last two that
+        /// succeeded in a row: said at the first and every 1,024th
+        /// (`accept_starved`), since at the limit a success and a failure
+        /// alternate, and a line per failure would be a line per connection.
+        accept_starved_count: u32 = 0,
+        accept_ok_run: u32 = 0,
         /// Counts free slots: the acceptor waits on it, so a full server
         /// stops accepting and the kernel's backlog holds new clients.
         free_slots: Io.Semaphore,
@@ -1151,17 +1162,18 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                     error.Canceled => return,
                     // Out of descriptors before the slots are full: the
                     // process's limit, when the reserve the startup sized it
-                    // by was short, or the system's. Make room as a full
-                    // server does, then wait a tick for the close to free
-                    // one, rather than spin.
+                    // by was short, or the system's. Linux takes the
+                    // descriptor before it looks at the backlog, so this
+                    // says nothing about a client waiting: only with one
+                    // waiting, and no close in flight about to free a
+                    // descriptor, is the longest idle evicted, as a full
+                    // server does. Then a tick's wait for the close, rather
+                    // than a spin.
                     error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
-                        if (!server.accept_starved) {
-                            log.warn("accept: {t}: evicting the longest idle until one frees", .{
-                                err,
-                            });
+                        server.accept_starved(err);
+                        if (server.closing_count == 0 and server.backlog_waiting()) {
+                            server.evict_idle();
                         }
-                        server.accept_starved = true;
-                        server.evict_idle();
                         if (!server.wait_tick()) return; // canceled
                         continue;
                     },
@@ -1171,7 +1183,7 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
                         continue;
                     },
                 };
-                server.accept_starved = false;
+                server.accept_fed();
                 if (server.free_count == 0) server.evict_idle();
                 server.free_slots.wait(server.io) catch {
                     // Canceled while the server was full: never served.
@@ -1195,6 +1207,36 @@ pub fn ServerType(comptime App: type, comptime type_options: Options) type {
             const tick: Io.Duration = .fromMilliseconds(server.config.tick_ms);
             server.io.sleep(tick, .awake) catch return false;
             return true;
+        }
+
+        /// An accept failed for want of a descriptor: said at the first
+        /// of an episode and every 1,024th after.
+        fn accept_starved(server: *Server, err: anyerror) void {
+            server.accept_ok_run = 0;
+            server.accept_starved_count += 1;
+            const count = server.accept_starved_count;
+            if (count == 1 or count % 1024 == 0) {
+                log.warn("accept: {t}, {d} times: evicting the longest idle for a client " ++
+                    "waiting", .{ err, count });
+            }
+        }
+
+        /// An accept succeeded: two in a row end a starved episode.
+        fn accept_fed(server: *Server) void {
+            if (server.accept_starved_count == 0) return;
+            server.accept_ok_run += 1;
+            if (server.accept_ok_run >= 2) {
+                server.accept_starved_count = 0;
+                server.accept_ok_run = 0;
+            }
+        }
+
+        /// Whether a client waits in the listener's backlog, when the `Io`
+        /// can say (`Options.listen_backlog`); unknown counts as waiting.
+        fn backlog_waiting(server: *Server) bool {
+            const listen_backlog = type_options.listen_backlog orelse return true;
+            const waiting = listen_backlog(server.listener.socket.handle) orelse return true;
+            return waiting > 0;
         }
 
         /// Close the connection idle longest, if any is: the fiber waiting

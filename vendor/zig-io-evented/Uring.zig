@@ -6406,6 +6406,22 @@ pub fn sendThenReceive(
     };
 }
 
+/// fourneau: whether clients wait in a listener's backlog, for an acceptor
+/// short of descriptors (Linux fails such an accept before it looks at the
+/// backlog, so EMFILE says nothing about a client waiting). A listening
+/// socket's TCP_INFO reports its queue as `unacked`: a plain system call
+/// through `kernel`, so the simulator answers it. Null: the kernel would
+/// not say.
+pub fn listenBacklog(listen_handle: net.Socket.Handle) ?u32 {
+    var head: kernel.TcpInfoHead = undefined;
+    var len: linux.socklen_t = @sizeOf(kernel.TcpInfoHead);
+    const level = linux.IPPROTO.TCP;
+    const asked = kernel.getsockopt(listen_handle, level, linux.TCP.INFO, @ptrCast(&head), &len);
+    if (linux.errno(asked) != .SUCCESS) return null;
+    if (len < @sizeOf(kernel.TcpInfoHead)) return null;
+    return head.unacked;
+}
+
 fn netReadStream(
     ev: *Evented,
     cancel_region: *CancelRegion,

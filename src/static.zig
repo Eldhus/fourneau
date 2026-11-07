@@ -53,10 +53,16 @@ const App = struct {
     }
 };
 
-const Server = server_module.ServerType(App, .{ .send_then_receive = Evented.sendThenReceive });
+const Server = server_module.ServerType(App, .{
+    .send_then_receive = Evented.sendThenReceive,
+    .listen_backlog = Evented.listenBacklog,
+});
 
 /// Port 80 beside HTTPS: redirects (https.zig).
-const Redirect = https.RedirectType(.{ .send_then_receive = Evented.sendThenReceive });
+const Redirect = https.RedirectType(.{
+    .send_then_receive = Evented.sendThenReceive,
+    .listen_backlog = Evented.listenBacklog,
+});
 
 const Options = struct {
     root: ?[]const u8 = null,
@@ -81,12 +87,12 @@ const connections_per_shard_min = 64;
 /// raised to what the server needs: the connections and the reserve for
 /// everything else. Fewer than `connections_per_shard_min` a shard fit:
 /// the environment cannot run the server, said with the number to set.
-fn connections_per_shard(shards: u32) !u32 {
+fn connections_per_shard(shards: u32, redirect: bool) !u32 {
     assert(shards >= 1);
     assert(shards <= shards_max);
     const wanted = @max(connections_per_shard_min, connections_max / shards) * shards;
     const minimum = connections_per_shard_min * shards;
-    const reserved = descriptors_reserved(shards);
+    const reserved = descriptors_reserved(shards, redirect);
     const need: u64 = @as(u64, reserved) + wanted;
     const descriptors = listen.descriptor_limit_raise(need);
     const fitting = listen.connections_fitting(.{
@@ -112,25 +118,30 @@ fn connections_per_shard(shards: u32) !u32 {
 }
 
 /// Descriptors that are no connection, as a sum: stdio (3); a ring and a
-/// listener a shard; the redirect server's ring and listener (2); ACME's
-/// responder, its listener and the one client it answers at a time (3);
-/// the site's directory while it loads (1); and a margin for what a
-/// library opens (64). What is open before the shards start is checked
-/// against it (`assert_descriptors_reserved`).
-fn descriptors_reserved(shards: u32) u32 {
+/// listener a shard; with a redirect, each shard's redirect listener and
+/// its connections (`Redirect.config`); ACME's responder, its listener and
+/// the one client it answers at a time (3); the site's directory while it
+/// loads (1); and a margin for what a library opens (64). What is open
+/// before the shards start is checked against it
+/// (`check_descriptors_reserved`); what opens later is in the sum by count.
+fn descriptors_reserved(shards: u32, redirect: bool) u32 {
     assert(shards <= shards_max);
-    return 3 + 2 * shards + 2 + 3 + 1 + 64;
+    const redirects: u32 = if (redirect) shards * (1 + Redirect.config.connections_max) else 0;
+    return 3 + 2 * shards + redirects + 3 + 1 + 64;
 }
 
-/// The reserve is a sum, not a guess: what the process holds open just
-/// before its shards start, plus each shard's ring and listener, fits it,
-/// or the sum is wrong and the server says so instead of running short.
-fn assert_descriptors_reserved(shards: u32) void {
+/// What the process holds open just before its shards start, plus each
+/// shard's ring and listener, fits the reserve, or the server refuses with
+/// the counts instead of running short of descriptors under load.
+fn check_descriptors_reserved(shards: u32, redirect: bool) !void {
     const open = listen.descriptors_open() orelse return; // no /proc: unchecked
-    const reserved = descriptors_reserved(shards);
+    const reserved = descriptors_reserved(shards, redirect);
     if (open + 2 * shards > reserved) {
-        std.debug.panic("fourneau-static: {d} descriptors open before {d} shards, past the " ++
-            "{d} reserved: descriptors_reserved is wrong", .{ open, shards, reserved });
+        log.err("{d} descriptors open before {d} shards start, past the {d} reserved for " ++
+            "them: inherited descriptors, or the reserve's sum is short", .{
+            open, shards, reserved,
+        });
+        return error.DescriptorsReserved;
     }
 }
 
@@ -199,8 +210,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     if (options.shards == 0) options.shards = cpu_count();
     assert(options.shards <= shards_max);
-    options.connections_max = try connections_per_shard(options.shards);
-    assert_descriptors_reserved(options.shards);
+    const redirect = options.https.redirect_port != null;
+    options.connections_max = try connections_per_shard(options.shards, redirect);
+    try check_descriptors_reserved(options.shards, redirect);
     var threads: [shards_max]std.Thread = undefined;
     for (threads[1..options.shards]) |*thread| {
         thread.* = try std.Thread.spawn(.{}, run_shard, .{ &shared, options });

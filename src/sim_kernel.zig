@@ -740,6 +740,49 @@ pub fn shutdown(fd: linux.fd_t, how: i32) usize {
     return @bitCast(@as(isize, errno(.BADF)));
 }
 
+/// As src/kernel.zig declares it.
+pub const TcpInfoHead = extern struct {
+    state: u8,
+    ca_state: u8,
+    retransmits: u8,
+    probes: u8,
+    backoff: u8,
+    options: u8,
+    scales: u8,
+    flags: u8,
+    rto: u32,
+    ato: u32,
+    snd_mss: u32,
+    rcv_mss: u32,
+    unacked: u32,
+    sacked: u32,
+};
+
+/// The acceptor's question when short of descriptors (src/kernel.zig):
+/// TCP_INFO on the listening socket, whose `unacked` is the backlog's
+/// length, as Linux answers it. No other option is simulated.
+pub fn getsockopt(
+    fd: linux.fd_t,
+    level: i32,
+    optname: u32,
+    optval: [*]u8,
+    optlen: *linux.socklen_t,
+) usize {
+    const kernel = running.?;
+    if (fd != listener_fd) return @bitCast(@as(isize, errno(.BADF)));
+    if (level != linux.IPPROTO.TCP or optname != linux.TCP.INFO) {
+        return @bitCast(@as(isize, errno(.NOPROTOOPT)));
+    }
+    var head: TcpInfoHead = std.mem.zeroes(TcpInfoHead);
+    head.state = 10; // TCP_LISTEN
+    head.unacked = kernel.network.backlog_count;
+    const bytes = std.mem.asBytes(&head);
+    const copied: linux.socklen_t = @intCast(@min(optlen.*, bytes.len));
+    @memcpy(optval[0..copied], bytes[0..copied]);
+    optlen.* = copied;
+    return 0;
+}
+
 /// The ring, as the port holds it: `std.os.linux.IoUring`'s declarations
 /// that the port uses, on the running kernel.
 pub const Ring = struct {

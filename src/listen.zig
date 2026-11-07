@@ -173,6 +173,7 @@ pub fn descriptors_open() ?u32 {
         var offset: usize = 0;
         while (offset < read) {
             const entry: *const linux.dirent64 = @ptrCast(@alignCast(&buffer[offset]));
+            assert(entry.reclen >= @sizeOf(linux.dirent64)); // the walk advances
             const name: [*:0]const u8 = @ptrCast(&entry.name);
             // `.` and `..` are no descriptors; the directory's own is.
             if (name[0] != '.') count += 1;

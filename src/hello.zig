@@ -64,7 +64,10 @@ const App = struct {
     }
 };
 
-const Server = server_module.ServerType(App, .{ .send_then_receive = Evented.sendThenReceive });
+const Server = server_module.ServerType(App, .{
+    .send_then_receive = Evented.sendThenReceive,
+    .listen_backlog = Evented.listenBacklog,
+});
 
 const Options = struct {
     port: u16 = 8080,

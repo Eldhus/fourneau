@@ -326,8 +326,9 @@ const App = struct {
     }
 };
 
-const ServerPlain = server_module.ServerType(App, .{});
+const ServerPlain = server_module.ServerType(App, .{ .listen_backlog = Evented.listenBacklog });
 const ServerLinked = server_module.ServerType(App, .{
+    .listen_backlog = Evented.listenBacklog,
     .send_then_receive = Evented.sendThenReceive,
 });
 
@@ -980,33 +981,44 @@ test "sim: an idle connection evicted as its next request arrives closes unanswe
 }
 
 // The process's descriptor limit below the slots (a reserve sized short,
-// or the system's limit): accept fails with EMFILE while slots are free.
-// The acceptor evicts the longest idle as a full server would, the close
-// frees a descriptor, and the new client is served, not left in the
-// backlog until it times out.
-test "sim: out of descriptors before the slots are full, the longest idle is evicted" {
+// or the system's limit): accept fails with EMFILE while slots are free,
+// and Linux fails it before looking at the backlog, so it fails at the
+// limit with nobody waiting too. Nothing is evicted for nobody. Once a
+// client waits, the acceptor evicts the longest idle as a full server
+// would, once (a close in flight is about to free a descriptor), and the
+// new client is served, not left in the backlog until it times out.
+test "sim: short of descriptors, the longest idle is evicted only for a client waiting" {
     const gpa = std.testing.allocator;
     for (1..17) |seed| {
         var scripted: Scripted = undefined;
         var plan = scripted_plan(4);
-        plan.kernel.network.descriptors_max = 1;
+        plan.kernel.network.descriptors_max = 2;
         try scripted.init(gpa, seed, plan);
         defer scripted.deinit(gpa);
         const network = &scripted.kernel.network;
-        var idle: HandClient = .connect(network);
-        idle.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
-        try idle.await_until(&scripted, heads_at_least(1));
+        var first: HandClient = .connect(network);
+        first.send(network, "GET /s/204 HTTP/1.1\r\nHost: a\r\n\r\n");
+        try first.await_until(&scripted, heads_at_least(1));
+        scripted.ticks(5);
+        var second: HandClient = .connect(network);
+        second.send(network, "GET /s/204 HTTP/1.1\r\nHost: b\r\n\r\n");
+        try second.await_until(&scripted, heads_at_least(1));
+        // At the limit with nobody waiting: accept fails, nothing is evicted.
         scripted.ticks(20);
+        try std.testing.expectEqual(0, scripted.shard.now().stats.evicted);
         var fresh: HandClient = .connect(network);
-        fresh.send(network, "GET /s/204 HTTP/1.1\r\nHost: b\r\nConnection: close\r\n\r\n");
+        fresh.send(network, "GET /s/204 HTTP/1.1\r\nHost: c\r\nConnection: close\r\n\r\n");
         try fresh.await_until(&scripted, heads_at_least(1));
         try std.testing.expect(std.mem.startsWith(u8, fresh.text(), "HTTP/1.1 204"));
-        try idle.await_until(&scripted, heads_at_least(2)); // ends: it was evicted
-        try std.testing.expect(network.client_sees_end(idle.connection));
+        // The longest idle made room, once; the other idle connection stays.
+        try first.await_until(&scripted, heads_at_least(2)); // returns at its end
+        try std.testing.expect(network.client_sees_end(first.connection));
+        try std.testing.expect(!network.client_sees_end(second.connection));
         const stats = scripted.shard.now().stats;
         try std.testing.expectEqual(1, stats.evicted);
-        try std.testing.expectEqual(2, stats.accepted);
-        network.client_close(idle.connection);
+        try std.testing.expectEqual(3, stats.accepted);
+        network.client_close(first.connection);
+        network.client_close(second.connection);
         network.client_close(fresh.connection);
         try scripted.finish();
     }

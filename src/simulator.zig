@@ -14,6 +14,8 @@ pub const IoUring = sim_kernel.Ring;
 pub const sq_space_left = sim_kernel.sq_space_left;
 pub const clock_gettime = sim_kernel.clock_gettime;
 pub const shutdown = sim_kernel.shutdown;
+pub const getsockopt = sim_kernel.getsockopt;
+pub const TcpInfoHead = sim_kernel.TcpInfoHead;
 
 /// `fourneau-sim`: the sweep (sim.zig).
 pub const main = sim.main;
