@@ -848,6 +848,8 @@ pub fn io(ev: *Evented) Io {
             .childKill = childKill,
 
             .progressParentFile = progressParentFile,
+            .inheritParentDir = inheritParentDir,
+            .inheritParentFile = inheritParentFile,
 
             .now = now,
             .clockResolution = clockResolution,
@@ -855,8 +857,6 @@ pub fn io(ev: *Evented) Io {
 
             .random = random,
             .randomSecure = randomSecure,
-            .inheritParentDir = inheritParentDirUnavailable,
-            .inheritParentFile = inheritParentFileUnavailable,
 
             .netListenIp = netListenIp,
             .netAccept = netAccept,
@@ -900,7 +900,7 @@ pub const InitOptions = struct {
     argv0: Argv0 = .empty,
     /// Affects the following operations:
     /// * `fileIsTty`
-    /// * `processSpawn`, `processSpawnPath`, `processReplace`, `processReplacePath`
+    /// * `processSpawn`, `processReplace`
     environ: process.Environ = .empty,
 };
 
@@ -1387,7 +1387,8 @@ fn idle(ev: *Evented, thread: *Thread) void {
                             batch_userdata[0] = next;
                         }
                         break :ready_fiber switch (@as(u2, @truncate(next))) {
-                            0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                            0b00 => @ptrFromInt(next),
+                            0b01 => null, // the timeout completion already woke this fiber
                             0b10, 0b11 => null,
                         };
                     },
@@ -2607,6 +2608,9 @@ fn batchDrainSubmitted(
                 return error.ConcurrencyUnavailable
             else
                 .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
+            // fourneau: upstream 0.17.1 has a `.net_accept` arm here, but
+            // 0.17.1's `Io.Operation` has no `net_accept`, so it does not
+            // compile (upstream never builds this file); taken out.
             .net_receive => |o| {
                 _ = o;
                 @panic("TODO implement batchDrainSubmitted for net_receive");
@@ -2685,7 +2689,10 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
             if (@as(?Io.Operation.Result, result: switch (pending.tag) {
                 .file_read_streaming => .{
                     .file_read_streaming = switch (completion.errno()) {
-                        .SUCCESS => @as(u32, @bitCast(completion.result)),
+                        .SUCCESS => if (completion.result == 0)
+                            error.EndOfStream
+                        else
+                            @as(u32, @bitCast(completion.result)),
                         .INTR => 0,
                         .CANCELED => break :result null,
                         .INVAL => |err| errnoBug(err),
@@ -2723,6 +2730,7 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
                     },
                 },
                 .device_io_control => unreachable,
+                // fourneau: upstream 0.17.1's `.net_accept` arm taken out, as above.
                 .net_receive => @panic("TODO"),
                 .net_send => @panic("TODO"),
                 .net_read => @panic("TODO"),
@@ -4466,19 +4474,32 @@ fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) proces
 
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
-    return execv(&sync, options.expand_arg0, argv_buf.ptr[0].?, argv_buf.ptr, env_block, PATH);
-}
 
-fn processReplacePath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: process.ReplaceOptions,
-) process.ReplaceError {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processReplacePath");
+    switch (options.cwd) {
+        .inherit => {},
+        .dir => |cwd_dir| fchdir(&sync, cwd_dir.handle) catch |err| switch (err) {
+            error.NoDevice, error.UnrecognizedVolume => return error.FileSystem,
+            else => |e| return e,
+        },
+        .path => |cwd_path| {
+            var cwd_path_buffer: [PATH_MAX]u8 = undefined;
+            const cwd_path_posix = try pathToPosix(cwd_path, &cwd_path_buffer);
+            chdir(&sync, cwd_path_posix) catch |err| switch (err) {
+                error.SymLinkLoop => return error.FileSystem,
+                else => |e| return e,
+            };
+        },
+    }
+    for (options.inherit_dirs) |dir| try setFdFlags(&sync, dir.handle, 0);
+    for (options.inherit_files) |file| try setFdFlags(&sync, file.handle, 0);
+    if (options.start_suspended) {
+        switch (linux.errno(linux.kill(linux.getpid(), .STOP))) {
+            .SUCCESS => {},
+            .PERM => return error.PermissionDenied,
+            else => return error.Unexpected,
+        }
+    }
+    return processExec(&sync, options.exe, argv_buf.ptr, options.expand_arg0, env_block, PATH);
 }
 
 fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
@@ -4513,18 +4534,6 @@ fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.Sp
         };
     };
     return child_err;
-}
-
-fn processSpawnPath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: process.SpawnOptions,
-) process.SpawnError!process.Child {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processSpawnPath");
 }
 
 const prog_fileno = @max(linux.STDIN_FILENO, linux.STDOUT_FILENO, linux.STDERR_FILENO);
@@ -4710,6 +4719,20 @@ fn setUpChild(sync: *CancelRegion.Sync, options: struct {
     PATH: []const u8,
     spawn: process.SpawnOptions,
 }) ForkBailError {
+    // Must happen before clobbering file descriptors below.
+    switch (options.spawn.cwd) {
+        .inherit => {},
+        .dir => |cwd_dir| try fchdir(sync, cwd_dir.handle),
+        .path => |cwd_path| {
+            var cwd_path_buffer: [PATH_MAX]u8 = undefined;
+            const cwd_path_posix = try pathToPosix(cwd_path, &cwd_path_buffer);
+            try chdir(sync, cwd_path_posix);
+        },
+    }
+
+    for (options.spawn.inherit_dirs) |dir| try setFdFlags(sync, dir.handle, 0);
+    for (options.spawn.inherit_files) |file| try setFdFlags(sync, file.handle, 0);
+
     try setUpChildIo(
         sync,
         options.spawn.stdin,
@@ -4732,19 +4755,14 @@ fn setUpChild(sync: *CancelRegion.Sync, options: struct {
         options.dev_null_fd,
     );
 
-    switch (options.spawn.cwd) {
-        .inherit => {},
-        .dir => |cwd_dir| try fchdir(sync, cwd_dir.handle),
-        .path => |cwd_path| {
-            var cwd_path_buffer: [PATH_MAX]u8 = undefined;
-            const cwd_path_posix = try pathToPosix(cwd_path, &cwd_path_buffer);
-            try chdir(sync, cwd_path_posix);
-        },
+    // Must happen after fchdir above because the cwd file descriptor might be
+    // equal to prog_fileno and be clobbered by this operation.
+    if (options.prog_pipe != -1) {
+        if (options.prog_pipe == prog_fileno)
+            try setFdFlags(sync, options.prog_pipe, 0)
+        else
+            try dup2(sync, options.prog_pipe, prog_fileno);
     }
-
-    // Must happen after fchdir above, the cwd file descriptor might be
-    // equal to prog_fileno and be clobbered by this dup2 call.
-    if (options.prog_pipe != -1) try dup2(sync, options.prog_pipe, prog_fileno);
 
     if (options.spawn.gid) |gid| {
         switch (linux.errno(linux.setregid(gid, gid))) {
@@ -4777,18 +4795,18 @@ fn setUpChild(sync: *CancelRegion.Sync, options: struct {
     }
 
     if (options.spawn.start_suspended) {
-        switch (linux.errno(linux.kill(0, .STOP))) {
+        switch (linux.errno(linux.kill(linux.getpid(), .STOP))) {
             .SUCCESS => {},
             .PERM => return error.PermissionDenied,
             else => return error.Unexpected,
         }
     }
 
-    return execv(
+    return processExec(
         sync,
-        options.spawn.expand_arg0,
-        options.argv_buf.ptr[0].?,
+        options.spawn.exe,
         options.argv_buf.ptr,
+        options.spawn.expand_arg0,
         options.env_block,
         options.PATH,
     );
@@ -4807,6 +4825,17 @@ fn setUpChildIo(
         .inherit => {},
         .ignore => try dup2(sync, dev_null_fd, std_fileno),
         .file => |file| try dup2(sync, file.handle, std_fileno),
+    }
+}
+
+fn setFdFlags(sync: *CancelRegion.Sync, fd: fd_t, flags: usize) (Io.Cancelable || Io.UnexpectedError)!void {
+    while (true) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
+            .SUCCESS => return,
+            .INTR => {},
+            else => |err| return unexpectedErrno(err),
+        }
     }
 }
 
@@ -4829,63 +4858,77 @@ pub fn dup2(sync: *CancelRegion.Sync, old_fd: fd_t, new_fd: fd_t) DupError!void 
     }
 }
 
-fn execv(
+fn processExec(
     sync: *CancelRegion.Sync,
-    arg0_expand: process.ArgExpansion,
-    file: [*:0]const u8,
-    child_argv: [*:null]?[*:0]const u8,
+    exe: process.ReplaceOptions.Exe,
+    argv: [*:null]?[*:0]const u8,
+    expand_arg0: process.ArgExpansion,
     env_block: process.Environ.PosixBlock,
     PATH: []const u8,
 ) process.ReplaceError {
-    const file_slice = std.mem.sliceTo(file, 0);
-    if (std.mem.findScalar(u8, file_slice, '/') != null)
-        return execvPath(sync, file, child_argv, env_block);
+    const arg0_slice = std.mem.span(argv[0].?);
+    exe: switch (exe) {
+        .detect => continue :exe if (std.mem.findScalar(u8, arg0_slice, '/')) |_| .{
+            .path = .cwd(),
+        } else .search,
+        .search => {
+            if (Dir.path.isAbsolute(arg0_slice)) continue :exe .{ .path = .cwd() };
+            var path_buf: [PATH_MAX]u8 = undefined;
+            var it = std.mem.tokenizeScalar(u8, PATH, ':');
+            var err: error{ FileNotFound, NotDir } = error.FileNotFound;
 
-    // Use of PATH_MAX here is valid as the path_buf will be passed
-    // directly to the operating system in posixExecvPath.
-    var path_buf: [PATH_MAX]u8 = undefined;
-    var it = std.mem.tokenizeScalar(u8, PATH, ':');
-    var seen_eacces = false;
-    var err: process.ReplaceError = error.FileNotFound;
-
-    // In case of expanding arg0 we must put it back if we return with an error.
-    const prev_arg0 = child_argv[0];
-    defer switch (arg0_expand) {
-        .expand => child_argv[0] = prev_arg0,
-        .no_expand => {},
-    };
-
-    while (it.next()) |search_path| {
-        const path_len = search_path.len + file_slice.len + 1;
-        if (path_buf.len < path_len + 1) return error.NameTooLong;
-        @memcpy(path_buf[0..search_path.len], search_path);
-        path_buf[search_path.len] = '/';
-        @memcpy(path_buf[search_path.len + 1 ..][0..file_slice.len], file_slice);
-        path_buf[path_len] = 0;
-        const full_path = path_buf[0..path_len :0].ptr;
-        switch (arg0_expand) {
-            .expand => child_argv[0] = full_path,
-            .no_expand => {},
-        }
-        err = execvPath(sync, full_path, child_argv, env_block);
-        switch (err) {
-            error.AccessDenied => seen_eacces = true,
-            error.FileNotFound, error.NotDir => {},
-            else => |e| return e,
-        }
+            while (it.next()) |search_path| {
+                const path_len = search_path.len + arg0_slice.len + 1;
+                if (path_buf.len < path_len + 1) return error.NameTooLong;
+                @memcpy(path_buf[0..search_path.len], search_path);
+                path_buf[search_path.len] = Dir.path.sep;
+                @memcpy(path_buf[search_path.len + 1 ..][0..arg0_slice.len], arg0_slice);
+                path_buf[path_len] = 0;
+                const full_path = path_buf[0..path_len :0].ptr;
+                switch (expand_arg0) {
+                    .expand => argv[0] = full_path,
+                    .no_expand => {},
+                }
+                switch (processExecveat(sync, linux.AT.FDCWD, full_path, argv, env_block)) {
+                    error.AccessDenied => {},
+                    error.FileNotFound, error.NotDir => |e| err = e,
+                    else => |e| return e,
+                }
+            }
+            return err;
+        },
+        .path => |dir| return processExecveat(sync, dir.handle, arg0_slice, argv, env_block),
+        .file => |file| return processExecveat(sync, file.handle, null, argv, env_block),
+        .explicit => |explicit| {
+            var path_buffer: [PATH_MAX]u8 = undefined;
+            const path_posix = try pathToPosix(explicit.path, &path_buffer);
+            return processExecveat(sync, explicit.dir.handle, path_posix, argv, env_block);
+        },
     }
-    if (seen_eacces) return error.AccessDenied;
-    return err;
 }
-/// This function ignores PATH environment variable.
-pub fn execvPath(
+
+fn processExecveat(
     sync: *CancelRegion.Sync,
-    path: [*:0]const u8,
-    child_argv: [*:null]const ?[*:0]const u8,
+    dir: fd_t,
+    path: ?[*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
     env_block: process.Environ.PosixBlock,
 ) process.ReplaceError {
     try sync.cancel_region.await(.nothing);
-    switch (linux.errno(linux.execve(path, child_argv, env_block.slice.ptr))) {
+    const rc = if (path) |p|
+        if (dir == linux.AT.FDCWD or Dir.path.isAbsoluteZ(p))
+            linux.execve(p, argv, env_block.slice.ptr)
+        else
+            linux.execveat(dir, p, argv, env_block.slice.ptr, .{
+                .EMPTY_PATH = false,
+                .SYMLINK_NOFOLLOW = false,
+            })
+    else
+        linux.execveat(dir, "", argv, env_block.slice.ptr, .{
+            .EMPTY_PATH = true,
+            .SYMLINK_NOFOLLOW = false,
+        });
+    switch (linux.errno(rc)) {
         .FAULT => |err| return errnoBug(err), // Bad pointer parameter.
         .@"2BIG" => return error.SystemResources,
         .MFILE => return error.ProcessFdQuotaExceeded,
@@ -4903,6 +4946,7 @@ pub fn execvPath(
         .NOTDIR => return error.NotDir,
         .TXTBSY => return error.FileBusy,
         .LIBBAD => return error.InvalidExe,
+        .NOSYS => return error.OperationUnsupported,
         else => |err| return unexpectedErrno(err),
     }
 }
@@ -5049,6 +5093,28 @@ fn progressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!File {
         error.Canceled => unreachable, // blocked
     };
     return ev.environ.zig_progress_file;
+}
+
+fn inheritParentHandle(ev: *Evented, handle: fd_t) Io.InheritParentHandleError!void {
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    return setFdFlags(&sync, handle, linux.FD_CLOEXEC);
+}
+
+fn inheritParentDir(userdata: ?*anyopaque, handle: Dir.Handle) Io.InheritParentHandleError!Dir {
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    try inheritParentHandle(ev, handle);
+    return .{ .handle = handle };
+}
+
+fn inheritParentFile(
+    userdata: ?*anyopaque,
+    handle: File.Handle,
+    flags: File.Flags,
+) Io.InheritParentHandleError!File {
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    try inheritParentHandle(ev, handle);
+    return .{ .handle = handle, .flags = flags };
 }
 
 fn scanEnviron(ev: *Evented) Io.Cancelable!void {
@@ -6316,19 +6382,6 @@ fn writeSync(sync: *CancelRegion.Sync, fd: fd_t, buffer: []const u8) File.Writer
 
 test {
     _ = Fiber.CancelProtection;
-}
-
-fn inheritParentDirUnavailable(userdata: ?*anyopaque, handle: Dir.Handle) Io.InheritParentHandleError!Dir {
-    _ = userdata;
-    _ = handle;
-    return error.UnsupportedOperation;
-}
-
-fn inheritParentFileUnavailable(userdata: ?*anyopaque, handle: File.Handle, flags: File.Flags) Io.InheritParentHandleError!File {
-    _ = userdata;
-    _ = handle;
-    _ = flags;
-    return error.UnsupportedOperation;
 }
 
 fn netListenIp(

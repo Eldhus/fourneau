@@ -27,7 +27,7 @@ zig build -Doptimize=ReleaseSafe
 zig-out/bin/fourneau-static --root ./public --port 8080
 ```
 
-Zig 0.17.0 (`.zig-version`); Linux 6.13 or later (connections live in the ring's file table,
+Zig 0.17.1 (`.zig-version`); Linux 6.13 or later (connections live in the ring's file table,
 and before 6.13 a closed one lingered until another's operation completed); for HTTPS, the
 kernel's `tls` module.
 

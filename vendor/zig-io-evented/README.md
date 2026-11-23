@@ -1,7 +1,7 @@
 # zig-io-evented
 
 Zig's `std.Io.Evented` for Linux (`lib/std/Io/Uring.zig`): green threads (fibers) on io_uring with
-work stealing. Upstream calls it experimental, and in 0.17.0 it cannot listen, accept, connect, or
+work stealing. Upstream calls it experimental, and in 0.17.1 it cannot listen, accept, connect, or
 read and write streams. We carry it, with listen, accept and stream reads and writes filled in
 (connect stays upstream's stub: fourneau never dials out), until upstream can serve; then this
 directory is deleted and fourneau uses `std.Io.Evented`. The interface is `std.Io` either way, so
@@ -16,6 +16,6 @@ How it is kept, the simplest way that works for one file:
 3. At a new Zig release: take the new upstream file and re-apply the patch.
     - Fix what the release changed, run the suite, and move the tag named below.
 
-Upstream: Zig 0.17.0, `lib/std/Io/Uring.zig`
-(https://codeberg.org/ziglang/zig/src/tag/0.17.0/lib/std/Io/Uring.zig). License: MIT (`LICENSE`,
+Upstream: Zig 0.17.1, `lib/std/Io/Uring.zig`
+(https://codeberg.org/ziglang/zig/src/tag/0.17.1/lib/std/Io/Uring.zig). License: MIT (`LICENSE`,
 Zig's).
